@@ -11,7 +11,7 @@ def to_jax(x):
     elif isinstance(x, jax.Array):
         return x
     elif isinstance(x, torch.Tensor):
-        return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(x.contiguous()))
+        return jnp.asarray(x.detach().cpu().numpy()) # jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(x.contiguous())) This code gave this error - TypeError: The array passed to from_dlpack must have __dlpack__ and __dlpack_device__ methods.
     elif isinstance(x, dict) or isinstance(x, list):
         return jax.tree.map(to_jax, x)
     else:
@@ -24,7 +24,7 @@ def to_torch(x):
     elif isinstance(x, torch.Tensor):
         return x
     elif isinstance(x, jax.Array):
-        return torch.utils.dlpack.from_dlpack(jax.dlpack.to_dlpack(x))
+        return torch.from_numpy(np.asarray(x)) # same as above
     else:
         raise ValueError(f"Cannot convert type {type(x)} to torch.Tensor")
 

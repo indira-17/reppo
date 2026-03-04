@@ -206,12 +206,13 @@ def _make_maniskill_env(cfg: DictConfig, n_obs_dataset: int = None) -> EnvSetup[
     env = make_env(eval=False)
     eval_env = make_env(eval=True)
     
+    # I don’t think this would be required anymore, since the dataset observations should now match the online environment observations with `state` as the observation mode, which was used in the original REPPO code. But need to remove it and test it
     if cfg.algorithm.bc_indicator:
         # Debug: check observation space from wrapper
-        logging.info(f"[make_maniskill_env] env.single_observation_space: {env.single_observation_space}")
-        logging.info(f"[make_maniskill_env] env.single_observation_space.shape: {env.single_observation_space.shape}")
-        logging.info(f"[make_maniskill_env] env.observation_space: {env.observation_space}")
-        logging.info(f"[make_maniskill_env] env.observation_space.shape: {env.observation_space.shape}")
+        logging.debug(f"[make_maniskill_env] env.single_observation_space: {env.single_observation_space}")
+        logging.debug(f"[make_maniskill_env] env.single_observation_space.shape: {env.single_observation_space.shape}")
+        logging.debug(f"[make_maniskill_env] env.observation_space: {env.observation_space}")
+        logging.debug(f"[make_maniskill_env] env.observation_space.shape: {env.observation_space.shape}")
         
         # Override observation space to match dataset dimension
         obs_space = env.single_observation_space

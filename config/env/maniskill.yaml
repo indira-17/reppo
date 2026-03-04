@@ -1,5 +1,5 @@
 type: maniskill
-name: PushCube-v1
+name: RollBall-v1
 
 # Disable struct mode to allow CLI overrides
 defaults:
@@ -27,6 +27,6 @@ vmax: 15
 # Demo loading configuration
 demo:
   batch_size: 1024
-  demo_path: /scratch/cluster/idutta/h5_files/PushCube/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5
+  demo_path: /scratch/cluster/idutta/h5_files/RollBall/trajectory.state_dict.pd_joint_delta_pos.physx_cpu.h5
   max_episodes: null
   filter_success: true

@@ -27,141 +27,21 @@ import torch
 
 logging.basicConfig(level=logging.INFO)
 
-
-def load_bc_weights_to_critic(bc_checkpoint_path: str, jax_critic: nnx.Module) -> nnx.Module:
-    """Load PyTorch BC weights into JAX critic"""
-    
-    if not os.path.exists(bc_checkpoint_path):
-        logging.warning(f"Checkpoint not found at {bc_checkpoint_path}")
-        return jax_critic
-    
-    logging.info(f"Loading BC critic weights from {bc_checkpoint_path}")
-    
-    try:
-        checkpoint = torch.load(bc_checkpoint_path, map_location="cpu")
-        state_dict = checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint))
-        
-        # Get all nnx.Linear layers recursively
-        def get_linears(m):
-            linears = []
-            if isinstance(m, nnx.Linear):
-                return [m]
-            if isinstance(m, nnx.Sequential):
-                for layer in m.layers:
-                    linears.extend(get_linears(layer))
-            if hasattr(m, 'input_layer'):
-                linears.extend(get_linears(m.input_layer))
-            if hasattr(m, 'main_layers'):
-                linears.extend(get_linears(m.main_layers))
-            if hasattr(m, 'output_layer'):
-                linears.extend(get_linears(m.output_layer))
-            return linears
-        
-        total = 0
-        
-        # Load feature_module -> feature_encoder
-        feature_torch = {}
-        for key in state_dict:
-            if "feature_module" in key and ".0." in key:
-                parts = key.split('.')
-                try:
-                    idx = parts.index('net') + 1
-                    layer_num = parts[idx]
-                    if layer_num not in feature_torch:
-                        feature_torch[layer_num] = {}
-                    if "weight" in key:
-                        feature_torch[layer_num]['weight'] = state_dict[key].cpu().numpy()
-                    elif "bias" in key:
-                        feature_torch[layer_num]['bias'] = state_dict[key].cpu().numpy()
-                except (ValueError, IndexError):
-                    pass
-        
-        feature_jax = get_linears(jax_critic.feature_encoder)
-        for i, (layer_num, tensors) in enumerate(sorted(feature_torch.items())):
-            if i < len(feature_jax):
-                if 'weight' in tensors:
-                    feature_jax[i].kernel = jnp.array(tensors['weight'].T)
-                    total += 1
-                if 'bias' in tensors:
-                    feature_jax[i].bias = jnp.array(tensors['bias'])
-                    total += 1
-        
-        # Load critic_module -> q_network
-        critic_torch = {}
-        for key in state_dict:
-            if "critic_module" in key and ".0." in key:
-                parts = key.split('.')
-                try:
-                    idx = parts.index('net') + 1
-                    layer_num = parts[idx]
-                    if layer_num not in critic_torch:
-                        critic_torch[layer_num] = {}
-                    if "weight" in key:
-                        critic_torch[layer_num]['weight'] = state_dict[key].cpu().numpy()
-                    elif "bias" in key:
-                        critic_torch[layer_num]['bias'] = state_dict[key].cpu().numpy()
-                except (ValueError, IndexError):
-                    pass
-        
-        critic_jax = get_linears(jax_critic.q_network)
-        for i, (layer_num, tensors) in enumerate(sorted(critic_torch.items())):
-            if i < len(critic_jax):
-                if 'weight' in tensors:
-                    critic_jax[i].kernel = jnp.array(tensors['weight'].T)
-                    total += 1
-                if 'bias' in tensors:
-                    critic_jax[i].bias = jnp.array(tensors['bias'])
-                    total += 1
-        
-        # Load pred_module -> prediction_network
-        pred_torch = {}
-        for key in state_dict:
-            if "pred_module" in key and ".0." in key:
-                parts = key.split('.')
-                try:
-                    idx = parts.index('net') + 1
-                    layer_num = parts[idx]
-                    if layer_num not in pred_torch:
-                        pred_torch[layer_num] = {}
-                    if "weight" in key:
-                        pred_torch[layer_num]['weight'] = state_dict[key].cpu().numpy()
-                    elif "bias" in key:
-                        pred_torch[layer_num]['bias'] = state_dict[key].cpu().numpy()
-                except (ValueError, IndexError):
-                    pass
-        
-        pred_jax = get_linears(jax_critic.prediction_network)
-        for i, (layer_num, tensors) in enumerate(sorted(pred_torch.items())):
-            if i < len(pred_jax):
-                if 'weight' in tensors:
-                    pred_jax[i].kernel = jnp.array(tensors['weight'].T)
-                    total += 1
-                if 'bias' in tensors:
-                    pred_jax[i].bias = jnp.array(tensors['bias'])
-                    total += 1
-        
-        logging.info(f"Transferred {total} parameters")
-        return jax_critic
-        
-    except Exception as e:
-        logging.error(f"Failed to load BC weights: {e}")
-        return jax_critic
-
-
 def load_bc_weights_to_actor(bc_checkpoint_path: str, jax_actor: nnx.Module) -> nnx.Module:
     """
-    Load PyTorch BC weights into JAX actor's feature_encoder.
+    Load JAX BC pretrained weights into JAX actor.
     
-    Maps PyTorch FCNN weights to JAX MLP structure by traversing the module tree.
+    Loads a pickle file saved by pretrain-jax.py (nnx.split state) and
+    updates the actor's parameters in-place.
     
     Args:
-        bc_checkpoint_path: Path to BC checkpoint file (.pth or .pt)
-        jax_actor: JAX actor with feature_encoder to load weights into
+        bc_checkpoint_path: Path to BC checkpoint file (.pkl)
+        jax_actor: JAX actor to load weights into
     
     Returns:
-        Modified jax_actor with BC feature_encoder weights loaded
+        Modified jax_actor with BC weights loaded
     """
-    import glob
+    import pickle
     
     # Verify checkpoint exists
     if not os.path.exists(bc_checkpoint_path):
@@ -171,89 +51,11 @@ def load_bc_weights_to_actor(bc_checkpoint_path: str, jax_actor: nnx.Module) -> 
     logging.info(f"Loading BC weights from {bc_checkpoint_path}")
     
     try:
-        checkpoint = torch.load(bc_checkpoint_path, map_location="cpu")
+        with open(bc_checkpoint_path, 'rb') as f:
+            saved_state = pickle.load(f)
         
-        # Extract state dict
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            state_dict = checkpoint["model_state_dict"]
-        elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            state_dict = checkpoint["state_dict"]
-        elif hasattr(checkpoint, "state_dict"):
-            state_dict = checkpoint.state_dict()
-        else:
-            state_dict = checkpoint
-        
-        logging.info(f"Loaded checkpoint with {len(state_dict)} parameters")
-        
-        # Extract linear layer names from torch state dict
-        torch_linear_layers = []
-        for name in sorted(state_dict.keys()):
-            if "model.net" in name and ".0.weight" in name:  # .0 is Linear in normed_activation_layer
-                torch_linear_layers.append(name)
-        
-        logging.info(f"Found {len(torch_linear_layers)} linear layers in torch model")
-        
-        # Get JAX actor's feature_encoder structure
-        fe = jax_actor.feature_encoder
-        
-        # Collect JAX linear layers (from input_layer, main_layers, output_layer)
-        jax_linear_refs = []
-        
-        # input_layer: Sequential with [Linear, LayerNorm(?), Activation]
-        if hasattr(fe, 'input_layer'):
-            layers = getattr(fe.input_layer, 'layers', None)
-            if layers is not None:
-                for module in layers:
-                    if isinstance(module, nnx.Linear):
-                        jax_linear_refs.append(module)
-        
-        # main_layers: nnx.List of Sequentials
-        if hasattr(fe, 'main_layers'):
-            for seq in fe.main_layers:
-                layers = getattr(seq, 'layers', None)
-                if layers is not None:
-                    for module in layers:
-                        if isinstance(module, nnx.Linear):
-                            jax_linear_refs.append(module)
-        
-        # output_layer: Sequential with [Linear, LayerNorm(?), Activation]
-        if hasattr(fe, 'output_layer'):
-            layers = getattr(fe.output_layer, 'layers', None)
-            if layers is not None:
-                for module in layers:
-                    if isinstance(module, nnx.Linear):
-                        jax_linear_refs.append(module)
-        
-        logging.info(f"Found {len(jax_linear_refs)} nnx.Linear module references")
-        
-        # Transfer weights from torch to jax
-        transferred = 0
-        for torch_name, jax_layer in zip(torch_linear_layers, jax_linear_refs):
-            try:
-                # Get torch weights and bias
-                torch_weight = state_dict[torch_name]  # [out_features, in_features]
-                torch_bias_name = torch_name.replace(".weight", ".bias")
-                torch_bias = state_dict.get(torch_bias_name, None)
-                
-                # Transfer weights (transpose: torch [out, in] -> jax [in, out])
-                jax_layer.kernel = jnp.array(torch_weight.detach().cpu().numpy().T)
-                
-                # Transfer bias
-                if torch_bias is not None:
-                    jax_layer.bias = jnp.array(torch_bias.detach().cpu().numpy())
-                
-                transferred += 1
-                logging.debug(f"Transferred {torch_name}")
-                
-            except Exception as e:
-                logging.warning(f"Failed to transfer {torch_name}: {e}")
-                continue
-        
-        logging.info(f"Successfully transferred {transferred}/{len(torch_linear_layers)} weight matrices")
-        
-        if transferred == 0:
-            logging.warning("No weights were transferred! Verify architecture compatibility.")
-        
+        nnx.update(jax_actor, saved_state)
+        logging.info(f"Successfully loaded JAX BC weights from {bc_checkpoint_path}")
         return jax_actor
         
     except Exception as e:
@@ -381,14 +183,7 @@ def make_init_fn(
                 logging.info("No BC actor checkpoint specified or found, using random initialization")
         else:
             logging.info("bc_indicator=False, using random initialization for actor")
-        # Also load weights into critic if specified
-        # bc_critic_checkpoint_path = getattr(hparams, "bc_critic_checkpoint_path", None)
-        # if bc_critic_checkpoint_path and os.path.exists(bc_critic_checkpoint_path):
-        #     logging.info(f"Loading BC critic weights from {bc_critic_checkpoint_path}")
-        #     critic = load_bc_weights_to_critic(bc_critic_checkpoint_path, critic)
-        # else:
-        #     logging.info("No BC critic checkpoint specified or found, using random initialization for critic")
-
+            
         return REPPOTrainState.create(
             graphdef=nnx.graphdef(actor),
             params=nnx.state(actor),

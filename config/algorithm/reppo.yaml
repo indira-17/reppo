@@ -5,8 +5,8 @@ eval_interval: 2
 num_eval: 20
 
 # BC pretraining checkpoint path
-bc_checkpoint_path: /scratch/cluster/idutta/reppo/outputs/2026-02-22/12-46-03/PushCube-v1/saved_models/20260222_124605/bc_model_actor_best.pt #reppo/outputs/2026-02-22/12-46-03/PushCube-v1/saved_models/20260222_124605/bc_model_actor_best.pt
-bc_critic_checkpoint_path: /scratch/cluster/idutta/reppo/bc_utils/bc_model_critic_20260127_193401_2.pth
+bc_checkpoint_path: /scratch/cluster/idutta/reppo/outputs/2026-03-03/19-03-21/RollBall-v1/saved_models/20260303_190323/bc_model_actor_best.pkl # /scratch/cluster/idutta/reppo/outputs/2026-03-02/23-19-18/PickCube-v1/saved_models/20260302_231920/bc_model_actor_best.pkl # /scratch/cluster/idutta/reppo/outputs/2026-03-02/22-17-45/PullCube-v1/saved_models/20260302_221746/bc_model_actor_best.pkl # /scratch/cluster/idutta/reppo/outputs/2026-03-01/20-31-14/PushCube-v1/saved_models/20260301_203116/bc_model_actor_best.pkl
+# bc_critic_checkpoint_path: /scratch/cluster/idutta/reppo/bc_utils/bc_model_critic_20260127_193401_2.pth
 bc_mse_loss_weight: 0.0
 bc_actor_update_delay : 10
 bc_indicator: True

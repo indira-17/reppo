@@ -25,13 +25,12 @@ def main(cfg: DictConfig):
     logging.info("\n" + OmegaConf.to_yaml(cfg))
     
     # Modify run name based on bc_indicator
-    bc_suffix = f"-bc-denorm-{cfg.algorithm.bc_actor_update_delay}" if cfg.algorithm.bc_indicator else ""
+    bc_suffix = f"-bc-jax-pretrain-denorm-{cfg.algorithm.bc_actor_update_delay}" if cfg.algorithm.bc_indicator else ""
     run_name = f"{cfg.name}-{cfg.env.name.lower()}{bc_suffix}"
     
     wandb.init(
         mode=cfg.logging.mode,
-        project=cfg.logging.project,
-        entity=cfg.logging.entity,
+        project="bc_reppo",
         tags=cfg.tags,
         config=OmegaConf.to_container(cfg),
         name=run_name,
