@@ -14,28 +14,6 @@ from tensordict import TensorDict
 from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader, random_split
 
-def torch_to_numpy(tensor):
-    # Convert a torch tensor to numpy, handling CUDA tensors
-    if isinstance(tensor, torch.Tensor):
-        if tensor.is_cuda:
-            tensor = tensor.cpu()
-        return tensor.detach().numpy()
-    return np.array(tensor)
-
-def denormalize_action(action, dataset_low, dataset_high):
-    # Denormalize action from [-1, 1] to dataset bounds.
-    if isinstance(action, np.ndarray):
-        action = torch.from_numpy(np.ascontiguousarray(action.copy()))
-    denormalized = (action + 1.0) * (dataset_high - dataset_low) / 2.0 + dataset_low
-    return torch_to_numpy(denormalized)
-
-def normalize_action(action, dataset_low, dataset_high):
-    # Normalize action from dataset bounds to [-1, 1].
-    if isinstance(action, np.ndarray):
-        action = torch.from_numpy(np.ascontiguousarray(action.copy()))
-    normalized = 2.0 * (action - dataset_low) / (dataset_high - dataset_low) - 1.0
-    return torch_to_numpy(normalized) 
-
 @dataclass
 class DemoConfig:
     device: torch.device = torch.device("cpu")
@@ -179,8 +157,8 @@ class ManiSkillDemoLoader:
         # col_offset = 0
         for key in sorted(obs_group.keys()):  # iterates over available actors
             sub_group = obs_group[key]
-            # print('Offline Observation Keys', key, sub_group.keys())
             if key in ('agent', 'extra'):
+                # print(key, sub_group.keys())
                 for sub_key in sorted(sub_group.keys()):
                     # Include all agent and extra fields (no filtering)
                     if key == 'agent' and sub_key in ['qpos', 'qvel']:
@@ -203,7 +181,6 @@ class ManiSkillDemoLoader:
         #     if 'actors' in env_states:
         #         actors_group = env_states['actors']
         #         for actor_key in sorted(actors_group.keys()):
-        #             print('actor_key:', actor_key, 'shape:', actors_group[actor_key].shape)
         #             data = np.array(actors_group[actor_key])
         #             data_flat = data.reshape(data.shape[0], -1)
         #             # col_offset += data_flat.shape[1]
@@ -234,7 +211,7 @@ class ManiSkillDemoLoader:
 
 def load_demos_for_training(env_id: str,
                             bsize: int = 64,
-                            demo_path: str = f'/scratch/cluster/idutta/h5_files/PushCube/trajectory.state_dict.pd_joint_delta_pos.physx_cpu.h5',
+                            demo_path: str = '/scratch/cluster/idutta/h5_files/trajectory.rgb.pd_joint_pos.physx_cpu.h5',
                             device: torch.device = torch.device("cpu"),
                             max_episodes: Optional[int] = None,
                             filter_success: bool = True) -> TensorDict:
@@ -250,8 +227,18 @@ def load_demos_for_training(env_id: str,
     loader = ManiSkillDemoLoader(config, env_id)
     trajectories, metadata = loader.load_demo_dataset(demo_path)
     print(f"Loaded {len(trajectories)} transitions from {demo_path}")
+    # print(trajectories.batch_size[0])
+    # print(trajectories['observations'][0].shape)
+
+    # create dataset from these flattened trajectories
+    # dataset = TensorDictDataset(trajectories)
+    # total_len = len(dataset)
+    # train_len = int(train_ratio * total_len)
+    # val_len = total_len - train_len
+    # train_dataset, val_dataset = random_split(dataset, [train_len, val_len])
 
     # create dataset from non flattened trajectories
+    # print(trajectories[0])
     num_traj = len(trajectories)
     train_traj = int(0.8 * num_traj)
     train_td = torch.cat(trajectories[:train_traj], dim=0)
@@ -267,18 +254,13 @@ def load_demos_for_training(env_id: str,
         batch_size=bsize,
         shuffle=False,
         drop_last=False)
-    obs_dim = trajectories[0]["observations"].shape[1] 
-    act_dim = trajectories[0]["actions"].shape[1]
-    # find min and max action values and try denormalizing and normalizing back to check correctness
-    actions = torch.cat([td["actions"] for td in trajectories], dim=0) # for non flattened
-    act_min = actions.min(dim=0).values   # [8]
-    act_max = actions.max(dim=0).values   # [8]
-    diff = 0
-    for td in trajectories: # Average difference after normalization and denormalization: 6.445472231211208e-08
-        act = td["actions"]
-        act_denorm = denormalize_action(normalize_action(act, act_min, act_max), act_min, act_max)
-        diff += torch.abs(act - act_denorm).mean().item()
-    print(f"Average difference after normalization and denormalization: {diff / len(trajectories)}")
+    obs_dim = trajectories[0]["observations"].shape[1]  # 25 for non flattened
+    act_dim = trajectories[0]["actions"].shape[1]  # 8 for non flattened
+    # find min and max action values
+    # actions = trajectories["actions"]   # shape [N, 8]
+    # actions = torch.cat([td["actions"] for td in trajectories], dim=0) # for non flattened
+    # act_min = actions.min(dim=0).values   # [8]
+    # act_max = actions.max(dim=0).values   # [8]
     print(f"Created {len(train_loader)} and {len(val_loader)} dataset from {demo_path}")
     return train_loader, val_loader, obs_dim, act_dim, None, None
 

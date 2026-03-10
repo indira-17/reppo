@@ -215,4 +215,4 @@ def init_env_state(
         ).astype(jnp.float32)
         env_state.set_env_state(_env_state)
     
-    return env_state, _env_state
+    return obs, env_state

@@ -150,16 +150,17 @@ def main(cfg: OmegaConf):
     val_losses = []
 
     # Check dataset action stats
-    all_actions = torch.cat(
-        [batch["actions"] for batch in train_loader] +
-        [batch['actions'] for batch in val_loader],
-        dim=0
+    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success)
+    loader = ManiSkillDemoLoader(config, env_name)
+    trajectories, _ = loader.load_demo_dataset(demo_path)
+    all_actions = np.concatenate(
+        [traj['actions'].numpy() for traj in trajectories], axis=0
     )
     
     # Compute empirical bounds from dataset
-    data_low = all_actions.min(dim=0).values
-    data_high = all_actions.max(dim=0).values
-
+    data_low = all_actions.min(axis=0)
+    data_high = all_actions.max(axis=0)
+    
     # Add 10% safety margin to bounds
     margin = 0.1 * (data_high - data_low)
     low_with_margin = data_low - margin

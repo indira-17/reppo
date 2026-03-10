@@ -18,7 +18,7 @@ from omegaconf import OmegaConf
 from src.networks.common import MLP
 from src.networks.policy_heads import TanhGaussianPolicyHead
 from src.algorithms.reppo.networks import Actor
-from src.maniskill_utils.maniskill_dataloader_shabnam import load_demos_for_training
+from src.maniskill_utils.maniskill_dataloader_shabnam import load_demos_for_training, DemoConfig, ManiSkillDemoLoader
 
 
 def create_actor(n_obs, n_act, cfg, rngs):
@@ -206,8 +206,8 @@ def main(cfg: OmegaConf):
     wandb.init(
         config=dict(cfg),
         entity=cfg.logging.entity,
-        project="reppo",
-        name=f"bc_pretrain_jax_no_clamp_linear_scale_no_envstates_{cfg.env.name}",
+        project="reppo_v2",
+        name=f"bc_pretrain_{cfg.env.name}",
         mode=cfg.logging.mode,
     )
 
@@ -248,10 +248,12 @@ def main(cfg: OmegaConf):
     opt_state = nnx.Optimizer(actor, optimizer, wrt=nnx.Param)
 
     # Compute dataset action stats for normalization bounds
+    # Use raw trajectories (not DataLoader batches) to avoid drop_last=True excluding samples
+    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success)
+    loader = ManiSkillDemoLoader(config, env_name)
+    trajectories, _ = loader.load_demo_dataset(demo_path)
     all_actions = np.concatenate(
-        [batch["actions"].numpy() for batch in train_loader] +
-        [batch['actions'].numpy() for batch in val_loader],
-        axis=0,
+        [traj['actions'].numpy() for traj in trajectories], axis=0
     )
 
     data_low = all_actions.min(axis=0)

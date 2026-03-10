@@ -25,12 +25,12 @@ def main(cfg: DictConfig):
     logging.info("\n" + OmegaConf.to_yaml(cfg))
     
     # Modify run name based on bc_indicator
-    bc_suffix = f"-bc-jax-pretrain-denorm-{cfg.algorithm.bc_actor_update_delay}" if cfg.algorithm.bc_indicator else ""
-    run_name = f"{cfg.name}-{cfg.env.name.lower()}{bc_suffix}"
+    run_name = f"bc-reppo-{cfg.env.name}-v2" if cfg.algorithm.bc_indicator else f"reppo-{cfg.env.name}-v2"
     
     wandb.init(
         mode=cfg.logging.mode,
-        project="bc_reppo",
+        project="bc-reppo-v2",
+        entity=cfg.logging.entity,
         tags=cfg.tags,
         config=OmegaConf.to_container(cfg),
         name=run_name,
@@ -80,8 +80,6 @@ def main(cfg: DictConfig):
         rollout_fn=rollout_fn,
         eval_fn=eval_fn,
         log_callback=utils.make_log_callback(),
-        demo_path=cfg.env.demo.demo_path,
-        bc_indicator=cfg.algorithm.bc_indicator
     )
     start = time.perf_counter()
     _, metrics = train_fn(key)

@@ -5,6 +5,8 @@ rollout_fn:
   num_envs: ${algorithm.num_envs}
   demo_path: ${env.demo.demo_path}
   bc_indicator: ${algorithm.bc_indicator}
+  env_id: ${env.name}
+  filter_success: ${env.demo.filter_success}
 
 eval_fn:
   _target_: src.runners.maniskill_runner.make_eval_fn
@@ -12,6 +14,8 @@ eval_fn:
   max_episode_steps: ${algorithm.max_episode_steps}
   demo_path: ${env.demo.demo_path}
   bc_indicator: ${algorithm.bc_indicator}
+  env_id: ${env.name}
+  filter_success: ${env.demo.filter_success}
   
 train_fn:
   _target_: src.algorithms.training.make_loop_train_fn

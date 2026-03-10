@@ -20,28 +20,34 @@ from src.common import (
 )
 from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 
-def _compute_action_bounds(demo_path):
-    """Compute action bounds from demo file once."""
-    all_actions = []
-    with h5py.File(demo_path, 'r') as f:
-        traj_keys = [key for key in f.keys() if key.startswith('traj_')]
-        for traj_key in traj_keys:
-            traj_group = f[traj_key]
-            action_data = traj_group['actions'][:]
-            all_actions.append(torch.tensor(action_data))
-            
-    all_actions = torch.cat(all_actions, dim=0)
-    action_min = all_actions.min(dim=0).values
-    action_max = all_actions.max(dim=0).values
+def _compute_action_bounds(demo_path, env_id="PushCube-v1", filter_success=True):
+    """Compute action bounds from demo file, matching BC pretraining exactly.
     
-    # Add 10% margin to bounds
-    margin = 0.1 * (action_max - action_min)
-    low_with_margin = action_min - margin 
-    high_with_margin = action_max + margin
+    Uses ManiSkillDemoLoader with filter_success_only (which also cuts
+    trajectories at first success), then computes bounds from raw trajectories
+    with 10% safety margin — identical to pretrain-jax.py.
+    """
+    from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
+    
+    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success)
+    loader = ManiSkillDemoLoader(config, env_id)
+    trajectories, _ = loader.load_demo_dataset(demo_path)
+    
+    all_actions = np.concatenate(
+        [traj['actions'].numpy() for traj in trajectories], axis=0
+    )
+    
+    data_low = all_actions.min(axis=0)
+    data_high = all_actions.max(axis=0)
+    
+    # Add 10% safety margin to bounds (matching pretrain-jax.py)
+    margin = 0.1 * (data_high - data_low)
+    low_with_margin = data_low - margin
+    high_with_margin = data_high + margin
 
     # Ensure bounds are at least [-1, 1] in each dimension
-    dataset_low = torch.min(low_with_margin, torch.full_like(low_with_margin, -1.0))
-    dataset_high = torch.max(high_with_margin, torch.full_like(high_with_margin, 1.0))
+    dataset_low = torch.from_numpy(np.minimum(low_with_margin, -1.0).astype(np.float32))
+    dataset_high = torch.from_numpy(np.maximum(high_with_margin, 1.0).astype(np.float32))
     
     return dataset_low, dataset_high
 
@@ -69,76 +75,59 @@ def torch_to_numpy(tensor):
 
 def get_demo_obs_keys(demo_path):
     """Extract which observation keys are actually in the demo file."""
+    import h5py
+    
     with h5py.File(demo_path, 'r') as f:
         traj_group = f['traj_0']
         obs_group = traj_group['obs']
+        
         demo_keys = {'agent': [], 'extra': []}
         for key in sorted(obs_group.keys()):
             if key in ('agent', 'extra'):
                 sub_group = obs_group[key]
-                if hasattr(sub_group, 'keys'):
-                    demo_keys[key] = sorted(sub_group.keys())
-
+                demo_keys[key] = sorted(sub_group.keys())
+        
         return demo_keys
 
 def flatten_obs(obs_dict, env, demo_obs_keys):
-    """Flatten the observation dictionary to match the demo data format.
-    
-    Must match the observation loading in ManiSkillDemoLoader._load_observations().
-    Only includes: agent.qpos, agent.qvel, and ALL extra fields.
-    Intelligently handles both vectorized (batched) and non-vectorized environments.
-    """
+    # Flatten the observation dictionary to match BC pretraining's _load_observations().
+    # Only includes: agent/qpos, agent/qvel, and ALL extra fields.
+    # Sorted alphabetically at each level (matching h5py iteration order in BC loader).
+    if not hasattr(obs_dict, "keys"):
+        raise TypeError(
+            f"flatten_obs expects a dict observation, received {type(obs_dict)}"
+        )
+
     obs_list = []
-    inferred_batch_size = None
-    
     for key in sorted(obs_dict.keys()):
-        if key in ('agent', 'extra') and key in demo_obs_keys:
+        if key in ('agent', 'extra'):
             sub_group = obs_dict[key]
             for sub_key in sorted(sub_group.keys()):
-                # Only include qpos and qvel from agent, include ALL extra fields
-                if key == 'agent' and sub_key not in ['qpos', 'qvel']:
-                    continue
-                if sub_key in demo_obs_keys[key]:
-                    data = sub_group[sub_key]
-                    if isinstance(data, np.ndarray):
-                        data_array = data
-                    else:
-                        data_array = np.asarray(data)
-                    
-                    # Infer batch size from first 2D array
-                    if inferred_batch_size is None and data_array.ndim > 1:
-                        inferred_batch_size = data_array.shape[0]
-                    
-                    # Reshape based on dimensionality
-                    if data_array.ndim == 0:
-                        # Scalar value -> (1, 1)
-                        data_flat = data_array.reshape(1, 1)
-                    elif data_array.ndim == 1:
-                        # 1D array - could be batched scalar or feature vector
-                        if inferred_batch_size is not None and len(data_array) == inferred_batch_size:
-                            # Matches inferred batch size -> batched scalar
-                            data_flat = data_array.reshape(-1, 1)
-                        else:
-                            # Feature vector from single sample
-                            data_flat = data_array.reshape(1, -1)
-                    else:
-                        # Multi-dimensional - flatten all but first (batch) dimension
-                        data_flat = data_array.reshape(data_array.shape[0], -1)
-                    
+                if key == 'agent' and sub_key in ['qpos', 'qvel']:
+                    data = torch_to_numpy(sub_group[sub_key])
+                    # reshape(N, -1) matches BC loader: (batch, features)
+                    data_flat = data.reshape(data.shape[0], -1)
                     obs_list.append(data_flat)
-
+                elif key == 'extra':
+                    data = torch_to_numpy(sub_group[sub_key])
+                    # reshape(N, -1) handles both 2D (N, D) -> (N, D)
+                    # and 1D scalars (N,) -> (N, 1), matching BC loader
+                    data_flat = data.reshape(data.shape[0], -1)
+                    obs_list.append(data_flat)
+    
     if not obs_list:
         raise ValueError(f"No observation data found in obs_dict with keys: {obs_dict.keys()}")
     
-    return np.concatenate(obs_list, axis=1)
+    result = np.concatenate(obs_list, axis=1)
+    return result
 
-def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path: str = None, bc_indicator: bool = False) -> RolloutFn:
+def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path: str = None, bc_indicator: bool = False, env_id: str = None, filter_success: bool = True) -> RolloutFn:
     # BC-specific rollout function with demo observation flattening
-    # I don’t think this would be required anymore, since the dataset observations should now match the online environment observations with `state` as the observation mode, which was used in the original REPPO code. But need to remove it and test it
     if bc_indicator:
         demo_obs_keys = get_demo_obs_keys(demo_path) if demo_path else None
         # Compute action bounds once at function creation time
-        dataset_low, dataset_high = _compute_action_bounds(demo_path)
+        _env_id = env_id or (env.spec.id if hasattr(env, 'spec') and env.spec else "PushCube-v1")
+        dataset_low, dataset_high = _compute_action_bounds(demo_path, _env_id, filter_success)
         
         def collect_rollout(
             key: Key, train_state: TrainState, policy: Policy
@@ -232,13 +221,13 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
     return collect_rollout
 
 
-def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = None, bc_indicator: bool = False) -> EvalFn:
+def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = None, bc_indicator: bool = False, env_id: str = None, filter_success: bool = True) -> EvalFn:
     # BC-specific evaluation function with demo observation flattening
-    # I don’t think this would be required anymore, since the dataset observations should now match the online environment observations with `state` as the observation mode, which was used in the original REPPO code. But need to remove it and test it
     if bc_indicator:
         demo_obs_keys = get_demo_obs_keys(demo_path) if demo_path else None
         # Compute action bounds once at function creation time
-        dataset_low, dataset_high = _compute_action_bounds(demo_path)
+        _env_id = env_id or (env.spec.id if hasattr(env, 'spec') and env.spec else "PushCube-v1")
+        dataset_low, dataset_high = _compute_action_bounds(demo_path, _env_id, filter_success)
 
         def evaluate(key: Key, policy: Policy) -> dict:
             obs_dict, _ = env.reset()

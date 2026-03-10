@@ -27,6 +27,7 @@ import torch
 
 logging.basicConfig(level=logging.INFO)
 
+
 def load_bc_weights_to_actor(bc_checkpoint_path: str, jax_actor: nnx.Module) -> nnx.Module:
     """
     Load JAX BC pretrained weights into JAX actor.
@@ -64,7 +65,6 @@ def load_bc_weights_to_actor(bc_checkpoint_path: str, jax_actor: nnx.Module) -> 
         import traceback
         traceback.print_exc()
         return jax_actor
-
 
 class REPPOPolicy(nnx.Module):
     def __init__(
@@ -183,7 +183,7 @@ def make_init_fn(
                 logging.info("No BC actor checkpoint specified or found, using random initialization")
         else:
             logging.info("bc_indicator=False, using random initialization for actor")
-            
+
         return REPPOTrainState.create(
             graphdef=nnx.graphdef(actor),
             params=nnx.state(actor),

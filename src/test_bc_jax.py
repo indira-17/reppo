@@ -92,41 +92,22 @@ def flatten_obs(obs_dict, env, demo_obs_keys):
     Only includes: agent.qpos, agent.qvel, and ALL extra fields.
     """
     obs_list = []
-    inferred_batch_size = None
     
     for key in sorted(obs_dict.keys()):
-        if key in ('agent', 'extra') and key in demo_obs_keys:
+        if key in ('agent', 'extra'):
             sub_group = obs_dict[key]
             for sub_key in sorted(sub_group.keys()):
-                # Only include qpos and qvel from agent, include ALL extra fields
-                if key == 'agent' and sub_key not in ['qpos', 'qvel']:
-                    continue
-                if sub_key in demo_obs_keys[key]:
+                if key == 'agent' and sub_key in ['qpos', 'qvel']:
                     data = sub_group[sub_key]
-                    if isinstance(data, np.ndarray):
-                        data_array = data
-                    else:
-                        data_array = np.asarray(data)
-                    
-                    # Infer batch size from first 2D array
-                    if inferred_batch_size is None and data_array.ndim > 1:
-                        inferred_batch_size = data_array.shape[0]
-                    
-                    # Reshape based on dimensionality
-                    if data_array.ndim == 0:
-                        # for scalar value - (1, 1)
-                        data_flat = data_array.reshape(1, 1)
-                    elif data_array.ndim == 1:
-                        # for 1D array - if length matches inferred batch size, treat as (batch, 1), else (1, features)
-                        if inferred_batch_size is not None and len(data_array) == inferred_batch_size:
-                            # Matches inferred batch size -> batched scalar
-                            data_flat = data_array.reshape(-1, 1)
-                        else:
-                            data_flat = data_array.reshape(1, -1)
-                    else:
-                        # Multi-dimensional - flatten all but first (batch) dimension
-                        data_flat = data_array.reshape(data_array.shape[0], -1)
-                    
+                    if not isinstance(data, np.ndarray):
+                        data = np.asarray(data)
+                    data_flat = data.reshape(data.shape[0], -1)
+                    obs_list.append(data_flat)
+                elif key == 'extra':
+                    data = sub_group[sub_key]
+                    if not isinstance(data, np.ndarray):
+                        data = np.asarray(data)
+                    data_flat = data.reshape(data.shape[0], -1)
                     obs_list.append(data_flat)
 
     if not obs_list:
@@ -140,8 +121,8 @@ def test(cfg, env_id=None, model_path=None, demo_path=None):
     wandb.init(
         config=dict(cfg),
         entity=cfg.logging.entity,
-        project="reppo",
-        name=f"bc_eval_jax_no_clamp_linear_scale_no_envstates_{cfg.env.name}",
+        project="reppo_v2",
+        name=f"bc_eval_{cfg.env.name}",
         mode=cfg.logging.mode,
     )
 
@@ -162,7 +143,8 @@ def test(cfg, env_id=None, model_path=None, demo_path=None):
     print(f"Demo observation keys: {demo_obs_keys}")
 
     # Determine obs/act dims from demo data
-    config = DemoConfig(device=torch.device("cpu"), filter_success_only=True)
+    filter_success = cfg.env.demo.get('filter_success', True)
+    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success)
     loader = ManiSkillDemoLoader(config, env_id)
     trajectories_for_dims, _ = loader.load_demo_dataset(demo_path)
     n_obs = trajectories_for_dims[0]["observations"].shape[1]
@@ -205,7 +187,7 @@ def test(cfg, env_id=None, model_path=None, demo_path=None):
     print(f"Action space center: {(env_high + env_low) / 2}")
     print(f"=" * 50)
 
-    # Compute dataset action bounds with safety margin (same as training)
+    # Compute dataset action bounds with safety margin (same as pretrain-jax.py)
     all_dataset_actions = np.concatenate(
         [traj['actions'].numpy() for traj in trajectories_for_dims], axis=0
     )
