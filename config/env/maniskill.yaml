@@ -1,5 +1,5 @@
 type: maniskill
-name: PullCube-v1
+name: AnymalC-Reach-v1
 
 # Disable struct mode to allow CLI overrides
 defaults:
@@ -17,7 +17,7 @@ control_mode: pd_joint_delta_pos
 capture_video: false
 save_train_video_freq: null
 env_kwargs:
-  obs_mode: state
+  obs_mode: state_dict
   render_mode: rgb_array
   sim_backend: physx_cuda
 
@@ -27,6 +27,6 @@ vmax: 15
 # Demo loading configuration
 demo:
   batch_size: 1024
-  demo_path: /scratch/cluster/idutta/h5_files/PullCube/trajectory.state_dict.pd_joint_delta_pos.physx_cpu.h5
+  demo_path: /scratch/cluster/idutta/h5_files/AnymalC-Reach/trajectory.state_dict.pd_joint_delta_pos.physx_cpu.h5
   max_episodes: null
   filter_success: true

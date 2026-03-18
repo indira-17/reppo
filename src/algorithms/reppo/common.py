@@ -1,5 +1,6 @@
 from flax import nnx, struct
 from flax.struct import PyTreeNode
+import jax.numpy as jnp
 
 from src.common import TrainState
 
@@ -52,10 +53,25 @@ class ReppoConfig(struct.PyTreeNode):
     actor_kl_clip_mode: str = "clipped"
     action_size_target: float = 0
     reward_scale: float = 1.0
+    rho_mix: float = 0.5
+    bc_transition_iterations: int = 20
 
 
 class REPPOTrainState(TrainState):
     critic: nnx.TrainState
     actor: nnx.TrainState
     actor_target: nnx.TrainState
+    rollout_actor: nnx.TrainState | None = None
     normalization_state: PyTreeNode | None = None
+
+class ReplayBuffer(struct.PyTreeNode):
+    observations: jnp.ndarray
+    next_observations: jnp.ndarray
+    actions: jnp.ndarray
+    rewards: jnp.ndarray
+    dones: jnp.ndarray
+    truncations: jnp.ndarray
+    behavior_log_probs: jnp.ndarray
+    episode_starts: jnp.ndarray
+    ptr: jnp.ndarray = struct.field(default_factory=lambda: jnp.array(0, dtype=jnp.int32))
+    size: jnp.ndarray = struct.field(default_factory=lambda: jnp.array(0, dtype=jnp.int32))

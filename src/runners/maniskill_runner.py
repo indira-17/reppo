@@ -21,11 +21,11 @@ from src.common import (
 from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 
 def _compute_action_bounds(demo_path, env_id="PushCube-v1", filter_success=True):
-    """Compute action bounds from demo file, matching BC pretraining exactly.
+    """Compute action bounds from demo file, matching pretraining exactly.
     
     Uses ManiSkillDemoLoader with filter_success_only (which also cuts
     trajectories at first success), then computes bounds from raw trajectories
-    with 10% safety margin — identical to pretrain-jax.py.
+    with 10% safety margin.
     """
     from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
     
@@ -90,9 +90,9 @@ def get_demo_obs_keys(demo_path):
         return demo_keys
 
 def flatten_obs(obs_dict, env, demo_obs_keys):
-    # Flatten the observation dictionary to match BC pretraining's _load_observations().
+    # Flatten the observation dictionary to match pretraining's _load_observations().
     # Only includes: agent/qpos, agent/qvel, and ALL extra fields.
-    # Sorted alphabetically at each level (matching h5py iteration order in BC loader).
+    # Sorted alphabetically at each level (matching h5py iteration order in loader).
     if not hasattr(obs_dict, "keys"):
         raise TypeError(
             f"flatten_obs expects a dict observation, received {type(obs_dict)}"
@@ -140,7 +140,7 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
             prev_time = time.perf_counter()
             for i in range(num_steps):
                 key, act_key = jax.random.split(key)
-                action, _ = policy(act_key, obs)
+                action, log_prob = policy(act_key, obs)
                 
                 # Convert action from JAX to numpy for environment
                 action = np.asarray(action)
@@ -168,7 +168,10 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
                     reward=reward,
                     done=done,
                     truncated=truncated,
-                    extras={},
+                    extras={
+                        "behavior_log_prob": jnp.asarray(log_prob['log_prob']),
+                        "is_offline": jnp.zeros(np.asarray(reward).shape, dtype=jnp.float32),
+                    },
                 )
                 transitions.append(transition)
                 obs = flatten_obs(next_obs_dict, env=env, demo_obs_keys=demo_obs_keys)
