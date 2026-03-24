@@ -36,14 +36,14 @@ class REPPOPolicy(nnx.Module):
             x = self.normalizer.normalize(self.normalization_state, x)
         if self._eval_mode:
             action = self.base.det_action(x)
-            info = {}
+            _, log_prob = self.base(x, **kwargs).sample_and_log_prob(seed=key)
         else:
             pi = self.base(x, **kwargs)
             action, log_prob = pi.sample_and_log_prob(seed=key)
-            info = {'log_prob': log_prob}
         if isinstance(self.action_space, Box):
             action = action.clip(-0.999, 0.999)
-        return action, info
+        return action, {"log_prob": log_prob}
+
 
 @dataclass
 class LangevinConfig:

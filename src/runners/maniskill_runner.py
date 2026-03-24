@@ -21,11 +21,11 @@ from src.common import (
 from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 
 def _compute_action_bounds(demo_path, env_id="PushCube-v1", filter_success=True):
-    """Compute action bounds from demo file, matching pretraining exactly.
+    """Compute action bounds from demo file, matching BC pretraining exactly.
     
     Uses ManiSkillDemoLoader with filter_success_only (which also cuts
     trajectories at first success), then computes bounds from raw trajectories
-    with 10% safety margin.
+    with 10% safety margin — identical to pretrain-jax.py.
     """
     from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
     
@@ -90,9 +90,9 @@ def get_demo_obs_keys(demo_path):
         return demo_keys
 
 def flatten_obs(obs_dict, env, demo_obs_keys):
-    # Flatten the observation dictionary to match pretraining's _load_observations().
+    # Flatten the observation dictionary to match BC pretraining's _load_observations().
     # Only includes: agent/qpos, agent/qvel, and ALL extra fields.
-    # Sorted alphabetically at each level (matching h5py iteration order in loader).
+    # Sorted alphabetically at each level (matching h5py iteration order in BC loader).
     if not hasattr(obs_dict, "keys"):
         raise TypeError(
             f"flatten_obs expects a dict observation, received {type(obs_dict)}"
@@ -140,7 +140,7 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
             prev_time = time.perf_counter()
             for i in range(num_steps):
                 key, act_key = jax.random.split(key)
-                action, log_prob = policy(act_key, obs)
+                action, _ = policy(act_key, obs)
                 
                 # Convert action from JAX to numpy for environment
                 action = np.asarray(action)
@@ -168,10 +168,7 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
                     reward=reward,
                     done=done,
                     truncated=truncated,
-                    extras={
-                        "behavior_log_prob": jnp.asarray(log_prob['log_prob']),
-                        "is_offline": jnp.zeros(np.asarray(reward).shape, dtype=jnp.float32),
-                    },
+                    extras={},
                 )
                 transitions.append(transition)
                 obs = flatten_obs(next_obs_dict, env=env, demo_obs_keys=demo_obs_keys)
@@ -235,23 +232,45 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
         def evaluate(key: Key, policy: Policy) -> dict:
             obs_dict, _ = env.reset()
             obs = flatten_obs(obs_dict, env=env, demo_obs_keys=demo_obs_keys)
+            online_trajectories = []
             
             metrics = defaultdict(list)
             num_episodes = 0
             for i in range(max_episode_steps):
                 key, act_key = jax.random.split(key)
-                action, _ = policy(act_key, obs)
+                action, log_prob = policy(act_key, obs)
                 # Convert action from JAX to numpy for environment
                 action = np.asarray(action)
                 # Denormalize action from [-1, 1] to dataset bounds for BC mode
                 action = denormalize_action(action, dataset_low, dataset_high)
                 # Get raw dict from base env
-                next_obs_dict, reward, done, truncated, info = env.step(action)    
+                next_obs_dict, reward, done, truncated, info = env.step(action)
+                reward = torch_to_numpy(reward)
+                done = torch_to_numpy(done)
+                truncated = torch_to_numpy(truncated)
+                if "final_observation" in info:
+                    _next_obs = to_jax(flatten_obs(info["final_observation"], env=env, demo_obs_keys=demo_obs_keys))
+                else:
+                    _next_obs = flatten_obs(next_obs_dict, env=env, demo_obs_keys=demo_obs_keys)
                 if "final_info" in info:
                     mask = info["_final_info"]
                     num_episodes += mask.sum()
                     for k, v in info["final_info"]["episode"].items():
                         metrics[k].append(v)
+
+                # Normalize action back to [-1, 1] for storage
+                action = normalize_action(action, dataset_low, dataset_high)
+
+                transition = Transition(
+                    obs=obs,
+                    next_obs=_next_obs,
+                    action=action,
+                    reward=reward,
+                    done=done,
+                    truncated=truncated,
+                    extras={"log_prob": log_prob['log_prob']},
+                )
+                online_trajectories.append(transition)
                 obs = flatten_obs(next_obs_dict, env=env, demo_obs_keys=demo_obs_keys)
 
             eval_metrics = {}
@@ -263,7 +282,7 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
             eval_metrics["episode_return_std"] = eval_metrics.pop("return_std", 0.0)
             eval_metrics["episode_length"] = eval_metrics.pop("episode_len", 0.0)
             eval_metrics["episode_length_std"] = eval_metrics.pop("episode_len_std", 0.0)
-            return eval_metrics
+            return eval_metrics, online_trajectories
     else:
         # Non-BC evaluation function - matches upstream behavior
         def evaluate(key: Key, policy: Policy) -> dict:

@@ -1,5 +1,4 @@
 import logging
-import optax
 import math
 from typing import Callable
 import operator
@@ -25,6 +24,7 @@ from src.normalization import Normalizer
 from src.algorithms import utils
 import distrax
 import torch
+from src.algorithms.reppo.common import OfflineReplayBuffer
 
 logging.basicConfig(level=logging.INFO)
 
@@ -50,14 +50,14 @@ def load_bc_weights_to_actor(bc_checkpoint_path: str, jax_actor: nnx.Module) -> 
         logging.warning(f"Checkpoint not found at {bc_checkpoint_path}, using random initialization")
         return jax_actor
     
-    logging.debug(f"Loading BC weights from {bc_checkpoint_path}")
+    logging.info(f"Loading BC weights from {bc_checkpoint_path}")
     
     try:
         with open(bc_checkpoint_path, 'rb') as f:
             saved_state = pickle.load(f)
         
         nnx.update(jax_actor, saved_state)
-        logging.debug(f"Successfully loaded JAX BC weights from {bc_checkpoint_path}")
+        logging.info(f"Successfully loaded JAX BC weights from {bc_checkpoint_path}")
         return jax_actor
         
     except Exception as e:
@@ -87,27 +87,24 @@ class REPPOPolicy(nnx.Module):
             x = self.normalizer.normalize(self.normalization_state, x)
         if self._eval_mode:
             action = self.base.det_action(x)
-            info = {}
+            _, log_prob = self.base(x, **kwargs).sample_and_log_prob(seed=key)
         else:
             pi = self.base(x, **kwargs)
             action, log_prob = pi.sample_and_log_prob(seed=key)
-            info = {"log_prob": log_prob}
         if isinstance(self.action_space, Box):
             action = action.clip(-0.999, 0.999)
-        return action, info
+        return action, {"log_prob": log_prob}
 
 
 def make_policy_fn(
     cfg: DictConfig, observation_space: Space, action_space: Space
 ) -> Callable[[REPPOTrainState, bool], Policy]:
     cfg = cfg.algorithm
+    offset = None
 
     def policy_fn(train_state: REPPOTrainState, eval: bool) -> Policy:
         normalizer = Normalizer() if cfg.normalize_env else None
-        actor_state = train_state.actor
-        if not eval and train_state.rollout_actor is not None:
-            actor_state = train_state.rollout_actor
-        actor_model = nnx.merge(actor_state.graphdef, actor_state.params)
+        actor_model = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
 
         policy = REPPOPolicy(
             base=actor_model,
@@ -175,17 +172,24 @@ def make_init_fn(
             rngs=rngs,
         )
 
-        # Initialize the actor with BC weights if available (BC initialization only)
-        bc_checkpoint_path = getattr(hparams, "bc_checkpoint_path", None)
-        if hparams.bc_indicator and bc_checkpoint_path and os.path.exists(bc_checkpoint_path):
-            logging.debug(f"Loading actor weights from {bc_checkpoint_path}")
-            actor = load_bc_weights_to_actor(bc_checkpoint_path, actor)
-        logging.debug("JAX Actor structure successfully created")
-        # Only one actor and one rollout_actor (reference policy)
+        # Print JAX actor structure
+        logging.info("JAX Actor structure successfully created")
+
+        # Load BC pretrained weights into actor's feature_encoder only if bc_indicator is True
+        if hparams.bc_indicator:
+            bc_checkpoint_path = getattr(hparams, "bc_checkpoint_path", None)
+            if bc_checkpoint_path and os.path.exists(bc_checkpoint_path):
+                logging.info(f"Loading BC actor weights from {bc_checkpoint_path}")
+                actor = load_bc_weights_to_actor(bc_checkpoint_path, actor)
+            else:
+                logging.info("No BC actor checkpoint specified or found, using random initialization")
+        else:
+            logging.info("bc_indicator=False, using random initialization for actor")
+
         return REPPOTrainState.create(
             graphdef=nnx.graphdef(actor),
             params=nnx.state(actor),
-            tx=tx,
+            tx=optax.set_to_zero(),
             actor=nnx.TrainState.create(
                 graphdef=nnx.graphdef(actor), params=nnx.state(actor), tx=tx
             ),
@@ -193,13 +197,10 @@ def make_init_fn(
                 graphdef=nnx.graphdef(critic), params=nnx.state(critic), tx=tx
             ),
             actor_target=nnx.TrainState.create(
-                graphdef=nnx.graphdef(actor), params=nnx.state(actor), tx=tx
+                graphdef=nnx.graphdef(actor),
+                params=nnx.state(actor),
+                tx=optax.set_to_zero(),
             ),
-            # rollout_actor is a simple dict, not a TrainState
-            rollout_actor={
-                'graphdef': nnx.graphdef(actor),
-                'params': nnx.state(actor),
-            },
             iteration=0,
             time_steps=0,
             normalization_state=norm_state,
@@ -258,15 +259,12 @@ def make_learner_fn(
             target_values,
         )
         critic_loss = jnp.mean(critic_loss)
-        valid = minibatch.extras.get("valid_mask", jnp.ones_like(minibatch.reward))
         mask_truncated = hparams.mask_truncated
         mask = (1.0 - minibatch.truncated) if mask_truncated else 1.0
-        mask = mask * valid  # mask out padded timesteps from offline sampling
-        denom = jnp.maximum(jnp.sum(valid), 1.0)
-        loss = jnp.sum(
+        loss = jnp.mean(
             mask
             * (critic_update_loss + hparams.aux_loss_mult * aux_loss)
-        ) / denom
+        )
         return loss, dict(
             value_loss=critic_loss,
             critic_update_loss=critic_update_loss,
@@ -282,27 +280,23 @@ def make_learner_fn(
     def actor_loss(
         params: nnx.Param, train_state: REPPOTrainState, minibatch: Transition
     ):
-        valid = minibatch.extras.get("valid_mask", jnp.ones(minibatch.reward.shape, dtype=jnp.float32))
-
-        def masked_mean(x):
-            x = jnp.asarray(x)
-            denom = jnp.maximum(jnp.sum(valid), 1.0)
-            return jnp.sum(x * valid) / denom
-
         critic_target_model = nnx.merge(
             train_state.critic.graphdef,
             train_state.critic.params,
         )
         actor_model = nnx.merge(train_state.actor.graphdef, params)
-        # Use rollout_actor as the reference policy for KL
+        actor_target_model = nnx.merge(
+            train_state.actor.graphdef, train_state.actor_target.params
+        )
+
         # set up models for training with batch norm
         actor_model.train()
         critic_target_model.eval()
-        rollout_actor = nnx.merge(train_state.rollout_actor['graphdef'], train_state.rollout_actor['params'])
-        rollout_actor.eval()
+        actor_target_model.eval()
         pi = actor_model(minibatch.obs)
-        old_pi = rollout_actor(minibatch.obs)
-        # policy KL with independent linear schedulers:
+        old_pi = actor_target_model(minibatch.obs)
+
+        # policy KL constraint
         kl = compute_policy_kl(minibatch=minibatch, pi=pi, old_pi=old_pi)
         alpha = jax.lax.stop_gradient(actor_model.temperature())
         if discrete_actions:
@@ -376,11 +370,11 @@ def make_learner_fn(
         lagrangian = actor_model.lagrangian()
 
         if hparams.actor_kl_clip_mode == "full":
-            loss = masked_mean(
+            loss = jnp.mean(
                 actor_loss + kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl
             )
         elif hparams.actor_kl_clip_mode == "clipped":
-            loss = masked_mean(
+            loss = jnp.mean(
                 jnp.where(
                     kl < hparams.kl_bound,
                     actor_loss,
@@ -388,7 +382,7 @@ def make_learner_fn(
                 )
             )
         elif hparams.actor_kl_clip_mode == "value":
-            loss = masked_mean(actor_loss)
+            loss = jnp.mean(actor_loss)
         else:
             raise ValueError(f"Unknown actor loss mode: {hparams.actor_kl_clip_mode}")
 
@@ -404,9 +398,9 @@ def make_learner_fn(
 
         # total loss
         if hparams.update_entropy_lagrangian:
-            loss += masked_mean(target_entropy_loss)
+            loss += jnp.mean(target_entropy_loss)
         if hparams.update_kl_lagrangian:
-            loss += masked_mean(lagrangian_loss)
+            loss += jnp.mean(lagrangian_loss)
 
         # for logging
         real_action_log_prob = old_pi.log_prob(
@@ -459,17 +453,21 @@ def make_learner_fn(
                 kl = old_pi_act_log_prob - pi_act_log_prob
         return kl
 
-    # rollout_actor_tx will be set in make_init_fn and carried in the state, so we can reference it from train_state.rollout_actor.tx
     def update(train_state: REPPOTrainState, batch: Transition):
-        critic_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
-        output, grads = critic_grad_fn(train_state.critic.params, train_state, batch)
-        critic_train_state = train_state.critic.apply_gradients(grads)
-        train_state = train_state.replace(
-            critic=critic_train_state,
-        )
-        critic_metrics = output[1]
+        # Update critic always
+        if cfg.algorithm.bc_indicator:
+            def update_critic(_):
+                critic_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
+                output, grads = critic_grad_fn(train_state.critic.params, train_state, batch)
+                critic_train_state = train_state.critic.apply_gradients(grads)
+                critic_metrics = output[1]
+                return critic_train_state, critic_metrics
+            
+            # Always update the critic
+            critic_train_state, critic_metrics = update_critic(None)
+            train_state = train_state.replace(critic=critic_train_state)
 
-        if hparams.bc_indicator:
+            # Actor update with delayed start
             def update_actor(_):
                 actor_grad_fn = jax.value_and_grad(actor_loss, has_aux=True)
                 output, grads = actor_grad_fn(train_state.actor.params, train_state, batch)
@@ -481,21 +479,31 @@ def make_learner_fn(
                 actor_train_state = train_state.actor.apply_gradients(grads)
                 actor_metrics = output[1]
                 return actor_train_state, grad_norm, actor_metrics
-
+            
             def hold_update_actor(_):
                 actor_train_state = train_state.actor
                 grad_norm = jnp.array(0.0)
+                # Dynamically get the metric structure from actor_loss without computing gradients
                 _, actor_metrics = actor_loss(train_state.actor.params, train_state, batch)
                 return actor_train_state, grad_norm, actor_metrics
-
-            actor_update_delay = int(getattr(hparams, "bc_actor_update_delay", 0))
+            
+            # for bc policy only, start updating the actor after some iterations
             actor_train_state, grad_norm, actor_metrics = jax.lax.cond(
-                train_state.iteration >= actor_update_delay,
+                train_state.iteration > cfg.algorithm.bc_actor_update_delay,
                 update_actor,
                 hold_update_actor,
-                operand=None,
+                None
             )
+
         else:
+            critic_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
+            output, grads = critic_grad_fn(train_state.critic.params, train_state, batch)
+            critic_train_state = train_state.critic.apply_gradients(grads)
+            train_state = train_state.replace(
+                critic=critic_train_state,
+            )
+            critic_metrics = output[1]
+
             actor_grad_fn = jax.value_and_grad(actor_loss, has_aux=True)
             output, grads = actor_grad_fn(train_state.actor.params, train_state, batch)
             grad_norm = jax.tree.map(lambda x: jnp.linalg.norm(x), grads)
@@ -505,12 +513,12 @@ def make_learner_fn(
             )
             actor_train_state = train_state.actor.apply_gradients(grads)
             actor_metrics = output[1]
-
-        # Only update actor; rollout_actor is frozen at the start of each outer
-        # iteration to serve as the KL reference policy.
+        
+        # Update train_state with actor in all paths
         train_state = train_state.replace(
             actor=actor_train_state,
         )
+        
         return train_state, {
             **critic_metrics,
             **actor_metrics,
@@ -556,44 +564,40 @@ def make_learner_fn(
 
     def nstep_lambda(batch: Transition):
         def loop(carry: tuple[jax.Array, ...], transition: Transition):
-            retrace_target, gae, next_value, next_c, next_q = carry
-            done = transition.done
+            lambda_return, gae, truncated, next_value = carry
+
+            # combine importance_weights with TD lambda
             truncated = transition.truncated
+            done = transition.done
             reward = transition.extras["soft_reward"]
-            expected_next_q = transition.extras["next_value"]
-            q_value = transition.extras["q_value"]
+            value = transition.extras["value"]
             policy_value = transition.extras["policy_value"]
-            log_prob_behavior = transition.extras["behavior_log_prob"]
-            log_prob_current = transition.extras["log_prob_current"]
+            lambda_sum = hparams.lmbda * lambda_return + (1 - hparams.lmbda) * value
+            lambda_return = reward + hparams.gamma * jnp.where(
+                truncated, value, (1.0 - done) * lambda_sum
+            )
 
-            log_ratio = log_prob_current - log_prob_behavior
-            ratio = jnp.exp(jnp.clip(log_ratio, -5.0, 5.0))
-            c_t = hparams.lmbda * jnp.minimum(1.0, ratio)
-
-            td_error = reward + hparams.gamma * (1.0 - done) * expected_next_q - q_value
-            retrace_target = q_value + td_error + hparams.gamma * (1.0 - done) * next_c * (retrace_target - next_q)
-            retrace_target = jnp.where(truncated, q_value + td_error, retrace_target)
-
+            # GAE for policy
             delta = reward + hparams.gamma * (1.0 - done) * next_value - policy_value
             gae = delta + hparams.gamma * (1.0 - done) * hparams.lmbda * gae
-            gae = jnp.where(truncated, reward + hparams.gamma * (1.0 - done) * next_value - expected_next_q, gae)
+            truncated_gae = reward + hparams.gamma * (1.0 - done) * next_value - value
+            gae = jnp.where(truncated, truncated_gae, gae)
 
+            truncated = transition.truncated
             return (
-                retrace_target,
+                lambda_return,
                 gae,
-                expected_next_q,
-                c_t,
-                q_value,
-            ), (retrace_target, gae)
+                truncated,
+                policy_value,
+            ), (lambda_return, gae)
 
         _, (target_values, target_advs) = jax.lax.scan(
             f=loop,
             init=(
-                batch.extras["next_value"][-1],
+                batch.extras["value"][-1],
                 batch.extras["policy_value"][-1],
-                batch.extras["next_value"][-1],
-                jnp.ones_like(batch.extras["next_value"][-1]),
-                batch.extras["q_value"][-1],
+                jnp.ones_like(batch.truncated[0]),
+                batch.extras["policy_value"][-1],
             ),
             xs=batch,
             reverse=True,
@@ -601,7 +605,7 @@ def make_learner_fn(
         return target_values, target_advs
 
     def compute_extras(key: Key, train_state: REPPOTrainState, batch: Transition):
-        key, act1_key, act2_key, act3_key = jax.random.split(key, 4)
+        key, act1_key, act2_key = jax.random.split(key, 3)
 
         actor_model = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
         critic_model = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
@@ -611,58 +615,33 @@ def make_learner_fn(
         actions, log_probs = actor_model(batch.next_obs).sample_and_log_prob(
             seed=act1_key
         )
-        actions = jnp.clip(actions, -0.999, 0.999)
         critic_output = critic_model(batch.next_obs, actions)
+        value = critic_output["value"]
         next_emb = critic_output["embed"]
 
         soft_reward = (
             batch.reward - hparams.gamma * log_probs * actor_model.temperature()
         )
 
+        # compute average policy value
         if hparams.scale_samples_with_action_d:
             num_samples = 8 * d
         else:
             num_samples = 8
-        next_pi = actor_model(batch.next_obs)
-        next_actions = next_pi.sample(seed=act2_key, sample_shape=(num_samples,))
-        next_actions = jnp.clip(next_actions, -0.999, 0.999)
-        next_obs = jnp.repeat(batch.next_obs[None, ...], next_actions.shape[0], axis=0)
-        next_q_values = critic_model(next_obs, next_actions)["value"]
-        next_value = next_q_values.mean(0)
-
-        # compute average policy value for the actor baseline
         pi = actor_model(batch.obs)
         actions = pi.sample(
-            seed=act3_key, sample_shape=(num_samples,)
-        )
+            seed=act2_key, sample_shape=(num_samples,)
+        )  # WARNING: magic number
         actions = jnp.clip(actions, -0.999, 0.999)
         obs = jnp.repeat(batch.obs[None, ...], actions.shape[0], axis=0)
         policy_value = critic_model(obs, actions)["value"].mean(0)
 
-        # Compute current policy log prob of actual batch actions for retrace importance ratio
-        pi_current = actor_model(batch.obs)
-        batch_action = jnp.clip(batch.action, -0.999, 0.999)
-        log_prob_current = pi_current.log_prob(batch_action)
-        q_value = critic_model(batch.obs, batch_action)["value"]
-
-        # For offline data, use current policy log probs so retrace importance
-        # ratios stay near 1 instead of exploding as the policy drifts.
-        is_offline = batch.extras.get("is_offline", jnp.zeros_like(batch.reward))
-        behavior_log_prob = jnp.where(
-            is_offline > 0.5,
-            log_prob_current,
-            batch.extras["behavior_log_prob"],
-        )
-
         extras = {
             "soft_reward": soft_reward * cfg.env.get("reward_scaling", 1.0),
-            "next_value": next_value,
+            "value": value,
             "policy_value": policy_value,
             "next_emb": next_emb,
             "log_prob": log_probs,
-            "log_prob_current": log_prob_current,
-            "behavior_log_prob": behavior_log_prob,
-            "q_value": q_value,
         }
         return extras
 

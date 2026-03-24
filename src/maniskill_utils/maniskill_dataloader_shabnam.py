@@ -211,7 +211,7 @@ class ManiSkillDemoLoader:
 
 def load_demos_for_training(env_id: str,
                             bsize: int = 64,
-                            demo_path: str = '/scratch/cluster/idutta/h5_files/trajectory.rgb.pd_joint_pos.physx_cpu.h5',
+                            demo_path: str = '/scratch/cluster/idutta/h5_files/PushCube/trajectory.state_dict.pd_joint_delta_pos.physx_cpu.h5',
                             device: torch.device = torch.device("cpu"),
                             max_episodes: Optional[int] = None,
                             filter_success: bool = True) -> TensorDict:
@@ -254,6 +254,7 @@ def load_demos_for_training(env_id: str,
         batch_size=bsize,
         shuffle=False,
         drop_last=False)
+    print(trajectories[0]["observations"].shape)
     obs_dim = trajectories[0]["observations"].shape[1]  # 25 for non flattened
     act_dim = trajectories[0]["actions"].shape[1]  # 8 for non flattened
     # find min and max action values
@@ -267,7 +268,7 @@ def load_demos_for_training(env_id: str,
 # result = load_demos_for_training("PushCube-v1", device=torch.device("cpu"), filter_success=True)
 
 # Create video from dataset observations (render pre-recorded RGB or state images)
-def render_trajectory_video(demo_path = '/scratch/cluster/idutta/h5_files/trajectory.rgb.pd_joint_pos.physx_cpu.h5', env_id = 'PushCube-v1', output_path = '/scratch/cluster/idutta/expert_videos', fps: int = 30):
+def render_trajectory_video(demo_path = '/scratch/cluster/idutta/h5_files/PushCube/trajectory.state_dict.pd_joint_delta_pos.physx_cpu.h5', env_id = 'PushCube-v1', output_path = '/scratch/cluster/idutta/expert_videos', fps: int = 30):
     """
     Render videos by rendering pre-recorded RGB observations from dataset.
     Uses RGB images directly from H5 file sensor_data structure.

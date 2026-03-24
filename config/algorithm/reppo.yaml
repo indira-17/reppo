@@ -12,7 +12,7 @@ bc_checkpoint_path: /scratch/cluster/idutta/reppo/outputs/2026-03-06/19-06-23/An
 # /scratch/cluster/idutta/reppo/outputs/2026-03-06/19-01-22/RollBall-v1/saved_models/20260306_190123/bc_model_actor_best.pkl
 # /scratch/cluster/idutta/reppo/outputs/2026-03-06/19-06-23/AnymalC-Reach-v1/saved_models/20260306_190625/bc_model_actor_best.pkl
 bc_mse_loss_weight: 0.0
-bc_actor_update_delay : 0  # Only used for delayed actor update, not for a separate bc_actor
+bc_actor_update_delay : 10
 bc_indicator: True
 
 # optimization settings (seem very stable)
@@ -33,14 +33,6 @@ num_steps: 128
 num_mini_batches: 128
 num_envs: 1024
 num_epochs: 4
-
-# replay buffer settings (offline + online mixing)
-replay_buffer_size: null  # if null, defaults to 2x offline transitions
-replay_offline_fraction: 0.7  # fraction of each learner batch sampled from replay buffer
-
-# rho_mix settings (offline-to-online transition schedule)
-rho_mix: 1.0  # initial offline fraction (1.0 = all offline at start)
-bc_transition_iterations: 20  # number of iterations to linearly transition from offline to online
 
 # exploration settings (currently not touched)
 exploration_noise_max: 1.0
