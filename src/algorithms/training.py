@@ -1,5 +1,6 @@
 import logging
 import gymnasium
+import numpy as np
 from gymnax.environments.environment import Environment
 import jax
 import torch
@@ -21,6 +22,7 @@ from src.algorithms.reppo.common import OfflineReplayBuffer, OnlineReplayBuffer
 from src.common import Transition
 from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
+from src.runners.maniskill_runner import _compute_action_bounds, normalize_action
 
 def _pad_or_truncate(arr, length, fill=0.0):
     """Pad or truncate arr along axis 0 to `length`."""
@@ -43,6 +45,7 @@ def _create_replay_buffer_from_demos(demo_path, env_id):
     for traj in trajectories:
         obs_list.append(to_jax(traj['observations']))
         next_obs_list.append(to_jax(traj['next_observations']))
+        # Keep raw (unnormalized) demo actions in replay buffer.
         act_list.append(to_jax(traj['actions']))
         rew_list.append(to_jax(traj['rewards']).squeeze(-1))
         done_list.append(to_jax(traj['dones']).squeeze(-1))
@@ -55,13 +58,13 @@ def _create_replay_buffer_from_demos(demo_path, env_id):
         reward=rew_list,
         done=done_list,
         truncated=trunc_list,
-        log_prob=[jnp.zeros(t['observations'].shape[0]) for t in trajectories],
+        behavior_log_prob=[jnp.zeros(t['observations'].shape[0]) for t in trajectories],
         size=len(trajectories),
     )
     print(f"[REPLAY] Offline buffer created: {replay_buffer.size} trajectories")
     print(f"  traj[0] obs={replay_buffer.obs[0].shape} action={replay_buffer.action[0].shape} "
               f"reward={replay_buffer.reward[0].shape} done={replay_buffer.done[0].shape} "
-              f"log_prob={replay_buffer.log_prob[0].shape}")
+              f"behavior_log_prob={replay_buffer.behavior_log_prob[0].shape}")
     return replay_buffer
 
 def make_scan_train_fn(
@@ -225,19 +228,30 @@ def make_loop_train_fn(
         if bc_indicator:
             # initialise the offline replay buffer before the training loop starts
             offline_replay_buffer = _create_replay_buffer_from_demos(demo_path, env.spec.id)
+            dataset_low, dataset_high = _compute_action_bounds(
+                demo_path, env.spec.id, filter_success=True
+            )
+            offline_normalized_actions = [
+                to_jax(normalize_action(np.asarray(a), dataset_low, dataset_high))
+                for a in offline_replay_buffer.action
+            ]
 
-            # Compute initial log_probs for offline data using current policy (batched per trajectory)
+            # Compute initial behavior_log_probs for offline data using current policy (batched per trajectory)
             policy_for_logprobs = policy_fn(state, True)
             for traj_idx in range(offline_replay_buffer.size):
                 traj_obs = offline_replay_buffer.obs[traj_idx]  # [T, obs_dim]
+                traj_action = offline_normalized_actions[traj_idx]  # normalized to [-1, 1]
                 key, lp_key = jax.random.split(key)
-                _, extras = policy_for_logprobs(lp_key, traj_obs)
-                offline_replay_buffer.log_prob[traj_idx] = extras['log_prob']
+                # Compute behavior log-prob on dataset action under BC-initialized actor.
+                _, extras = policy_for_logprobs(lp_key, traj_obs, action_input=traj_action)
+                offline_replay_buffer.behavior_log_prob[traj_idx] = extras.get(
+                    'behavior_log_prob', extras['log_prob']
+                )
 
-            print(f"[REPLAY] Offline log_probs computed for {offline_replay_buffer.size} trajectories")
-            print(f"  traj[0] log_prob shape={offline_replay_buffer.log_prob[0].shape} "
-                f"min={float(offline_replay_buffer.log_prob[0].min()):.4f} "
-                f"max={float(offline_replay_buffer.log_prob[0].max()):.4f}")
+            print(f"[REPLAY] Offline behavior_log_probs computed for {offline_replay_buffer.size} trajectories")
+            print(f"  traj[0] behavior_log_prob shape={offline_replay_buffer.behavior_log_prob[0].shape} "
+                f"min={float(offline_replay_buffer.behavior_log_prob[0].min()):.4f} "
+                f"max={float(offline_replay_buffer.behavior_log_prob[0].max()):.4f}")
 
             online_replay_buffer = None  # will be created after first eval
 
@@ -254,15 +268,14 @@ def make_loop_train_fn(
                 )
 
                 if bc_indicator:
-                    # Sample num_envs trajectories, pad/truncate each to num_steps,
-                    # so we get [num_steps, num_envs, ...] with correct temporal structure.
+                    # Sample num_envs trajectories, pad/truncate each to num_steps so we get [num_steps, num_envs, ...] with correct temporal structure.
                     num_offline = num_envs if ratio >= 1.0 else int(ratio * num_envs)
                     num_online = num_envs - num_offline
 
                     sample_key, off_subkey, on_subkey = jax.random.split(sample_key, 3)
 
                     traj_obs, traj_next_obs, traj_action = [], [], []
-                    traj_reward, traj_done, traj_truncated, traj_log_prob = [], [], [], []
+                    traj_reward, traj_done, traj_truncated, traj_behavior_log_prob = [], [], [], []
 
                     # Sample num_offline trajectories from offline buffer
                     for _ in range(num_offline):
@@ -270,11 +283,11 @@ def make_loop_train_fn(
                         idx = int(jax.random.choice(pick_key, offline_replay_buffer.size))
                         traj_obs.append(_pad_or_truncate(offline_replay_buffer.obs[idx], num_steps))
                         traj_next_obs.append(_pad_or_truncate(offline_replay_buffer.next_obs[idx], num_steps))
-                        traj_action.append(_pad_or_truncate(offline_replay_buffer.action[idx], num_steps))
+                        traj_action.append(_pad_or_truncate(offline_normalized_actions[idx], num_steps))
                         traj_reward.append(_pad_or_truncate(offline_replay_buffer.reward[idx], num_steps))
                         traj_done.append(_pad_or_truncate(offline_replay_buffer.done[idx], num_steps, 1.0))
                         traj_truncated.append(_pad_or_truncate(offline_replay_buffer.truncated[idx], num_steps, 1.0))
-                        traj_log_prob.append(_pad_or_truncate(offline_replay_buffer.log_prob[idx], num_steps))
+                        traj_behavior_log_prob.append(_pad_or_truncate(offline_replay_buffer.behavior_log_prob[idx], num_steps))
 
                     # Sample num_online trajectories from online buffer
                     if num_online > 0 and online_replay_buffer is not None and online_replay_buffer.size > 0:
@@ -287,7 +300,7 @@ def make_loop_train_fn(
                             traj_reward.append(_pad_or_truncate(online_replay_buffer.reward[idx], num_steps))
                             traj_done.append(_pad_or_truncate(online_replay_buffer.done[idx], num_steps, 1.0))
                             traj_truncated.append(_pad_or_truncate(online_replay_buffer.truncated[idx], num_steps, 1.0))
-                            traj_log_prob.append(_pad_or_truncate(online_replay_buffer.log_prob[idx], num_steps))
+                            traj_behavior_log_prob.append(_pad_or_truncate(online_replay_buffer.behavior_log_prob[idx], num_steps))
                     else:
                         # Fill remaining slots with more offline trajectories
                         for _ in range(num_online):
@@ -295,11 +308,11 @@ def make_loop_train_fn(
                             idx = int(jax.random.choice(pick_key, offline_replay_buffer.size))
                             traj_obs.append(_pad_or_truncate(offline_replay_buffer.obs[idx], num_steps))
                             traj_next_obs.append(_pad_or_truncate(offline_replay_buffer.next_obs[idx], num_steps))
-                            traj_action.append(_pad_or_truncate(offline_replay_buffer.action[idx], num_steps))
+                            traj_action.append(_pad_or_truncate(offline_normalized_actions[idx], num_steps))
                             traj_reward.append(_pad_or_truncate(offline_replay_buffer.reward[idx], num_steps))
                             traj_done.append(_pad_or_truncate(offline_replay_buffer.done[idx], num_steps, 1.0))
                             traj_truncated.append(_pad_or_truncate(offline_replay_buffer.truncated[idx], num_steps, 1.0))
-                            traj_log_prob.append(_pad_or_truncate(offline_replay_buffer.log_prob[idx], num_steps))
+                            traj_behavior_log_prob.append(_pad_or_truncate(offline_replay_buffer.behavior_log_prob[idx], num_steps))
 
                     transitions = Transition(
                         obs=_stack_and_transpose(traj_obs),
@@ -308,7 +321,7 @@ def make_loop_train_fn(
                         reward=_stack_and_transpose(traj_reward),
                         done=_stack_and_transpose(traj_done),
                         truncated=_stack_and_transpose(traj_truncated),
-                        extras={"log_prob": _stack_and_transpose(traj_log_prob)},
+                        extras={"behavior_log_prob": _stack_and_transpose(traj_behavior_log_prob)},
                     )
                     if step == 0:
                         print(f"[REPLAY] Sampled batch (step={step}, ratio={ratio:.3f}): "
@@ -317,7 +330,7 @@ def make_loop_train_fn(
                               f"action={transitions.action.shape} "
                               f"reward={transitions.reward.shape} "
                               f"done={transitions.done.shape}")
-                        print(f"  extras log_prob={transitions.extras['log_prob'].shape}")
+                        print(f"  extras behavior_log_prob={transitions.extras['behavior_log_prob'].shape}")
                         print(f"  Expected: [{num_steps}, {num_envs}, ...]")
                 else:
                     transitions = rollout_transitions
@@ -348,6 +361,11 @@ def make_loop_train_fn(
                     lambda *xs: jnp.stack(xs), *online_trajectories
                 )
                 n_eval_envs = stacked_online.obs.shape[1]
+                online_lp_key = (
+                    'behavior_log_prob'
+                    if 'behavior_log_prob' in stacked_online.extras
+                    else 'log_prob'
+                )
                 obs_list, next_obs_list, act_list = [], [], []
                 rew_list, done_list, trunc_list, lp_list = [], [], [], []
                 for env_idx in range(n_eval_envs):
@@ -357,7 +375,7 @@ def make_loop_train_fn(
                     rew_list.append(stacked_online.reward[:, env_idx])
                     done_list.append(stacked_online.done[:, env_idx])
                     trunc_list.append(stacked_online.truncated[:, env_idx])
-                    lp_list.append(stacked_online.extras['log_prob'][:, env_idx])
+                    lp_list.append(stacked_online.extras[online_lp_key][:, env_idx])
 
                 online_replay_buffer = OnlineReplayBuffer(
                     obs=obs_list,
@@ -366,7 +384,7 @@ def make_loop_train_fn(
                     reward=rew_list,
                     done=done_list,
                     truncated=trunc_list,
-                    log_prob=lp_list,
+                    behavior_log_prob=lp_list,
                     size=n_eval_envs,
                 )
                 print(f"[REPLAY] Online buffer created: {online_replay_buffer.size} trajectories "
@@ -375,7 +393,7 @@ def make_loop_train_fn(
                         f"action={online_replay_buffer.action[0].shape} "
                         f"reward={online_replay_buffer.reward[0].shape} "
                         f"done={online_replay_buffer.done[0].shape} "
-                        f"log_prob={online_replay_buffer.log_prob[0].shape}")
+                        f"behavior_log_prob={online_replay_buffer.behavior_log_prob[0].shape}")
                 ratio = ratio - (1/num_iterations)
                 print(f"[REPLAY] ratio updated to {ratio:.4f}")
 

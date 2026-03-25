@@ -83,17 +83,25 @@ class REPPOPolicy(nnx.Module):
         self.action_space = action_space
 
     def __call__(self, key: jax.Array, x: jax.Array, **kwargs) -> distrax.Distribution:
+        action_input = kwargs.pop("action_input", None)
         if self.normalizer is not None:
             x = self.normalizer.normalize(self.normalization_state, x)
         if self._eval_mode:
+            pi = self.base(x, **kwargs)
             action = self.base.det_action(x)
-            _, log_prob = self.base(x, **kwargs).sample_and_log_prob(seed=key)
+            action_for_logprob = action if action_input is None else action_input
+            action_for_logprob = (
+                action_for_logprob.clip(-0.999, 0.999)
+                if isinstance(self.action_space, Box)
+                else action_for_logprob
+            )
+            log_prob = pi.log_prob(action_for_logprob)
         else:
             pi = self.base(x, **kwargs)
             action, log_prob = pi.sample_and_log_prob(seed=key)
         if isinstance(self.action_space, Box):
             action = action.clip(-0.999, 0.999)
-        return action, {"log_prob": log_prob}
+        return action, {"log_prob": log_prob, "behavior_log_prob": log_prob}
 
 
 def make_policy_fn(
@@ -219,6 +227,9 @@ def make_learner_fn(
     discrete_actions = isinstance(action_space, Discrete)
     d = action_space.shape[-1] if not discrete_actions else action_space.n
 
+    def _get_behavior_log_prob(extras: dict):
+        return extras["behavior_log_prob"] if "behavior_log_prob" in extras else extras["log_prob"]
+
     def critic_loss_fn(
         params: nnx.Param, train_state: REPPOTrainState, minibatch: Transition
     ):
@@ -320,7 +331,7 @@ def make_learner_fn(
                     - minibatch.extras["target_advs"].mean()
                 ) / (minibatch.extras["target_advs"].std() + 1e-8)
                 log_prob = pi.log_prob(minibatch.action.clip(-0.999, 0.999))
-                old_log_prob = minibatch.extras["log_prob"]
+                old_log_prob = _get_behavior_log_prob(minibatch.extras)
                 ratio = jnp.exp(log_prob - old_log_prob)
                 actor_loss1 = ratio * adv
                 EPS = 0.2  # hardcoded for now
@@ -564,7 +575,7 @@ def make_learner_fn(
 
     def nstep_lambda(batch: Transition):
         def loop(carry: tuple[jax.Array, ...], transition: Transition):
-            lambda_return, gae, truncated, next_value = carry
+            lambda_return, gae, truncated, next_value, retrace_coeff_next = carry
 
             # combine importance_weights with TD lambda
             truncated = transition.truncated
@@ -572,23 +583,30 @@ def make_learner_fn(
             reward = transition.extras["soft_reward"]
             value = transition.extras["value"]
             policy_value = transition.extras["policy_value"]
-            lambda_sum = hparams.lmbda * lambda_return + (1 - hparams.lmbda) * value
-            lambda_return = reward + hparams.gamma * jnp.where(
-                truncated, value, (1.0 - done) * lambda_sum
-            )
+            
+            # Retrace coefficient
+            behavior_log_prob = _get_behavior_log_prob(transition.extras)
+            current_log_prob = transition.extras["policy_log_prob"]
+            retrace_coeff = hparams.lmbda * jnp.minimum(1.0, jnp.exp(current_log_prob - behavior_log_prob))
+
+            # Retrace target -
+            # Qret_t = r_t + gamma * E[Q(s_{t+1}, .)] + gamma * c_{t+1} * (Qret_{t+1} - Q(s_{t+1}, a_{t+1}))
+            lambda_return = reward + hparams.gamma * jnp.where(truncated, value, (1.0 - done) * (next_value + retrace_coeff_next * (lambda_return - value)))
 
             # GAE for policy
             delta = reward + hparams.gamma * (1.0 - done) * next_value - policy_value
-            gae = delta + hparams.gamma * (1.0 - done) * hparams.lmbda * gae
+            gae = delta + hparams.gamma * (1.0 - done) * retrace_coeff_next * gae
             truncated_gae = reward + hparams.gamma * (1.0 - done) * next_value - value
             gae = jnp.where(truncated, truncated_gae, gae)
 
             truncated = transition.truncated
+
             return (
                 lambda_return,
                 gae,
                 truncated,
                 policy_value,
+                retrace_coeff
             ), (lambda_return, gae)
 
         _, (target_values, target_advs) = jax.lax.scan(
@@ -598,6 +616,7 @@ def make_learner_fn(
                 batch.extras["policy_value"][-1],
                 jnp.ones_like(batch.truncated[0]),
                 batch.extras["policy_value"][-1],
+                jnp.zeros_like(batch.truncated[0]),
             ),
             xs=batch,
             reverse=True,
@@ -641,7 +660,9 @@ def make_learner_fn(
             "value": value,
             "policy_value": policy_value,
             "next_emb": next_emb,
-            "log_prob": log_probs,
+            "policy_log_prob": actor_model(batch.obs).log_prob(
+                batch.action.clip(-0.999, 0.999)
+            ),
         }
         return extras
 

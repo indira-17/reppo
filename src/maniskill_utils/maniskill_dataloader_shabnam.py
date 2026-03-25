@@ -114,8 +114,8 @@ class ManiSkillDemoLoader:
             success = None
             cut_idx = T
 
-        # Align everything properly (T-1 transitions)
-        obs = observations[:cut_idx]
+        # Align transitions properly.
+        obs = observations[:cut_idx + 1]   # cut_idx+1 entries for obs/next_obs pairs
         act = actions[:cut_idx]
         rew = rewards[:cut_idx]
         term = terminated[:cut_idx]
@@ -127,20 +127,21 @@ class ManiSkillDemoLoader:
         traj_data = {
             'observations': torch.as_tensor(obs[:-1], dtype=self.config.dtype, device=self.config.device),
             'next_observations': torch.as_tensor(obs[1:], dtype=self.config.dtype, device=self.config.device),
-            'actions': torch.as_tensor(act[:-1], dtype=self.config.dtype, device=self.config.device),
-            'rewards': torch.as_tensor(rew[:-1], dtype=self.config.dtype, device=self.config.device).unsqueeze(-1),
-            'dones': torch.as_tensor(term[:-1], dtype=torch.bool, device=self.config.device).unsqueeze(-1),
-            'truncations': torch.as_tensor(trunc[:-1], dtype=torch.bool, device=self.config.device).unsqueeze(-1),
+            'actions': torch.as_tensor(act, dtype=self.config.dtype, device=self.config.device),
+            'rewards': torch.as_tensor(rew, dtype=self.config.dtype, device=self.config.device).unsqueeze(-1),
+            'dones': torch.as_tensor(term, dtype=torch.bool, device=self.config.device).unsqueeze(-1),
+            'truncations': torch.as_tensor(trunc, dtype=torch.bool, device=self.config.device).unsqueeze(-1),
         }
 
         if success is not None:
             traj_data['success'] = torch.as_tensor(
-                success[:cut_idx-1],
+                success[:cut_idx],
                 dtype=torch.bool,
                 device=self.config.device
             ).unsqueeze(-1)
 
-        td = TensorDict(traj_data, batch_size=(len(obs) - 1,), device=self.config.device)
+        num_transitions = len(act)  # = cut_idx
+        td = TensorDict(traj_data, batch_size=(num_transitions,), device=self.config.device)
         return td.unsqueeze(0)
 
 

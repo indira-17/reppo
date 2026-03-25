@@ -268,7 +268,10 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
                     reward=reward,
                     done=done,
                     truncated=truncated,
-                    extras={"log_prob": log_prob['log_prob']},
+                    extras={
+                        "log_prob": log_prob['log_prob'],
+                        "behavior_log_prob": log_prob['log_prob'],
+                    },
                 )
                 online_trajectories.append(transition)
                 obs = flatten_obs(next_obs_dict, env=env, demo_obs_keys=demo_obs_keys)
