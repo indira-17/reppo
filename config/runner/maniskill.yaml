@@ -26,3 +26,4 @@ train_fn:
   num_eval: ${algorithm.num_eval}
   max_episode_steps: ${algorithm.max_episode_steps}
   stochastic_eval: True
+  bc_actor_update_delay: ${algorithm.bc_actor_update_delay}

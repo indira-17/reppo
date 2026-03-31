@@ -141,13 +141,12 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
             for i in range(num_steps):
                 key, act_key = jax.random.split(key)
                 action, _ = policy(act_key, obs)
-                
-                # Convert action from JAX to numpy for environment
-                action = np.asarray(action)
-                # Denormalize action from [-1, 1] to dataset bounds for BC mode
-                action = denormalize_action(action, dataset_low, dataset_high)
+
+                # Keep normalized policy action for storage; denormalize only for env step.
+                action_norm = np.asarray(action)
+                action_env = denormalize_action(action_norm, dataset_low, dataset_high)
                 # Get raw dict from base env
-                next_obs_dict, reward, done, truncated, info = env.step(action)
+                next_obs_dict, reward, done, truncated, info = env.step(action_env)
                 if "final_observation" in info:
                     _next_obs = to_jax(flatten_obs(info["final_observation"], env=env, demo_obs_keys=demo_obs_keys))
                 else:
@@ -157,14 +156,12 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
                 reward = torch_to_numpy(reward)
                 done = torch_to_numpy(done)
                 truncated = torch_to_numpy(truncated)
-                # Normalize action back to [-1, 1] for storage in transitions
-                action = normalize_action(action, dataset_low, dataset_high)
                 
                 # Record the transition
                 transition = Transition(
                     obs=obs,
                     next_obs=_next_obs,
-                    action=action,
+                    action=action_norm,
                     reward=reward,
                     done=done,
                     truncated=truncated,
@@ -239,12 +236,11 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
             for i in range(max_episode_steps):
                 key, act_key = jax.random.split(key)
                 action, log_prob = policy(act_key, obs)
-                # Convert action from JAX to numpy for environment
-                action = np.asarray(action)
-                # Denormalize action from [-1, 1] to dataset bounds for BC mode
-                action = denormalize_action(action, dataset_low, dataset_high)
+                # Keep normalized policy action for storage; denormalize only for env step.
+                action_norm = np.asarray(action)
+                action_env = denormalize_action(action_norm, dataset_low, dataset_high)
                 # Get raw dict from base env
-                next_obs_dict, reward, done, truncated, info = env.step(action)
+                next_obs_dict, reward, done, truncated, info = env.step(action_env)
                 reward = torch_to_numpy(reward)
                 done = torch_to_numpy(done)
                 truncated = torch_to_numpy(truncated)
@@ -258,13 +254,10 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
                     for k, v in info["final_info"]["episode"].items():
                         metrics[k].append(v)
 
-                # Normalize action back to [-1, 1] for storage
-                action = normalize_action(action, dataset_low, dataset_high)
-
                 transition = Transition(
                     obs=obs,
                     next_obs=_next_obs,
-                    action=action,
+                    action=action_norm,
                     reward=reward,
                     done=done,
                     truncated=truncated,

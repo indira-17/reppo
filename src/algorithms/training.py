@@ -189,7 +189,8 @@ def make_loop_train_fn(
     eval_fn: EvalFn | None = None,
     log_callback: LogCallback | None = None,
     demo_path: str | None = None,
-    bc_indicator: bool = False
+    bc_indicator: bool = False,
+    bc_actor_update_delay: int = 0,
 ):
     from src.runners.gymnasium_runner import (
         make_eval_fn as make_gymnasium_eval_fn,
@@ -211,6 +212,26 @@ def make_loop_train_fn(
     if eval_fn is None:
         eval_fn = make_gymnasium_eval_fn(eval_env, max_episode_steps)
 
+    # Log per-dimension action diagnostics for wandb with grouped key namespaces.
+    def _action_stats(action_list, source: str) -> dict[str, jax.Array]:
+        if len(action_list) == 0:
+            return {
+                f"replay_action/count/{source}": jnp.array(0.0),
+            }
+
+        flat = jnp.concatenate(
+            [jnp.asarray(a).reshape(-1, jnp.asarray(a).shape[-1]) for a in action_list],
+            axis=0,
+        )
+        stats = {f"replay_action/count/{source}": jnp.array(float(flat.shape[0]))}
+        for dim in range(flat.shape[-1]):
+            vals = flat[:, dim]
+            stats[f"replay_action/min/{source}_d{dim}"] = vals.min()
+            stats[f"replay_action/max/{source}_d{dim}"] = vals.max()
+            stats[f"replay_action/mean/{source}_d{dim}"] = vals.mean()
+            stats[f"replay_action/std/{source}_d{dim}"] = vals.std()
+        return stats
+
     def loop_train_fn(key: Key) -> tuple[TrainState, dict]:
         ratio = 1.0
         # Initialize the policy, environment and map that across the number of random seeds
@@ -219,6 +240,7 @@ def make_loop_train_fn(
         train_steps_per_iteration = num_train_steps // num_iterations
         key, init_key = jax.random.split(key)
         state = init_fn(init_key)
+        bc_anchor_state = state if bc_indicator else None
         obs, _ = env.reset()
         state = state.replace(last_obs=to_jax(obs), last_env_state=None)
         logging.info(f"Starting training for {num_iterations} iterations.")
@@ -236,8 +258,8 @@ def make_loop_train_fn(
                 for a in offline_replay_buffer.action
             ]
 
-            # Compute initial behavior_log_probs for offline data using current policy (batched per trajectory)
-            policy_for_logprobs = policy_fn(state, True)
+            # Compute initial behavior_log_probs for offline data using current policy
+            policy_for_logprobs = policy_fn(bc_anchor_state, True)
             for traj_idx in range(offline_replay_buffer.size):
                 traj_obs = offline_replay_buffer.obs[traj_idx]  # [T, obs_dim]
                 traj_action = offline_normalized_actions[traj_idx]  # normalized to [-1, 1]
@@ -257,10 +279,17 @@ def make_loop_train_fn(
 
         step = 0
         for i in range(num_iterations):
+            current_iteration = int(state.iteration)
+            use_bc_anchor_policy = (
+                bc_indicator
+                and bc_anchor_state is not None
+                and current_iteration == bc_actor_update_delay + 1
+            )
             for _ in range(train_steps_per_iteration):
                 key, rollout_key, learn_key, sample_key = jax.random.split(key, 4)
-                # Collect trajectories from `state`
-                policy = policy_fn(state, False)
+                # Collect trajectories from 'state'
+                rollout_policy_state = bc_anchor_state if use_bc_anchor_policy else state
+                policy = policy_fn(rollout_policy_state, False)
 
                 # Also collect fresh rollout transitions (for env stepping / state update)
                 rollout_transitions, state = rollout_fn(
@@ -276,6 +305,7 @@ def make_loop_train_fn(
 
                     traj_obs, traj_next_obs, traj_action = [], [], []
                     traj_reward, traj_done, traj_truncated, traj_behavior_log_prob = [], [], [], []
+                    traj_action_offline, traj_action_online = [], []
 
                     # Sample num_offline trajectories from offline buffer
                     for _ in range(num_offline):
@@ -283,7 +313,9 @@ def make_loop_train_fn(
                         idx = int(jax.random.choice(pick_key, offline_replay_buffer.size))
                         traj_obs.append(_pad_or_truncate(offline_replay_buffer.obs[idx], num_steps))
                         traj_next_obs.append(_pad_or_truncate(offline_replay_buffer.next_obs[idx], num_steps))
-                        traj_action.append(_pad_or_truncate(offline_normalized_actions[idx], num_steps))
+                        sampled_action = _pad_or_truncate(offline_normalized_actions[idx], num_steps)
+                        traj_action.append(sampled_action)
+                        traj_action_offline.append(sampled_action)
                         traj_reward.append(_pad_or_truncate(offline_replay_buffer.reward[idx], num_steps))
                         traj_done.append(_pad_or_truncate(offline_replay_buffer.done[idx], num_steps, 1.0))
                         traj_truncated.append(_pad_or_truncate(offline_replay_buffer.truncated[idx], num_steps, 1.0))
@@ -296,7 +328,9 @@ def make_loop_train_fn(
                             idx = int(jax.random.choice(pick_key, online_replay_buffer.size))
                             traj_obs.append(_pad_or_truncate(online_replay_buffer.obs[idx], num_steps))
                             traj_next_obs.append(_pad_or_truncate(online_replay_buffer.next_obs[idx], num_steps))
-                            traj_action.append(_pad_or_truncate(online_replay_buffer.action[idx], num_steps))
+                            sampled_action = _pad_or_truncate(online_replay_buffer.action[idx], num_steps)
+                            traj_action.append(sampled_action)
+                            traj_action_online.append(sampled_action)
                             traj_reward.append(_pad_or_truncate(online_replay_buffer.reward[idx], num_steps))
                             traj_done.append(_pad_or_truncate(online_replay_buffer.done[idx], num_steps, 1.0))
                             traj_truncated.append(_pad_or_truncate(online_replay_buffer.truncated[idx], num_steps, 1.0))
@@ -308,7 +342,9 @@ def make_loop_train_fn(
                             idx = int(jax.random.choice(pick_key, offline_replay_buffer.size))
                             traj_obs.append(_pad_or_truncate(offline_replay_buffer.obs[idx], num_steps))
                             traj_next_obs.append(_pad_or_truncate(offline_replay_buffer.next_obs[idx], num_steps))
-                            traj_action.append(_pad_or_truncate(offline_normalized_actions[idx], num_steps))
+                            sampled_action = _pad_or_truncate(offline_normalized_actions[idx], num_steps)
+                            traj_action.append(sampled_action)
+                            traj_action_offline.append(sampled_action)
                             traj_reward.append(_pad_or_truncate(offline_replay_buffer.reward[idx], num_steps))
                             traj_done.append(_pad_or_truncate(offline_replay_buffer.done[idx], num_steps, 1.0))
                             traj_truncated.append(_pad_or_truncate(offline_replay_buffer.truncated[idx], num_steps, 1.0))
@@ -323,6 +359,12 @@ def make_loop_train_fn(
                         truncated=_stack_and_transpose(traj_truncated),
                         extras={"behavior_log_prob": _stack_and_transpose(traj_behavior_log_prob)},
                     )
+                    batch_action_stats = {
+                        **_action_stats(traj_action_offline, "offline"),
+                        **_action_stats(traj_action_online, "online"),
+                        "replay_num_offline_traj": jnp.array(float(num_offline)),
+                        "replay_num_online_traj": jnp.array(float(num_online)),
+                    }
                     if step == 0:
                         print(f"[REPLAY] Sampled batch (step={step}, ratio={ratio:.3f}): "
                               f"num_offline={num_offline}, num_online={num_online}")
@@ -334,6 +376,7 @@ def make_loop_train_fn(
                         print(f"  Expected: [{num_steps}, {num_envs}, ...]")
                 else:
                     transitions = rollout_transitions
+                    batch_action_stats = {}
 
                 # Execute an update to the policy with `transitions`
                 state, train_metrics = learner_fn(
@@ -341,9 +384,11 @@ def make_loop_train_fn(
                 )
 
                 if step % train_log_interval == 0:
-                    log_callback(state, utils.prefix_dict("train", train_metrics))
+                    log_metrics = {**train_metrics, **batch_action_stats}
+                    log_callback(state, utils.prefix_dict("train", log_metrics))
                 step += 1
-            policy = policy_fn(state, not stochastic_eval)
+            policy_state = bc_anchor_state if use_bc_anchor_policy else state
+            policy = policy_fn(policy_state, not stochastic_eval)
             key, eval_key = jax.random.split(key)
 
             if bc_indicator:
@@ -394,7 +439,7 @@ def make_loop_train_fn(
                         f"reward={online_replay_buffer.reward[0].shape} "
                         f"done={online_replay_buffer.done[0].shape} "
                         f"behavior_log_prob={online_replay_buffer.behavior_log_prob[0].shape}")
-                ratio = ratio - (1/num_iterations)
+                ratio = max(0.0, ratio - (2 / num_iterations))
                 print(f"[REPLAY] ratio updated to {ratio:.4f}")
 
         return state, {

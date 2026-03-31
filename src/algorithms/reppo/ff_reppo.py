@@ -99,6 +99,9 @@ class REPPOPolicy(nnx.Module):
         else:
             pi = self.base(x, **kwargs)
             action, log_prob = pi.sample_and_log_prob(seed=key)
+            if isinstance(self.action_space, Box):
+                action = action.clip(-0.999, 0.999)
+                log_prob = pi.log_prob(action)
         if isinstance(self.action_space, Box):
             action = action.clip(-0.999, 0.999)
         return action, {"log_prob": log_prob, "behavior_log_prob": log_prob}
@@ -400,9 +403,7 @@ def make_learner_fn(
         # SAC target entropy loss
 
         target_entropy = action_size_target + entropy
-        target_entropy_loss = actor_model.temperature() * jax.lax.stop_gradient(
-            target_entropy
-        )
+        target_entropy_loss = actor_model.temperature() * jax.lax.stop_gradient(target_entropy)
 
         # Lagrangian constraint (follows temperature update)
         lagrangian_loss = -lagrangian * jax.lax.stop_gradient(kl - hparams.kl_bound)
@@ -413,25 +414,21 @@ def make_learner_fn(
         if hparams.update_kl_lagrangian:
             loss += jnp.mean(lagrangian_loss)
 
-        # for logging
-        real_action_log_prob = old_pi.log_prob(
-            minibatch.action.clip(-0.999, 0.999)
-        ).mean()
+        # for logging (policy drift tracker)
+        real_action_log_prob = jnp.mean(old_pi.log_prob(minibatch.action.clip(-0.999, 0.999)))
 
         return loss, dict(
             actor_loss=actor_loss,
             loss=loss,
             temp=actor_model.temperature(),
             abs_batch_action=jnp.abs(minibatch.action).mean(),
-            abs_pred_action=jnp.abs(pred_action).mean()
-            if not discrete_actions
-            else 0.0,
+            abs_pred_action=jnp.abs(pred_action).mean() if not discrete_actions else 0.0,
             reward_mean=minibatch.reward.mean(),
-            kl=kl.mean(),
+            kl=jnp.mean(kl),
             lagrangian=lagrangian,
-            lagrangian_loss=lagrangian_loss,
-            entropy=entropy,
-            entropy_loss=target_entropy_loss,
+            lagrangian_loss=jnp.mean(lagrangian_loss),
+            entropy=jnp.mean(entropy),
+            entropy_loss=jnp.mean(target_entropy_loss),
             target_values=minibatch.extras["target_values"].mean(),
             real_action_log_prob=real_action_log_prob,
         )
@@ -575,13 +572,13 @@ def make_learner_fn(
 
     def nstep_lambda(batch: Transition):
         def loop(carry: tuple[jax.Array, ...], transition: Transition):
-            lambda_return, gae, truncated, next_value, retrace_coeff_next = carry
+            lambda_return_next, expectation_next_state, next_current_q_value, retrace_coeff_next = carry
 
             # combine importance_weights with TD lambda
             truncated = transition.truncated
             done = transition.done
             reward = transition.extras["soft_reward"]
-            value = transition.extras["value"]
+            current_q_value = transition.extras["value"]
             policy_value = transition.extras["policy_value"]
             
             # Retrace coefficient
@@ -589,34 +586,30 @@ def make_learner_fn(
             current_log_prob = transition.extras["policy_log_prob"]
             retrace_coeff = hparams.lmbda * jnp.minimum(1.0, jnp.exp(current_log_prob - behavior_log_prob))
 
-            # Retrace target -
-            # Qret_t = r_t + gamma * E[Q(s_{t+1}, .)] + gamma * c_{t+1} * (Qret_{t+1} - Q(s_{t+1}, a_{t+1}))
-            lambda_return = reward + hparams.gamma * jnp.where(truncated, value, (1.0 - done) * (next_value + retrace_coeff_next * (lambda_return - value)))
+            # Retrace recursion:
+            # Qret_t = r_t + gamma * E_{a~pi(.|s_{t+1})}[Q(s_{t+1}, a)] + gamma * c_{t+1} * (Qret_{t+1} - Q(s_{t+1}, a_{t+1}))
+            q_value_current = next_current_q_value
+            lambda_return = reward + (1.0 - done) * (hparams.gamma * expectation_next_state + hparams.gamma * retrace_coeff_next * (lambda_return_next - q_value_current))
+            # stop recursion on padded/truncated transitions
+            lambda_return = jnp.where(truncated, current_q_value, lambda_return)
 
-            # GAE for policy
-            delta = reward + hparams.gamma * (1.0 - done) * next_value - policy_value
-            gae = delta + hparams.gamma * (1.0 - done) * retrace_coeff_next * gae
-            truncated_gae = reward + hparams.gamma * (1.0 - done) * next_value - value
-            gae = jnp.where(truncated, truncated_gae, gae)
-
-            truncated = transition.truncated
+            # Advantage baseline at current state
+            gae = lambda_return - policy_value
 
             return (
                 lambda_return,
-                gae,
-                truncated,
                 policy_value,
+                current_q_value,
                 retrace_coeff
             ), (lambda_return, gae)
 
         _, (target_values, target_advs) = jax.lax.scan(
             f=loop,
             init=(
+                jnp.zeros_like(batch.extras["value"][-1]),
+                batch.extras["expectation_next_state"][-1],
                 batch.extras["value"][-1],
-                batch.extras["policy_value"][-1],
-                jnp.ones_like(batch.truncated[0]),
-                batch.extras["policy_value"][-1],
-                jnp.zeros_like(batch.truncated[0]),
+                jnp.zeros_like(batch.extras["value"][-1]),
             ),
             xs=batch,
             reverse=True,
@@ -624,7 +617,7 @@ def make_learner_fn(
         return target_values, target_advs
 
     def compute_extras(key: Key, train_state: REPPOTrainState, batch: Transition):
-        key, act1_key, act2_key = jax.random.split(key, 3)
+        key, act1_key, act2_key, act3_key = jax.random.split(key, 4)
 
         actor_model = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
         critic_model = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
@@ -642,7 +635,10 @@ def make_learner_fn(
             batch.reward - hparams.gamma * log_probs * actor_model.temperature()
         )
 
-        # compute average policy value
+        # Q(s_t, a_t) for Retrace correction term
+        current_q_value = critic_model(batch.obs, batch.action.clip(-0.999, 0.999))["value"]
+
+        # compute average policy value at current state (baseline for advantages)
         if hparams.scale_samples_with_action_d:
             num_samples = 8 * d
         else:
@@ -655,10 +651,17 @@ def make_learner_fn(
         obs = jnp.repeat(batch.obs[None, ...], actions.shape[0], axis=0)
         policy_value = critic_model(obs, actions)["value"].mean(0)
 
+        # compute average policy value at next state for Retrace bootstrap
+        next_actions = actor_model(batch.next_obs).sample(seed=act3_key, sample_shape=(num_samples,))
+        next_actions = jnp.clip(next_actions, -0.999, 0.999)
+        next_obs = jnp.repeat(batch.next_obs[None, ...], next_actions.shape[0], axis=0)
+        expectation_next_state = critic_model(next_obs, next_actions)["value"].mean(0)
+
         extras = {
             "soft_reward": soft_reward * cfg.env.get("reward_scaling", 1.0),
-            "value": value,
+            "value": current_q_value,
             "policy_value": policy_value,
+            "expectation_next_state": expectation_next_state,
             "next_emb": next_emb,
             "policy_log_prob": actor_model(batch.obs).log_prob(
                 batch.action.clip(-0.999, 0.999)

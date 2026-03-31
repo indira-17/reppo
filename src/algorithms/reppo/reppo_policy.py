@@ -48,6 +48,9 @@ class REPPOPolicy(nnx.Module):
         else:
             pi = self.base(x, **kwargs)
             action, log_prob = pi.sample_and_log_prob(seed=key)
+            if isinstance(self.action_space, Box):
+                action = action.clip(-0.999, 0.999)
+                log_prob = pi.log_prob(action)
         if isinstance(self.action_space, Box):
             action = action.clip(-0.999, 0.999)
         return action, {"log_prob": log_prob, "behavior_log_prob": log_prob}
