@@ -36,24 +36,19 @@ class REPPOPolicy(nnx.Module):
         if self.normalizer is not None:
             x = self.normalizer.normalize(self.normalization_state, x)
         if self._eval_mode:
-            pi = self.base(x, **kwargs)
             action = self.base.det_action(x)
-            action_for_logprob = action if action_input is None else action_input
-            action_for_logprob = (
-                action_for_logprob.clip(-0.999, 0.999)
-                if isinstance(self.action_space, Box)
-                else action_for_logprob
-            )
-            log_prob = pi.log_prob(action_for_logprob)
+            extras = {}
+            if action_input is not None:
+                pi = self.base(x, **kwargs)
+                log_prob = pi.log_prob(action_input)
+                extras = {"behavior_log_prob": log_prob}
         else:
             pi = self.base(x, **kwargs)
             action, log_prob = pi.sample_and_log_prob(seed=key)
-            if isinstance(self.action_space, Box):
-                action = action.clip(-0.999, 0.999)
-                log_prob = pi.log_prob(action)
+            extras = {"behavior_log_prob": log_prob}
         if isinstance(self.action_space, Box):
             action = action.clip(-0.999, 0.999)
-        return action, {"log_prob": log_prob, "behavior_log_prob": log_prob}
+        return action, extras
 
 
 @dataclass

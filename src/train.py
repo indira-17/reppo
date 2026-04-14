@@ -25,11 +25,11 @@ def main(cfg: DictConfig):
     logging.info("\n" + OmegaConf.to_yaml(cfg))
     
     # Modify run name based on bc_indicator
-    run_name = f"bc-reppo-{cfg.env.name}-retrace" if cfg.algorithm.bc_indicator else f"reppo-{cfg.env.name}-retrace"
+    run_name = f"bc-reppo-{cfg.env.name}-retrace" if cfg.algorithm.bc_indicator else f"reppo-{cfg.env.name}"
     
     wandb.init(
         mode=cfg.logging.mode,
-        project="bc-reppo-v2",
+        project="bc-reppo-ablations",
         entity=cfg.logging.entity,
         tags=cfg.tags,
         config=OmegaConf.to_container(cfg),
@@ -82,6 +82,7 @@ def main(cfg: DictConfig):
         log_callback=utils.make_log_callback(),
         demo_path=cfg.env.demo.demo_path,
         bc_indicator=cfg.algorithm.bc_indicator,
+        decay_rate=cfg.algorithm.online_sample_decay_rate,
     )
     start = time.perf_counter()
     _, metrics = train_fn(key)

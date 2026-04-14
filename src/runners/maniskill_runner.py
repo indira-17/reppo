@@ -135,9 +135,7 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
             transitions = []
             obs_dict = train_state.last_obs
             obs = flatten_obs(obs_dict, env=env, demo_obs_keys=demo_obs_keys)
-            
-            prev_step = train_state.time_steps
-            prev_time = time.perf_counter()
+
             for i in range(num_steps):
                 key, act_key = jax.random.split(key)
                 action, _ = policy(act_key, obs)
@@ -235,7 +233,11 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
             num_episodes = 0
             for i in range(max_episode_steps):
                 key, act_key = jax.random.split(key)
-                action, log_prob = policy(act_key, obs)
+                action, policy_extras = policy(act_key, obs)
+                if "behavior_log_prob" not in policy_extras:
+                    raise KeyError(
+                        "Policy must return 'behavior_log_prob' during BC eval rollouts."
+                    )
                 # Keep normalized policy action for storage; denormalize only for env step.
                 action_norm = np.asarray(action)
                 action_env = denormalize_action(action_norm, dataset_low, dataset_high)
@@ -262,8 +264,7 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
                     done=done,
                     truncated=truncated,
                     extras={
-                        "log_prob": log_prob['log_prob'],
-                        "behavior_log_prob": log_prob['log_prob'],
+                        "behavior_log_prob": policy_extras["behavior_log_prob"],
                     },
                 )
                 online_trajectories.append(transition)

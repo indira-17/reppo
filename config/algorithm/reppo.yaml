@@ -5,15 +5,26 @@ eval_interval: 2
 num_eval: 20
 
 # BC pretraining checkpoint path
-bc_checkpoint_path: /scratch/cluster/idutta/reppo/outputs/2026-03-06/19-06-23/AnymalC-Reach-v1/saved_models/20260306_190625/bc_model_actor_best.pkl
-# /scratch/cluster/idutta/reppo/outputs/2026-03-06/17-41-47/PushCube-v1/saved_models/20260306_174149/bc_model_actor_best.pkl
-# /scratch/cluster/idutta/reppo/outputs/2026-03-06/18-03-46/PullCube-v1/saved_models/20260306_180347/bc_model_actor_best.pkl
-# /scratch/cluster/idutta/reppo/outputs/2026-03-06/18-06-40/PickCube-v1/saved_models/20260306_180642/bc_model_actor_best.pkl
+bc_checkpoint_path: /scratch/cluster/idutta/reppo/outputs/2026-04-12/17-25-40/RollBall-v1/saved_models/20260412_172540_seed0/bc_model_actor_best.pkl
+# /scratch/cluster/idutta/reppo/outputs/2026-03-06/17-41-47/PushCube-v1/saved_models/20260306_174149/bc_model_actor_best.pkl, /scratch/cluster/idutta/reppo/outputs/2026-04-04/22-35-06/PushCube-v1/saved_models/20260404_223758_seed3/bc_model_actor_best.pkl
+# /scratch/cluster/idutta/reppo/outputs/2026-03-06/18-03-46/PullCube-v1/saved_models/20260306_180347/bc_model_actor_best.pkl, /scratch/cluster/idutta/reppo/outputs/2026-04-04/22-40-53/PullCube-v1/saved_models/20260404_224334_seed3/bc_model_actor_best.pkl
+# /scratch/cluster/idutta/reppo/outputs/2026-03-06/18-06-40/PickCube-v1/saved_models/20260306_180642/bc_model_actor_best.pkl, /scratch/cluster/idutta/reppo/outputs/2026-04-04/23-07-29/PickCube-v1/saved_models/20260404_231127_seed3/bc_model_actor_best.pkl
 # /scratch/cluster/idutta/reppo/outputs/2026-03-06/19-01-22/RollBall-v1/saved_models/20260306_190123/bc_model_actor_best.pkl
-# /scratch/cluster/idutta/reppo/outputs/2026-03-06/19-06-23/AnymalC-Reach-v1/saved_models/20260306_190625/bc_model_actor_best.pkl
-bc_mse_loss_weight: 0.0
-bc_actor_update_delay : 3
+# /scratch/cluster/idutta/reppo/outputs/2026-04-07/23-07-03/AnymalC-Reach-v1/saved_models/20260407_230704_seed0/bc_model_actor_best.pkl
+# /scratch/cluster/idutta/reppo/outputs/2026-03-06/19-06-23/AnymalC-Reach-v1/saved_models/20260306_190625/bc_model_actor_best.pkl, /scratch/cluster/idutta/reppo/outputs/2026-04-07/19-41-10/StackCube-v1/saved_models/20260407_194110_seed0/bc_model_actor_best.pkl, /scratch/cluster/idutta/reppo/outputs/2026-04-10/16-00-52/AnymalC-Reach-v1/saved_models/20260410_160052_seed0/bc_model_actor_best.pkl
+# /scratch/cluster/idutta/reppo/outputs/2026-04-11/23-57-16/AnymalC-Reach-v1/saved_models/20260411_235716_seed0/bc_model_actor_best.pkl
+bc_actor_update_delay : 6
 bc_indicator: True
+bc_pretrain_seeds: [0] # [0, 1, 2, 3, 4]
+
+# offline->online replay sampling decay per eval iteration
+online_sample_decay_rate: 1.0
+
+# BC pretraining entropy ablation controls
+bc_use_entropy: True
+bc_use_entropy_tuning: True
+bc_entropy_coef: ${algorithm.ent_start}
+bc_ent_target_mult: ${algorithm.ent_target_mult}
 
 # optimization settings (seem very stable)
 optimizer:
@@ -32,7 +43,7 @@ lmbda_min: 0.95 # irrelevant if no exploration noise is added
 num_steps: 128
 num_mini_batches: 128
 num_envs: 1024
-num_epochs: 4
+num_epochs: 2
 
 # exploration settings (currently not touched)
 exploration_noise_max: 1.0
@@ -68,14 +79,14 @@ reverse_kl: false # previous default "false"
 update_kl_lagrangian: true
 actor_kl_clip_mode: "clipped" # "full", "clipped", "kl_relu_clipped", "kl_bound_clipped", "value"
 ## entropy settings
-ent_start: 0.01
+ent_start: 0.001
 ent_target_mult: 0.5
 update_entropy_lagrangian: true
 ## auxiliary loss settings
 aux_loss_mult: 1.0
-gradient_estimator: "score_based_gae" # "score_based_gae", "score_based_q", "pathwise_q"
+gradient_estimator: "pathwise_q" # "score_based_gae", "score_based_q", "pathwise_q"
 scale_samples_with_action_d: False
-fixed_actor_std: false
+fixed_actor_std: False
 policy_method: default
 
 mask_truncated: True
