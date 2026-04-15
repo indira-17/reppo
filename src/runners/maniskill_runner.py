@@ -138,7 +138,7 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
 
             for i in range(num_steps):
                 key, act_key = jax.random.split(key)
-                action, _ = policy(act_key, obs)
+                action, policy_extras = policy(act_key, obs)
 
                 # Keep normalized policy action for storage; denormalize only for env step.
                 action_norm = np.asarray(action)
@@ -163,7 +163,9 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
                     reward=reward,
                     done=done,
                     truncated=truncated,
-                    extras={},
+                    extras={
+                        "behavior_log_prob": policy_extras.get("behavior_log_prob", jnp.zeros_like(reward)),
+                    },
                 )
                 transitions.append(transition)
                 obs = flatten_obs(next_obs_dict, env=env, demo_obs_keys=demo_obs_keys)
@@ -227,47 +229,24 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
         def evaluate(key: Key, policy: Policy) -> dict:
             obs_dict, _ = env.reset()
             obs = flatten_obs(obs_dict, env=env, demo_obs_keys=demo_obs_keys)
-            online_trajectories = []
             
             metrics = defaultdict(list)
             num_episodes = 0
             for i in range(max_episode_steps):
                 key, act_key = jax.random.split(key)
-                action, policy_extras = policy(act_key, obs)
-                if "behavior_log_prob" not in policy_extras:
-                    raise KeyError(
-                        "Policy must return 'behavior_log_prob' during BC eval rollouts."
-                    )
-                # Keep normalized policy action for storage; denormalize only for env step.
+                action, _ = policy(act_key, obs)
+                # Denormalize for env step
                 action_norm = np.asarray(action)
                 action_env = denormalize_action(action_norm, dataset_low, dataset_high)
-                # Get raw dict from base env
                 next_obs_dict, reward, done, truncated, info = env.step(action_env)
                 reward = torch_to_numpy(reward)
                 done = torch_to_numpy(done)
                 truncated = torch_to_numpy(truncated)
-                if "final_observation" in info:
-                    _next_obs = to_jax(flatten_obs(info["final_observation"], env=env, demo_obs_keys=demo_obs_keys))
-                else:
-                    _next_obs = flatten_obs(next_obs_dict, env=env, demo_obs_keys=demo_obs_keys)
                 if "final_info" in info:
                     mask = info["_final_info"]
                     num_episodes += mask.sum()
                     for k, v in info["final_info"]["episode"].items():
                         metrics[k].append(v)
-
-                transition = Transition(
-                    obs=obs,
-                    next_obs=_next_obs,
-                    action=action_norm,
-                    reward=reward,
-                    done=done,
-                    truncated=truncated,
-                    extras={
-                        "behavior_log_prob": policy_extras["behavior_log_prob"],
-                    },
-                )
-                online_trajectories.append(transition)
                 obs = flatten_obs(next_obs_dict, env=env, demo_obs_keys=demo_obs_keys)
 
             eval_metrics = {}
@@ -279,7 +258,7 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
             eval_metrics["episode_return_std"] = eval_metrics.pop("return_std", 0.0)
             eval_metrics["episode_length"] = eval_metrics.pop("episode_len", 0.0)
             eval_metrics["episode_length_std"] = eval_metrics.pop("episode_len_std", 0.0)
-            return eval_metrics, online_trajectories
+            return eval_metrics
     else:
         # Non-BC evaluation function - matches upstream behavior
         def evaluate(key: Key, policy: Policy) -> dict:

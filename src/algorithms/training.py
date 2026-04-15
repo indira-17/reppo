@@ -18,7 +18,7 @@ from src.common import (
 from src.algorithms import utils
 import jax.numpy as jnp
 
-from src.algorithms.reppo.common import OfflineReplayBuffer, OnlineReplayBuffer
+from src.algorithms.reppo.common import OfflineReplayBuffer
 from src.common import Transition
 from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
@@ -276,8 +276,6 @@ def make_loop_train_fn(
                 f"min={float(offline_replay_buffer.behavior_log_prob[0].min()):.4f} "
                 f"max={float(offline_replay_buffer.behavior_log_prob[0].max()):.4f}")
 
-            online_replay_buffer = None  # will be created after first eval
-
         step = 0
         for i in range(num_iterations):
             for _ in range(train_steps_per_iteration):
@@ -295,7 +293,7 @@ def make_loop_train_fn(
                     num_offline = num_envs if ratio >= 1.0 else int(ratio * num_envs)
                     num_online = num_envs - num_offline
 
-                    sample_key, off_subkey, on_subkey = jax.random.split(sample_key, 3)
+                    sample_key, off_subkey = jax.random.split(sample_key)
 
                     traj_obs, traj_next_obs, traj_action = [], [], []
                     traj_reward, traj_done, traj_truncated, traj_behavior_log_prob = [], [], [], []
@@ -315,34 +313,18 @@ def make_loop_train_fn(
                         traj_behavior_log_prob.append(sampled_behavior_log_prob)
                         traj_source_is_offline.append(jnp.ones((num_steps,), dtype=jnp.float32))
 
-                    # Sample num_online trajectories from online buffer
-                    if num_online > 0 and online_replay_buffer is not None and online_replay_buffer.size > 0:
-                        for _ in range(num_online):
-                            on_subkey, pick_key = jax.random.split(on_subkey)
-                            idx = int(jax.random.choice(pick_key, online_replay_buffer.size))
-                            sampled_obs, sampled_next_obs, sampled_action, sampled_reward, sampled_done, sampled_truncated, sampled_behavior_log_prob = _prepare_padded_trajectory(obs=online_replay_buffer.obs[idx], next_obs=online_replay_buffer.next_obs[idx], action=online_replay_buffer.action[idx], reward=online_replay_buffer.reward[idx], done=online_replay_buffer.done[idx], truncated=online_replay_buffer.truncated[idx], behavior_log_prob=online_replay_buffer.behavior_log_prob[idx], num_steps=num_steps)
-                            traj_obs.append(sampled_obs)
-                            traj_next_obs.append(sampled_next_obs)
-                            traj_action.append(sampled_action)
-                            traj_reward.append(sampled_reward)
-                            traj_done.append(sampled_done)
-                            traj_truncated.append(sampled_truncated)
-                            traj_behavior_log_prob.append(sampled_behavior_log_prob)
+                    # Use current rollout transitions as truly on-policy online data
+                    # rollout_transitions shape: [num_steps, num_envs, ...]
+                    if num_online > 0:
+                        for env_idx in range(num_online):
+                            traj_obs.append(rollout_transitions.obs[:, env_idx])
+                            traj_next_obs.append(rollout_transitions.next_obs[:, env_idx])
+                            traj_action.append(rollout_transitions.action[:, env_idx])
+                            traj_reward.append(rollout_transitions.reward[:, env_idx])
+                            traj_done.append(rollout_transitions.done[:, env_idx])
+                            traj_truncated.append(rollout_transitions.truncated[:, env_idx])
+                            traj_behavior_log_prob.append(rollout_transitions.extras["behavior_log_prob"][:, env_idx])
                             traj_source_is_offline.append(jnp.zeros((num_steps,), dtype=jnp.float32))
-                    else:
-                        # Fill remaining slots with more offline trajectories
-                        for _ in range(num_online):
-                            off_subkey, pick_key = jax.random.split(off_subkey)
-                            idx = int(jax.random.choice(pick_key, offline_replay_buffer.size))
-                            sampled_obs, sampled_next_obs, sampled_action, sampled_reward, sampled_done, sampled_truncated, sampled_behavior_log_prob = _prepare_padded_trajectory(obs=offline_replay_buffer.obs[idx], next_obs=offline_replay_buffer.next_obs[idx], action=offline_normalized_actions[idx], reward=offline_replay_buffer.reward[idx], done=offline_replay_buffer.done[idx], truncated=offline_replay_buffer.truncated[idx], behavior_log_prob=offline_replay_buffer.behavior_log_prob[idx], num_steps=num_steps)
-                            traj_obs.append(sampled_obs)
-                            traj_next_obs.append(sampled_next_obs)
-                            traj_action.append(sampled_action)
-                            traj_reward.append(sampled_reward)
-                            traj_done.append(sampled_done)
-                            traj_truncated.append(sampled_truncated)
-                            traj_behavior_log_prob.append(sampled_behavior_log_prob)
-                            traj_source_is_offline.append(jnp.ones((num_steps,), dtype=jnp.float32))
 
                     source_is_offline_batch = _stack_and_transpose(traj_source_is_offline)
                     transitions = Transition(
@@ -400,50 +382,13 @@ def make_loop_train_fn(
             policy = policy_fn(state, not stochastic_eval)
             key, eval_key = jax.random.split(key)
 
-            if bc_indicator:
-                eval_metrics, online_trajectories = eval_fn(eval_key, policy)
-            else:
-                eval_metrics = eval_fn(eval_key, policy)
+            eval_metrics = eval_fn(eval_key, policy)
 
             state = state.replace(iteration=state.iteration + 1)
             log_callback(state, utils.prefix_dict("eval", eval_metrics))
 
             if bc_indicator:
-                # online_trajectories is a flat list of per-timestep Transitions, each with shape [num_eval_envs, ...].
-                # stack into [max_episode_steps, num_eval_envs, ...] then split by env to get num_eval_envs trajectories of [max_episode_steps, ...].
-                stacked_online = jax.tree.map(
-                    lambda *xs: jnp.stack(xs), *online_trajectories
-                )
-                n_eval_envs = stacked_online.obs.shape[1]
-                obs_list, next_obs_list, act_list = [], [], []
-                rew_list, done_list, trunc_list, lp_list = [], [], [], []
-                for env_idx in range(n_eval_envs):
-                    obs_list.append(stacked_online.obs[:, env_idx])
-                    next_obs_list.append(stacked_online.next_obs[:, env_idx])
-                    act_list.append(stacked_online.action[:, env_idx])
-                    rew_list.append(stacked_online.reward[:, env_idx])
-                    done_list.append(stacked_online.done[:, env_idx])
-                    trunc_list.append(stacked_online.truncated[:, env_idx])
-                    lp_list.append(stacked_online.extras['behavior_log_prob'][:, env_idx])
-
-                online_replay_buffer = OnlineReplayBuffer(
-                    obs=obs_list,
-                    next_obs=next_obs_list,
-                    action=act_list,
-                    reward=rew_list,
-                    done=done_list,
-                    truncated=trunc_list,
-                    behavior_log_prob=lp_list,
-                    size=n_eval_envs,
-                )
-                print(f"[REPLAY] Online buffer created: {online_replay_buffer.size} trajectories "
-                      f"(from {n_eval_envs} eval envs)")
-                print(f"  traj[0] obs={online_replay_buffer.obs[0].shape} "
-                        f"action={online_replay_buffer.action[0].shape} "
-                        f"reward={online_replay_buffer.reward[0].shape} "
-                        f"done={online_replay_buffer.done[0].shape} "
-                        f"behavior_log_prob={online_replay_buffer.behavior_log_prob[0].shape}")
-                # Decay offline sampling ratio faster (reach 0% at ~60% of training).
+                # Decay offline sampling ratio (reach 0% at ~60% of training).
                 ratio = max(0.0, ratio - (float(decay_rate) / num_iterations))
                 print(f"[REPLAY] ratio updated to {ratio:.4f}")
 
