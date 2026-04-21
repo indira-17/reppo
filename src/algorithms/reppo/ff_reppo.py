@@ -231,10 +231,6 @@ def make_learner_fn(
     discrete_actions = isinstance(action_space, Discrete)
     d = action_space.shape[-1] if not discrete_actions else action_space.n
 
-    def _masked_mean(values: jax.Array, mask: jax.Array) -> jax.Array:
-        count = mask.sum()
-        return jnp.where(count > 0, (values * mask).sum() / count, 0.0)
-
     def critic_loss_fn(
         params: nnx.Param, train_state: REPPOTrainState, minibatch: Transition
     ):
@@ -385,47 +381,22 @@ def make_learner_fn(
 
         lagrangian = actor_model.lagrangian()
 
-        if hparams.bc_indicator:
-            valid_mask = 1.0 - minibatch.truncated.astype(jnp.float32)
-        else:
-            valid_mask = None
-
-        # mask the padded trajectories so that they are not considered during actor loss computation
-        if hparams.bc_indicator:
-            if hparams.actor_kl_clip_mode == "full":
-                per_step_loss = (
-                    actor_loss + kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl
-                )
-                loss = _masked_mean(per_step_loss, valid_mask) if valid_mask is not None else jnp.mean(per_step_loss)
-            elif hparams.actor_kl_clip_mode == "clipped":
-                per_step_loss = jnp.where(
+        if hparams.actor_kl_clip_mode == "full":
+            loss = jnp.mean(
+                actor_loss + kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl
+            )
+        elif hparams.actor_kl_clip_mode == "clipped":
+            loss = jnp.mean(
+                jnp.where(
                     kl < hparams.kl_bound,
                     actor_loss,
                     kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl,
                 )
-                loss = _masked_mean(per_step_loss, valid_mask) if valid_mask is not None else jnp.mean(per_step_loss)
-            elif hparams.actor_kl_clip_mode == "value":
-                loss = _masked_mean(actor_loss, valid_mask) if valid_mask is not None else jnp.mean(actor_loss)
-            else:
-                raise ValueError(f"Unknown actor loss mode: {hparams.actor_kl_clip_mode}")
-        
+            )
+        elif hparams.actor_kl_clip_mode == "value":
+            loss = jnp.mean(actor_loss)
         else:
-            if hparams.actor_kl_clip_mode == "full":
-                loss = jnp.mean(
-                    actor_loss + kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl
-                )
-            elif hparams.actor_kl_clip_mode == "clipped":
-                loss = jnp.mean(
-                    jnp.where(
-                        kl < hparams.kl_bound,
-                        actor_loss,
-                        kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl,
-                    )
-                )
-            elif hparams.actor_kl_clip_mode == "value":
-                loss = jnp.mean(actor_loss)
-            else:
-                raise ValueError(f"Unknown actor loss mode: {hparams.actor_kl_clip_mode}")
+            raise ValueError(f"Unknown actor loss mode: {hparams.actor_kl_clip_mode}")
 
         # SAC target entropy loss
         target_entropy = action_size_target + entropy
@@ -435,19 +406,13 @@ def make_learner_fn(
         lagrangian_loss = -lagrangian * jax.lax.stop_gradient(kl - hparams.kl_bound)
 
         # total loss
-        # same as above
         if hparams.update_entropy_lagrangian:
-            loss += _masked_mean(target_entropy_loss, valid_mask) if valid_mask is not None else jnp.mean(target_entropy_loss)
+            loss += jnp.mean(target_entropy_loss)
         if hparams.update_kl_lagrangian:
-            loss += _masked_mean(lagrangian_loss, valid_mask) if valid_mask is not None else jnp.mean(lagrangian_loss)
+            loss += jnp.mean(lagrangian_loss)
 
         # for logging
-        if hparams.bc_indicator:
-            real_action_log_prob_all = old_pi.log_prob(minibatch.action.clip(-0.999, 0.999))
-            real_logprob_valid_mask = 1.0 - minibatch.truncated.astype(jnp.float32)
-            real_action_log_prob = _masked_mean(real_action_log_prob_all, real_logprob_valid_mask)
-        else:
-            real_action_log_prob = old_pi.log_prob(minibatch.action.clip(-0.999, 0.999)).mean()
+        real_action_log_prob = old_pi.log_prob(minibatch.action.clip(-0.999, 0.999)).mean()
 
         # Compute separate reward means for offline and online samples
         source_is_offline = minibatch.extras.get("source_is_offline")
@@ -716,8 +681,7 @@ def make_learner_fn(
                 reverse=True,
             )
 
-            valid_mask = 1.0 - batch.truncated.astype(jnp.float32)
-            retrace_coeff_mean = _masked_mean(retrace_coeffs, valid_mask)
+            retrace_coeff_mean = retrace_coeffs.mean()
 
         return target_values, target_advs, retrace_coeff_mean
 
@@ -802,22 +766,29 @@ def make_learner_fn(
         batch.extras.update(extras)
 
         # compute log probs for offline and online samples if initialised with bc policy
+        current_log_prob = batch.extras["current_log_prob"]
         if hparams.bc_indicator:
-            current_log_prob = batch.extras["current_log_prob"]
-            valid_mask = 1.0 - batch.truncated.astype(jnp.float32)
-            policy_log_prob_mean = _masked_mean(current_log_prob, valid_mask)
-            # Replay padding in training.py sets truncated=1 for synthetic padded steps.
-            # Exclude them from log-prob diagnostics to avoid inflated/invalid offline values.
+            policy_log_prob_mean = current_log_prob.mean()
             source_is_offline = batch.extras.get("source_is_offline")
             if source_is_offline is not None:
-                policy_log_prob_offline = _masked_mean(current_log_prob, source_is_offline * valid_mask)
-                policy_log_prob_online = _masked_mean(current_log_prob, (1.0 - source_is_offline) * valid_mask)
+                offline_count = source_is_offline.sum()
+                online_mask = 1.0 - source_is_offline
+                online_count = online_mask.sum()
+                policy_log_prob_offline = jnp.where(
+                    offline_count > 0,
+                    (current_log_prob * source_is_offline).sum() / offline_count,
+                    0.0,
+                )
+                policy_log_prob_online = jnp.where(
+                    online_count > 0,
+                    (current_log_prob * online_mask).sum() / online_count,
+                    0.0,
+                )
             else:
-                policy_log_prob_offline = _masked_mean(current_log_prob, valid_mask)
+                policy_log_prob_offline = current_log_prob.mean()
                 policy_log_prob_online = jnp.array(0.0, dtype=policy_log_prob_mean.dtype)
 
         else:
-            current_log_prob = batch.extras["current_log_prob"]
             policy_log_prob_mean = current_log_prob.mean()
 
         (

@@ -24,52 +24,53 @@ from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
 from src.runners.maniskill_runner import _compute_action_bounds, normalize_action
 
-def _pad_or_truncate(arr, length, fill=0.0):
-    """Pad or truncate arr along axis 0 to `length`."""
-    T = arr.shape[0]
-    if T >= length:
-        return arr[:length]
-    pad_width = [(0, length - T)] + [(0, 0)] * (arr.ndim - 1)
-    return jnp.pad(arr, pad_width, constant_values=fill)
-
-
-def _prepare_padded_trajectory(obs, next_obs, action, reward, done, truncated, behavior_log_prob, num_steps):
-    """Pad/truncate one trajectory to `num_steps` and mark synthetic padding via done/truncated."""
-    traj_len = int(obs.shape[0])
-    pad_steps = max(0, num_steps - traj_len)
-
-    sampled_obs = _pad_or_truncate(obs, num_steps)
-    sampled_next_obs = _pad_or_truncate(next_obs, num_steps)
-    sampled_action = _pad_or_truncate(action, num_steps)
-    sampled_reward = _pad_or_truncate(reward, num_steps)
-    sampled_done = _pad_or_truncate(done, num_steps, 1.0)
-    sampled_truncated = _pad_or_truncate(truncated, num_steps, 1.0)
-    sampled_behavior_log_prob = _pad_or_truncate(behavior_log_prob, num_steps)
-
-    if pad_steps > 0 and traj_len > 0:
-        sampled_done = sampled_done.at[traj_len - 1].set(1.0)
-        sampled_truncated = sampled_truncated.at[traj_len - 1].set(1.0)
-
-    return (sampled_obs, sampled_next_obs, sampled_action, sampled_reward, sampled_done, sampled_truncated, sampled_behavior_log_prob)
+def _take_fixed_horizon(arr, length):
+    """Take first `length` steps. Caller guarantees arr.shape[0] >= length."""
+    return arr[:length]
 
 # stack each list has num_envs arrays of shape [num_steps, ...]
 def _stack_and_transpose(arrays):
     stacked = jnp.stack(arrays, axis=0)  # [num_envs, num_steps, ...]
     return jnp.swapaxes(stacked, 0, 1)   # [num_steps, num_envs, ...]
 
-def _create_replay_buffer_from_demos(demo_path, env_id):
-    config = DemoConfig(device=torch.device("cpu"), filter_success_only=True)
+def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_success, cut_at_first_success):
+    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success, cut_at_first_success=cut_at_first_success)
     loader = ManiSkillDemoLoader(config, env_id)
     trajectories, _ = loader.load_demo_dataset(demo_path)
     obs_list, next_obs_list, act_list, rew_list, done_list, trunc_list = [], [], [], [], [], []
+    dropped_short = 0
     for traj in trajectories:
-        obs_list.append(to_jax(traj['observations']))
-        next_obs_list.append(to_jax(traj['next_observations']))
+        obs = to_jax(traj['observations'])
+        next_obs = to_jax(traj['next_observations'])
+        act = to_jax(traj['actions'])
+        rew = to_jax(traj['rewards']).squeeze(-1)
+        done = to_jax(traj['dones']).squeeze(-1)
+        trunc = to_jax(traj['truncations']).squeeze(-1)
+
+        traj_len = int(obs.shape[0])
+        if traj_len < num_steps:
+            dropped_short += 1
+            continue
+
+        obs_list.append(_take_fixed_horizon(obs, num_steps))
+        next_obs_list.append(_take_fixed_horizon(next_obs, num_steps))
         # Keep raw (unnormalized) demo actions in replay buffer.
-        act_list.append(to_jax(traj['actions']))
-        rew_list.append(to_jax(traj['rewards']).squeeze(-1))
-        done_list.append(to_jax(traj['dones']).squeeze(-1))
-        trunc_list.append(to_jax(traj['truncations']).squeeze(-1))
+        act_list.append(_take_fixed_horizon(act, num_steps))
+        rew_list.append(_take_fixed_horizon(rew, num_steps))
+        done_fixed = _take_fixed_horizon(done, num_steps)
+        trunc_fixed = _take_fixed_horizon(trunc, num_steps)
+        # Mark artificial fixed-horizon cut as truncated at the last step.
+        # This prevents return/retrace from propagating past the 128-step segment boundary.
+        trunc_fixed = trunc_fixed.at[num_steps - 1].set(jnp.array(1, dtype=trunc_fixed.dtype))
+
+        done_list.append(done_fixed)
+        trunc_list.append(trunc_fixed)
+
+    if len(obs_list) == 0:
+        raise ValueError(
+            f"No offline trajectories with length >= {num_steps}. "
+            f"Consider disabling success-cut or reducing num_steps."
+        )
     
     replay_buffer = OfflineReplayBuffer(
         obs=obs_list,
@@ -78,10 +79,12 @@ def _create_replay_buffer_from_demos(demo_path, env_id):
         reward=rew_list,
         done=done_list,
         truncated=trunc_list,
-        behavior_log_prob=[jnp.zeros(t['observations'].shape[0]) for t in trajectories],
-        size=len(trajectories),
+        behavior_log_prob=[jnp.zeros(num_steps) for _ in obs_list],
+        size=len(obs_list),
     )
     print(f"[REPLAY] Offline buffer created: {replay_buffer.size} trajectories")
+    if dropped_short > 0:
+        print(f"[REPLAY] Dropped {dropped_short} short trajectories (< {num_steps} steps)")
     print(f"  traj[0] obs={replay_buffer.obs[0].shape} action={replay_buffer.action[0].shape} "
               f"reward={replay_buffer.reward[0].shape} done={replay_buffer.done[0].shape} "
               f"behavior_log_prob={replay_buffer.behavior_log_prob[0].shape}")
@@ -211,6 +214,11 @@ def make_loop_train_fn(
     demo_path: str | None = None,
     bc_indicator: bool = False,
     decay_rate: float = 1.0,
+    filter_success: bool = False,
+    cut_at_first_success: bool = False,
+    critic_offline_warmup_iters: int = 2,
+    critic_mixed_warmup_iters: int = 2,
+    mixed_offline_start_ratio: float = 0.75,
 ):
     from src.runners.gymnasium_runner import (
         make_eval_fn as make_gymnasium_eval_fn,
@@ -232,8 +240,31 @@ def make_loop_train_fn(
     if eval_fn is None:
         eval_fn = make_gymnasium_eval_fn(eval_env, max_episode_steps)
 
+    def _offline_ratio_for_iteration(iter_idx: int, num_iterations: int) -> float:
+        """
+        Phase schedule:
+          1) warmup the critic on offline data only
+          2) warmup the critic on mixed offline+online data, decaying offline ratio
+          3) continue decaying via `decay_rate`
+        Actor freezing/unfreezing is handled in learner via `bc_actor_update_delay`.
+        """
+        off_end = max(0, int(critic_offline_warmup_iters))
+        mix_len = max(0, int(critic_mixed_warmup_iters))
+        mix_end = off_end + mix_len
+
+        if iter_idx < off_end:
+            return 1.0
+
+        if iter_idx < mix_end and mix_len > 0:
+            mix_progress = (iter_idx - off_end) / max(1, mix_len - 1)
+            return float(max(0.0, mixed_offline_start_ratio * (1.0 - mix_progress)))
+
+        # After explicit warmup phases, keep old global decay behaviour.
+        post_start_ratio = 0.0 if mix_len > 0 else float(mixed_offline_start_ratio)
+        post_steps = iter_idx - mix_end
+        return float(max(0.0, post_start_ratio - (float(decay_rate) / max(1, num_iterations)) * post_steps))
+
     def loop_train_fn(key: Key) -> tuple[TrainState, dict]:
-        ratio = 1.0
         # Initialize the policy, environment and map that across the number of random seeds
         num_train_steps = total_time_steps // (num_steps * num_envs)
         num_iterations = num_eval
@@ -248,9 +279,9 @@ def make_loop_train_fn(
 
         if bc_indicator:
             # initialise the offline replay buffer before the training loop starts
-            offline_replay_buffer = _create_replay_buffer_from_demos(demo_path, env.spec.id)
+            offline_replay_buffer = _create_replay_buffer_from_demos(demo_path, env.spec.id, num_steps, filter_success=filter_success, cut_at_first_success=cut_at_first_success)
             dataset_low, dataset_high = _compute_action_bounds(
-                demo_path, env.spec.id, filter_success=True
+                demo_path, env.spec.id, filter_success=filter_success
             )
             offline_normalized_actions = [
                 to_jax(normalize_action(np.asarray(a), dataset_low, dataset_high))
@@ -277,9 +308,10 @@ def make_loop_train_fn(
                 f"max={float(offline_replay_buffer.behavior_log_prob[0].max()):.4f}")
 
         step = 0
-        for i in range(num_iterations):
+        for iter_idx in range(num_iterations):
+            ratio = _offline_ratio_for_iteration(iter_idx, num_iterations) if bc_indicator else 0.0
             for _ in range(train_steps_per_iteration):
-                key, rollout_key, learn_key, sample_key = jax.random.split(key, 4)
+                key, rollout_key, learn_key, off_subkey = jax.random.split(key, 4)
                 # Collect trajectories from 'state'
                 policy = policy_fn(state, False)
 
@@ -289,28 +321,25 @@ def make_loop_train_fn(
                 )
 
                 if bc_indicator:
-                    # Sample num_envs trajectories, pad/truncate each to num_steps so we get [num_steps, num_envs, ...] with correct temporal structure.
+                    # Sample num_envs trajectories of fixed length num_steps.
                     num_offline = num_envs if ratio >= 1.0 else int(ratio * num_envs)
                     num_online = num_envs - num_offline
-
-                    sample_key, off_subkey = jax.random.split(sample_key)
 
                     traj_obs, traj_next_obs, traj_action = [], [], []
                     traj_reward, traj_done, traj_truncated, traj_behavior_log_prob = [], [], [], []
                     traj_source_is_offline = []
 
-                    # Sample num_offline trajectories from offline buffer
+                    # Sample num_offline trajectories from offline buffer (already fixed to num_steps)
                     for _ in range(num_offline):
                         off_subkey, pick_key = jax.random.split(off_subkey)
                         idx = int(jax.random.choice(pick_key, offline_replay_buffer.size))
-                        sampled_obs, sampled_next_obs, sampled_action, sampled_reward, sampled_done, sampled_truncated, sampled_behavior_log_prob = _prepare_padded_trajectory(obs=offline_replay_buffer.obs[idx], next_obs=offline_replay_buffer.next_obs[idx], action=offline_normalized_actions[idx], reward=offline_replay_buffer.reward[idx], done=offline_replay_buffer.done[idx], truncated=offline_replay_buffer.truncated[idx], behavior_log_prob=offline_replay_buffer.behavior_log_prob[idx], num_steps=num_steps)
-                        traj_obs.append(sampled_obs)
-                        traj_next_obs.append(sampled_next_obs)
-                        traj_action.append(sampled_action)
-                        traj_reward.append(sampled_reward)
-                        traj_done.append(sampled_done)
-                        traj_truncated.append(sampled_truncated)
-                        traj_behavior_log_prob.append(sampled_behavior_log_prob)
+                        traj_obs.append(offline_replay_buffer.obs[idx])
+                        traj_next_obs.append(offline_replay_buffer.next_obs[idx])
+                        traj_action.append(offline_normalized_actions[idx])
+                        traj_reward.append(offline_replay_buffer.reward[idx])
+                        traj_done.append(offline_replay_buffer.done[idx])
+                        traj_truncated.append(offline_replay_buffer.truncated[idx])
+                        traj_behavior_log_prob.append(offline_replay_buffer.behavior_log_prob[idx])
                         traj_source_is_offline.append(jnp.ones((num_steps,), dtype=jnp.float32))
 
                     # Use current rollout transitions as truly on-policy online data
@@ -388,8 +417,6 @@ def make_loop_train_fn(
             log_callback(state, utils.prefix_dict("eval", eval_metrics))
 
             if bc_indicator:
-                # Decay offline sampling ratio (reach 0% at ~60% of training).
-                ratio = max(0.0, ratio - (float(decay_rate) / num_iterations))
                 print(f"[REPLAY] ratio updated to {ratio:.4f}")
 
         return state, {

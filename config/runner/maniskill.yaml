@@ -27,3 +27,8 @@ train_fn:
   max_episode_steps: ${algorithm.max_episode_steps}
   stochastic_eval: True
   decay_rate: ${algorithm.online_sample_decay_rate}
+  filter_success: ${env.demo.filter_success}
+  cut_at_first_success: ${env.demo.cut_at_first_success}
+  critic_offline_warmup_iters: ${algorithm.critic_offline_warmup_iters}
+  critic_mixed_warmup_iters: ${algorithm.critic_mixed_warmup_iters}
+  mixed_offline_start_ratio: ${algorithm.mixed_offline_start_ratio}

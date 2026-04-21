@@ -5,7 +5,7 @@ eval_interval: 2
 num_eval: 20
 
 # BC pretraining checkpoint path
-bc_checkpoint_path: /scratch/cluster/idutta/reppo/outputs/2026-04-12/17-25-40/RollBall-v1/saved_models/20260412_172540_seed0/bc_model_actor_best.pkl
+bc_checkpoint_path: /scratch/cluster/idutta/reppo/outputs/2026-04-11/23-57-16/AnymalC-Reach-v1/saved_models/20260411_235716_seed0/bc_model_actor_best.pkl
 # /scratch/cluster/idutta/reppo/outputs/2026-03-06/17-41-47/PushCube-v1/saved_models/20260306_174149/bc_model_actor_best.pkl, /scratch/cluster/idutta/reppo/outputs/2026-04-04/22-35-06/PushCube-v1/saved_models/20260404_223758_seed3/bc_model_actor_best.pkl
 # /scratch/cluster/idutta/reppo/outputs/2026-03-06/18-03-46/PullCube-v1/saved_models/20260306_180347/bc_model_actor_best.pkl, /scratch/cluster/idutta/reppo/outputs/2026-04-04/22-40-53/PullCube-v1/saved_models/20260404_224334_seed3/bc_model_actor_best.pkl
 # /scratch/cluster/idutta/reppo/outputs/2026-03-06/18-06-40/PickCube-v1/saved_models/20260306_180642/bc_model_actor_best.pkl, /scratch/cluster/idutta/reppo/outputs/2026-04-04/23-07-29/PickCube-v1/saved_models/20260404_231127_seed3/bc_model_actor_best.pkl
@@ -19,6 +19,11 @@ bc_pretrain_seeds: [0] # [0, 1, 2, 3, 4]
 
 # offline->online replay sampling decay per eval iteration
 online_sample_decay_rate: 1.0
+
+# phased replay schedule
+critic_offline_warmup_iters: 3
+critic_mixed_warmup_iters: 3
+mixed_offline_start_ratio: 0.75
 
 # BC pretraining entropy ablation controls
 bc_use_entropy: True

@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import optax
 import matplotlib.pyplot as plt
 import gymnasium as gym
+import mani_skill.envs  # noqa: F401  # Registers ManiSkill envs with Gymnasium.
 import wandb
 import torch
 from datetime import datetime
@@ -31,7 +32,7 @@ def get_pretrain_seeds(cfg):
     """Resolve seed list from config, defaulting to 5 seeds."""
     if "pretrain_seeds" in cfg.algorithm and cfg.algorithm.pretrain_seeds is not None:
         return [int(s) for s in cfg.algorithm.pretrain_seeds]
-    return [0, 1, 2, 3, 4]
+    return [0]
 
 
 def create_actor(n_obs, n_act, cfg, rngs):
@@ -238,17 +239,16 @@ def main(cfg: OmegaConf):
         wandb.init(
             config={**dict(cfg), "seed": seed},
             entity=cfg.logging.entity,
-            project="bc-baseline-ablations",
+            project="bc-baseline",
             name=f"bc_pretrain_{cfg.env.name}_seed{seed}",
             mode=cfg.logging.mode,
             reinit=True,
         )
 
         # Load demonstrations (still uses torch DataLoader internally)
-        device = 'cpu'  # load data on CPU, convert to JAX later
         train_loader, val_loader, n_obs, n_act, _, _ = load_demos_for_training(
             env_id=env_name,
-            device=device,
+            device='cpu',
             bsize=batch_size,
             demo_path=demo_path,
             max_episodes=max_episodes,
@@ -261,10 +261,10 @@ def main(cfg: OmegaConf):
 
         # Get action bounds from environment
         temp_env = gym.make(env_name, obs_mode="state_dict", control_mode=cfg.env.get('control_mode'))
-        low = temp_env.action_space.low
-        high = temp_env.action_space.high
+        env_low = temp_env.action_space.low
+        env_high = temp_env.action_space.high
         temp_env.close()
-        print(f"True environment bounds: low={low}, high={high}")
+        print(f"True environment bounds: low={env_low}, high={env_high}")
 
         # Create optax optimizer
         optimizer = optax.adamw(learning_rate=float(cfg.algorithm.optimizer.learning_rate))
@@ -272,7 +272,7 @@ def main(cfg: OmegaConf):
 
         # Compute dataset action stats for normalization bounds
         # Use raw trajectories (not DataLoader batches) to avoid drop_last=True excluding samples
-        config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success)
+        config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success, cut_at_first_success=False)
         loader = ManiSkillDemoLoader(config, env_name)
         trajectories, _ = loader.load_demo_dataset(demo_path)
         all_actions = np.concatenate(
@@ -288,19 +288,19 @@ def main(cfg: OmegaConf):
         high_with_margin = data_high + margin
 
         # Ensure bounds are at least [-1, 1] in each dimension
-        low = np.minimum(low_with_margin, -1.0)
-        high = np.maximum(high_with_margin, 1.0)
+        dataset_low = np.minimum(low_with_margin, -1.0)
+        dataset_high = np.maximum(high_with_margin, 1.0)
 
         # Normalize actions for stats check
-        normalized_actions = 2.0 * (all_actions - low) / (high - low) - 1.0
+        normalized_actions = 2.0 * (all_actions - dataset_low) / (dataset_high - dataset_low) - 1.0
 
         print("\n=== DATASET ACTION STATS ===")
         print(f"Expert action min (raw): {all_actions.min():.6f}")
         print(f"Expert action max (raw): {all_actions.max():.6f}")
         print(f"Normalized action min: {normalized_actions.min():.6f}")
         print(f"Normalized action max: {normalized_actions.max():.6f}")
-        print(f"Action normalization bounds (low): {low}")
-        print(f"Action normalization bounds (high): {high}")
+        print(f"Action normalization bounds (low): {dataset_low}")
+        print(f"Action normalization bounds (high): {dataset_high}")
         print("================================\n")
 
         best_vloss = float('inf')
@@ -311,11 +311,15 @@ def main(cfg: OmegaConf):
             print(f'\nEPOCH {epoch + 1}/{EPOCHS}')
 
             # Training
-            avg_actor_loss, avg_nll_loss, avg_entropy, avg_entropy_loss, avg_mean, avg_log_std = train_one_epoch(cfg, train_loader, actor, opt_state, low, high, seed)
+            avg_actor_loss, avg_nll_loss, avg_entropy, avg_entropy_loss, avg_mean, avg_log_std = train_one_epoch(
+                cfg, train_loader, actor, opt_state, dataset_low, dataset_high, seed
+            )
             train_losses.append(avg_actor_loss)
 
             # Validation
-            avg_val_loss, v_nll_loss, v_entropy, v_entropy_loss, v_mean, v_log_std = evaluate(cfg, val_loader, actor, low, high, seed)
+            avg_val_loss, v_nll_loss, v_entropy, v_entropy_loss, v_mean, v_log_std = evaluate(
+                cfg, val_loader, actor, dataset_low, dataset_high, seed
+            )
             val_losses.append(avg_val_loss)
 
             print(f'Loss: train={avg_actor_loss:.4f} | val={avg_val_loss:.4f}')

@@ -127,7 +127,7 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
         demo_obs_keys = get_demo_obs_keys(demo_path) if demo_path else None
         # Compute action bounds once at function creation time
         _env_id = env_id or (env.spec.id if hasattr(env, 'spec') and env.spec else "PushCube-v1")
-        dataset_low, dataset_high = _compute_action_bounds(demo_path, _env_id, filter_success)
+        dataset_low, dataset_high = _compute_action_bounds(demo_path, _env_id, filter_success=filter_success)
         
         def collect_rollout(
             key: Key, train_state: TrainState, policy: Policy
@@ -224,7 +224,7 @@ def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = No
         demo_obs_keys = get_demo_obs_keys(demo_path) if demo_path else None
         # Compute action bounds once at function creation time
         _env_id = env_id or (env.spec.id if hasattr(env, 'spec') and env.spec else "PushCube-v1")
-        dataset_low, dataset_high = _compute_action_bounds(demo_path, _env_id, filter_success)
+        dataset_low, dataset_high = _compute_action_bounds(demo_path, _env_id, filter_success=filter_success)
 
         def evaluate(key: Key, policy: Policy) -> dict:
             obs_dict, _ = env.reset()

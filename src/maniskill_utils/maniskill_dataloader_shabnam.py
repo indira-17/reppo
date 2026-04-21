@@ -21,6 +21,7 @@ class DemoConfig:
     normalize_observations: bool = True
     include_next_obs: bool = True
     filter_success_only: bool = True
+    cut_at_first_success: bool = False
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -103,10 +104,10 @@ class ManiSkillDemoLoader:
         else:
             rewards = self._compute_dummy_rewards(traj_group, episode_metadata)
 
-        # Load success and CUT trajectory at first success
+        # Load success and optionally cut trajectory at first success
         if 'success' in traj_group:
             success = np.array(traj_group['success'])
-            if np.any(success):
+            if self.config.cut_at_first_success and np.any(success):
                 cut_idx = np.argmax(success) + 1
             else:
                 cut_idx = T

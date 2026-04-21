@@ -2,6 +2,12 @@ import os
 import pickle
 import numpy as np
 import hydra
+
+# Important: choose JAX backend before importing jax.
+# If user wants GPU, they can override by exporting JAX_PLATFORMS=gpu/cuda.
+if "JAX_PLATFORMS" not in os.environ:
+    os.environ["JAX_PLATFORMS"] = "cpu"
+
 import jax
 import jax.numpy as jnp
 import gymnasium as gym
@@ -268,7 +274,7 @@ def test(cfg, env_id=None, model_path=None, demo_path=None):
     wandb.init(
         config=dict(cfg),
         entity=cfg.logging.entity,
-        project="reppo-baseline",
+        project="bc-baseline",
         name=f"bc_eval_{cfg.env.name}_multiseed",
         mode=cfg.logging.mode,
     )
@@ -280,7 +286,15 @@ def test(cfg, env_id=None, model_path=None, demo_path=None):
 
     env_id = cfg.env.name
     demo_path = cfg.env.demo.demo_path
-    sim_backend = cfg.env.get("env_kwargs", {}).get("sim_backend", None)
+    sim_backend = cfg.env.get("sim_backend", cfg.env.get("env_kwargs", {}).get("sim_backend", None))
+    if "env_kwargs" in cfg.env and sim_backend is not None:
+        cfg.env.env_kwargs["sim_backend"] = sim_backend
+
+    if "JAX_PLATFORMS" not in os.environ:
+        if sim_backend == "physx_cpu":
+            jax.config.update("jax_platform_name", "cpu")
+        elif sim_backend == "physx_cuda":
+            jax.config.update("jax_platform_name", "cuda")
     eval_seeds = get_eval_seeds(cfg)
 
     # Get demo observation keys
@@ -289,7 +303,7 @@ def test(cfg, env_id=None, model_path=None, demo_path=None):
 
     # Determine obs/act dims from demo data
     filter_success = cfg.env.demo.get('filter_success', True)
-    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success)
+    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success, cut_at_first_success=False)
     loader = ManiSkillDemoLoader(config, env_id)
     trajectories_for_dims, _ = loader.load_demo_dataset(demo_path)
     n_obs = trajectories_for_dims[0]["observations"].shape[1]
