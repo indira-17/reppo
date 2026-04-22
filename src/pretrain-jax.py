@@ -220,7 +220,7 @@ def main(cfg: OmegaConf):
     batch_size = cfg.env.demo.batch_size
     demo_path = cfg.env.demo.demo_path
     max_episodes = cfg.env.demo.max_episodes
-    filter_success = cfg.env.demo.filter_success
+    filter_success = True
 
     seeds = get_pretrain_seeds(cfg)
     print(f"Running multi-seed pretraining with seeds: {seeds}")
@@ -272,7 +272,7 @@ def main(cfg: OmegaConf):
 
         # Compute dataset action stats for normalization bounds
         # Use raw trajectories (not DataLoader batches) to avoid drop_last=True excluding samples
-        config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success, cut_at_first_success=False)
+        config = DemoConfig(device=torch.device("cpu"), filter_success_only=True, cut_at_first_success=False)
         loader = ManiSkillDemoLoader(config, env_name)
         trajectories, _ = loader.load_demo_dataset(demo_path)
         all_actions = np.concatenate(

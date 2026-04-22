@@ -302,8 +302,7 @@ def test(cfg, env_id=None, model_path=None, demo_path=None):
     print(f"Demo observation keys: {demo_obs_keys}")
 
     # Determine obs/act dims from demo data
-    filter_success = cfg.env.demo.get('filter_success', True)
-    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success, cut_at_first_success=False)
+    config = DemoConfig(device=torch.device("cpu"), filter_success_only=True, cut_at_first_success=False)
     loader = ManiSkillDemoLoader(config, env_id)
     trajectories_for_dims, _ = loader.load_demo_dataset(demo_path)
     n_obs = trajectories_for_dims[0]["observations"].shape[1]

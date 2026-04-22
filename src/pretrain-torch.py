@@ -111,7 +111,7 @@ def main(cfg: OmegaConf):
     batch_size = cfg.env.demo.batch_size
     demo_path = cfg.env.demo.demo_path
     max_episodes = cfg.env.demo.max_episodes
-    filter_success = cfg.env.demo.filter_success
+    filter_success = True
 
     # Load demonstrations using config parameters
     train_loader, val_loader, n_obs, n_act, _, _ = load_demos_for_training(
@@ -150,7 +150,7 @@ def main(cfg: OmegaConf):
     val_losses = []
 
     # Check dataset action stats
-    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success)
+    config = DemoConfig(device=torch.device("cpu"), filter_success_only=True)
     loader = ManiSkillDemoLoader(config, env_name)
     trajectories, _ = loader.load_demo_dataset(demo_path)
     all_actions = np.concatenate(

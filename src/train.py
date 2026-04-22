@@ -42,6 +42,7 @@ def main(cfg: DictConfig):
     if cfg.algorithm.bc_indicator:
         # Load dataset first to get observation dimension (dataset dims) like test_bc.py does
         logging.info(f"Loading dataset from {cfg.env.demo.demo_path}")
+        filter_success = True
         config = DemoConfig(device=torch.device("cpu"), filter_success_only=True)
         loader = ManiSkillDemoLoader(config, cfg.env.name)
         trajectories, _ = loader.load_demo_dataset(cfg.env.demo.demo_path)
@@ -69,8 +70,8 @@ def main(cfg: DictConfig):
         action_space=env_setup.action_space,
         observation_space=obs_space,
     )
-    rollout_fn = hydra.utils.call(cfg.runner.rollout_fn)(env_setup.env, demo_path=cfg.env.demo.demo_path, bc_indicator=cfg.algorithm.bc_indicator)
-    eval_fn = hydra.utils.call(cfg.runner.eval_fn)(env_setup.eval_env, demo_path=cfg.env.demo.demo_path, bc_indicator=cfg.algorithm.bc_indicator)
+    rollout_fn = hydra.utils.call(cfg.runner.rollout_fn)(env_setup.env, demo_path=cfg.env.demo.demo_path, bc_indicator=cfg.algorithm.bc_indicator, filter_success=True)
+    eval_fn = hydra.utils.call(cfg.runner.eval_fn)(env_setup.eval_env, demo_path=cfg.env.demo.demo_path, bc_indicator=cfg.algorithm.bc_indicator, filter_success=True)
     make_train_fn = hydra.utils.call(cfg.runner.train_fn)
     train_fn = make_train_fn(
         env=(env_setup.env, env_setup.eval_env),
@@ -83,6 +84,7 @@ def main(cfg: DictConfig):
         demo_path=cfg.env.demo.demo_path,
         bc_indicator=cfg.algorithm.bc_indicator,
         decay_rate=cfg.algorithm.online_sample_decay_rate,
+        filter_success=True,
     )
     start = time.perf_counter()
     _, metrics = train_fn(key)

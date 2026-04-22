@@ -647,17 +647,24 @@ def make_learner_fn(
                 policy_value = transition.extras["policy_value"]
                 action_value = transition.extras["action_value"]
                 truncated = transition.truncated
+                source_is_offline = transition.extras.get("source_is_offline")
+                if source_is_offline is None:
+                    source_is_offline = jnp.zeros_like(truncated, dtype=jnp.float32)
                 valid = 1.0 - truncated.astype(jnp.float32)
                 c_t = hparams.lmbda * jnp.minimum(1.0, jnp.exp(current_log_prob - behavior_log_prob)) * valid
 
+                # Stop bootstrap only on offline stitched boundaries.
+                # Keep online partial-reset semantics (done=0, truncated boundary markers) unchanged.
+                offline_boundary = truncated.astype(jnp.float32) * source_is_offline
+                bootstrap = 1.0 - jnp.maximum(done.astype(jnp.float32), offline_boundary)
                 # G_t = r_tilde[t] + gamma * (1 - d[t]) * (V[t+1] + c_{t+1} * (G_{t+1} - Q(x[t+1], a[t+1])))
-                lambda_return = reward + hparams.gamma * (1.0 - done) * (
+                lambda_return = reward + hparams.gamma * bootstrap * (
                     next_value + retrace_coeff_next * (lambda_return - q_next)
                 )
 
-                # gae calculation
-                delta = reward + hparams.gamma * (1.0 - done) * next_value - policy_value
-                gae = delta + hparams.gamma * (1.0 - done) * hparams.lmbda * gae
+                # GAE calculation
+                delta = reward + hparams.gamma * bootstrap * next_value - policy_value
+                gae = delta + hparams.gamma * bootstrap * hparams.lmbda * gae
                 gae = jnp.where(truncated, delta, gae)
 
                 return (

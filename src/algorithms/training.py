@@ -39,6 +39,10 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
     trajectories, _ = loader.load_demo_dataset(demo_path)
     obs_list, next_obs_list, act_list, rew_list, done_list, trunc_list = [], [], [], [], [], []
     dropped_short = 0
+    curr_obs, curr_next_obs, curr_act = [], [], []
+    curr_rew, curr_done, curr_trunc = [], [], []
+    curr_len = 0
+    dropped_tail = 0
     for traj in trajectories:
         obs = to_jax(traj['observations'])
         next_obs = to_jax(traj['next_observations'])
@@ -48,28 +52,51 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
         trunc = to_jax(traj['truncations']).squeeze(-1)
 
         traj_len = int(obs.shape[0])
-        if traj_len < num_steps:
+        if traj_len == 0:
             dropped_short += 1
             continue
 
-        obs_list.append(_take_fixed_horizon(obs, num_steps))
-        next_obs_list.append(_take_fixed_horizon(next_obs, num_steps))
-        # Keep raw (unnormalized) demo actions in replay buffer.
-        act_list.append(_take_fixed_horizon(act, num_steps))
-        rew_list.append(_take_fixed_horizon(rew, num_steps))
-        done_fixed = _take_fixed_horizon(done, num_steps)
-        trunc_fixed = _take_fixed_horizon(trunc, num_steps)
-        # Mark artificial fixed-horizon cut as truncated at the last step.
-        # This prevents return/retrace from propagating past the 128-step segment boundary.
-        trunc_fixed = trunc_fixed.at[num_steps - 1].set(jnp.array(1, dtype=trunc_fixed.dtype))
+        # Match online ManiSkill partial-reset semantics:
+        # done is always 0; episode boundaries are encoded via truncated=1.
+        boundary = jnp.logical_or(done.astype(bool), trunc.astype(bool))
+        boundary = boundary.at[-1].set(True)
+        done = jnp.zeros_like(done)
+        trunc = boundary.astype(trunc.dtype)
 
-        done_list.append(done_fixed)
-        trunc_list.append(trunc_fixed)
+        j = 0
+        while j < traj_len:
+            take = min(num_steps - curr_len, traj_len - j)
+            end = j + take
+
+            curr_obs.append(obs[j:end])
+            curr_next_obs.append(next_obs[j:end])
+            curr_act.append(act[j:end])
+            curr_rew.append(rew[j:end])
+            curr_done.append(done[j:end])
+            curr_trunc.append(trunc[j:end])
+
+            curr_len += take
+            j = end
+
+            if curr_len == num_steps:
+                obs_list.append(jnp.concatenate(curr_obs, axis=0))
+                next_obs_list.append(jnp.concatenate(curr_next_obs, axis=0))
+                # Keep raw (unnormalized) demo actions in replay buffer.
+                act_list.append(jnp.concatenate(curr_act, axis=0))
+                rew_list.append(jnp.concatenate(curr_rew, axis=0))
+                done_list.append(jnp.concatenate(curr_done, axis=0))
+                trunc_list.append(jnp.concatenate(curr_trunc, axis=0))
+
+                curr_obs, curr_next_obs, curr_act = [], [], []
+                curr_rew, curr_done, curr_trunc = [], [], []
+                curr_len = 0
+
+    if curr_len > 0:
+        dropped_tail = curr_len
 
     if len(obs_list) == 0:
         raise ValueError(
-            f"No offline trajectories with length >= {num_steps}. "
-            f"Consider disabling success-cut or reducing num_steps."
+            f"Not enough offline transitions to build one segment of length {num_steps}."
         )
     
     replay_buffer = OfflineReplayBuffer(
@@ -85,6 +112,8 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
     print(f"[REPLAY] Offline buffer created: {replay_buffer.size} trajectories")
     if dropped_short > 0:
         print(f"[REPLAY] Dropped {dropped_short} short trajectories (< {num_steps} steps)")
+    if dropped_tail > 0:
+        print(f"[REPLAY] Dropped {dropped_tail} leftover transitions (< {num_steps}) after packing")
     print(f"  traj[0] obs={replay_buffer.obs[0].shape} action={replay_buffer.action[0].shape} "
               f"reward={replay_buffer.reward[0].shape} done={replay_buffer.done[0].shape} "
               f"behavior_log_prob={replay_buffer.behavior_log_prob[0].shape}")
@@ -214,7 +243,7 @@ def make_loop_train_fn(
     demo_path: str | None = None,
     bc_indicator: bool = False,
     decay_rate: float = 1.0,
-    filter_success: bool = False,
+    filter_success: bool = True,
     cut_at_first_success: bool = False,
     critic_offline_warmup_iters: int = 2,
     critic_mixed_warmup_iters: int = 2,
@@ -417,7 +446,7 @@ def make_loop_train_fn(
             log_callback(state, utils.prefix_dict("eval", eval_metrics))
 
             if bc_indicator:
-                print(f"[REPLAY] ratio updated to {ratio:.4f}")
+                print(f"[REPLAY] ratio for iteration {iter_idx}: {ratio:.4f}")
 
         return state, {
             **utils.prefix_dict("train", train_metrics),
