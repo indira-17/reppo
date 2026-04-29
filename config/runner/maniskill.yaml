@@ -7,6 +7,7 @@ rollout_fn:
   bc_indicator: ${algorithm.bc_indicator}
   env_id: ${env.name}
   filter_success: ${env.demo.filter_success}
+  cut_at_first_success: ${env.demo.cut_at_first_success}
 
 eval_fn:
   _target_: src.runners.maniskill_runner.make_eval_fn
@@ -16,6 +17,7 @@ eval_fn:
   bc_indicator: ${algorithm.bc_indicator}
   env_id: ${env.name}
   filter_success: ${env.demo.filter_success}
+  cut_at_first_success: ${env.demo.cut_at_first_success}
   
 train_fn:
   _target_: src.algorithms.training.make_loop_train_fn

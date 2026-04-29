@@ -20,7 +20,12 @@ from src.common import (
 )
 from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 
-def _compute_action_bounds(demo_path, env_id="PushCube-v1", filter_success=True):
+def _compute_action_bounds(
+    demo_path,
+    env_id="PushCube-v1",
+    filter_success=True,
+    cut_at_first_success=True,
+):
     """Compute action bounds from demo file, matching BC pretraining exactly.
     
     Uses ManiSkillDemoLoader with filter_success_only (which also cuts
@@ -29,7 +34,11 @@ def _compute_action_bounds(demo_path, env_id="PushCube-v1", filter_success=True)
     """
     from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
     
-    config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success)
+    config = DemoConfig(
+        device=torch.device("cpu"),
+        filter_success_only=filter_success,
+        cut_at_first_success=cut_at_first_success,
+    )
     loader = ManiSkillDemoLoader(config, env_id)
     trajectories, _ = loader.load_demo_dataset(demo_path)
     
@@ -121,13 +130,27 @@ def flatten_obs(obs_dict, env, demo_obs_keys):
     result = np.concatenate(obs_list, axis=1)
     return result
 
-def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path: str = None, bc_indicator: bool = False, env_id: str = None, filter_success: bool = True) -> RolloutFn:
+def make_rollout_fn(
+    env: gymnasium.Env,
+    num_steps: int,
+    num_envs: int,
+    demo_path: str = None,
+    bc_indicator: bool = False,
+    env_id: str = None,
+    filter_success: bool = True,
+    cut_at_first_success: bool = True,
+) -> RolloutFn:
     # BC-specific rollout function with demo observation flattening
     if bc_indicator:
         demo_obs_keys = get_demo_obs_keys(demo_path) if demo_path else None
         # Compute action bounds once at function creation time
         _env_id = env_id or (env.spec.id if hasattr(env, 'spec') and env.spec else "PushCube-v1")
-        dataset_low, dataset_high = _compute_action_bounds(demo_path, _env_id, filter_success=filter_success)
+        dataset_low, dataset_high = _compute_action_bounds(
+            demo_path,
+            _env_id,
+            filter_success=filter_success,
+            cut_at_first_success=cut_at_first_success,
+        )
         
         def collect_rollout(
             key: Key, train_state: TrainState, policy: Policy
@@ -218,13 +241,26 @@ def make_rollout_fn(env: gymnasium.Env, num_steps: int, num_envs: int, demo_path
     return collect_rollout
 
 
-def make_eval_fn(env: gymnasium.Env, max_episode_steps: int, demo_path: str = None, bc_indicator: bool = False, env_id: str = None, filter_success: bool = True) -> EvalFn:
+def make_eval_fn(
+    env: gymnasium.Env,
+    max_episode_steps: int,
+    demo_path: str = None,
+    bc_indicator: bool = False,
+    env_id: str = None,
+    filter_success: bool = True,
+    cut_at_first_success: bool = True,
+) -> EvalFn:
     # BC-specific evaluation function with demo observation flattening
     if bc_indicator:
         demo_obs_keys = get_demo_obs_keys(demo_path) if demo_path else None
         # Compute action bounds once at function creation time
         _env_id = env_id or (env.spec.id if hasattr(env, 'spec') and env.spec else "PushCube-v1")
-        dataset_low, dataset_high = _compute_action_bounds(demo_path, _env_id, filter_success=filter_success)
+        dataset_low, dataset_high = _compute_action_bounds(
+            demo_path,
+            _env_id,
+            filter_success=filter_success,
+            cut_at_first_success=cut_at_first_success,
+        )
 
         def evaluate(key: Key, policy: Policy) -> dict:
             obs_dict, _ = env.reset()

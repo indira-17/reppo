@@ -273,6 +273,9 @@ def make_learner_fn(
         critic_loss = jnp.mean(critic_loss)
         mask_truncated = hparams.mask_truncated
         mask = (1.0 - minibatch.truncated) if mask_truncated else 1.0
+        unmasked_critic_total_loss = jnp.mean(
+            critic_update_loss + hparams.aux_loss_mult * aux_loss
+        )
         loss = jnp.mean(
             mask
             * (critic_update_loss + hparams.aux_loss_mult * aux_loss)
@@ -280,12 +283,12 @@ def make_learner_fn(
         return loss, dict(
             value_loss=critic_loss,
             critic_update_loss=critic_update_loss,
-            loss=loss,
+            masked_critic_total_loss=loss,
+            unmasked_critic_total_loss=unmasked_critic_total_loss,
             aux_loss=aux_loss,
             rew_aux_loss=aux_rew_loss,
             q=value.mean(),
             abs_batch_action=jnp.abs(minibatch.action).mean(),
-            reward_mean=minibatch.reward.mean(),
             target_values=target_values.mean(),
         )
 
@@ -414,25 +417,6 @@ def make_learner_fn(
         # for logging
         real_action_log_prob = old_pi.log_prob(minibatch.action.clip(-0.999, 0.999)).mean()
 
-        # Compute separate reward means for offline and online samples
-        source_is_offline = minibatch.extras.get("source_is_offline")
-        if source_is_offline is not None:
-            offline_mask = source_is_offline
-            online_mask = 1.0 - source_is_offline
-            reward_mean_offline = jnp.where(
-                offline_mask.sum() > 0,
-                (minibatch.reward * offline_mask).sum() / offline_mask.sum(),
-                0.0,
-            )
-            reward_mean_online = jnp.where(
-                online_mask.sum() > 0,
-                (minibatch.reward * online_mask).sum() / online_mask.sum(),
-                0.0,
-            )
-        else:
-            reward_mean_offline = minibatch.reward.mean()
-            reward_mean_online = jnp.array(0.0)
-
         return loss, dict(
             actor_loss=actor_loss,
             loss=loss,
@@ -441,9 +425,6 @@ def make_learner_fn(
             abs_pred_action=jnp.abs(pred_action).mean()
             if not discrete_actions
             else 0.0,
-            reward_mean=minibatch.reward.mean(),
-            reward_mean_offline=reward_mean_offline,
-            reward_mean_online=reward_mean_online,
             kl=kl.mean(),
             lagrangian=lagrangian,
             kl_bound=hparams.kl_bound,
@@ -647,25 +628,23 @@ def make_learner_fn(
                 policy_value = transition.extras["policy_value"]
                 action_value = transition.extras["action_value"]
                 truncated = transition.truncated
-                source_is_offline = transition.extras.get("source_is_offline")
-                if source_is_offline is None:
-                    source_is_offline = jnp.zeros_like(truncated, dtype=jnp.float32)
-                valid = 1.0 - truncated.astype(jnp.float32)
-                c_t = hparams.lmbda * jnp.minimum(1.0, jnp.exp(current_log_prob - behavior_log_prob)) * valid
-
-                # Stop bootstrap only on offline stitched boundaries.
-                # Keep online partial-reset semantics (done=0, truncated boundary markers) unchanged.
-                offline_boundary = truncated.astype(jnp.float32) * source_is_offline
-                bootstrap = 1.0 - jnp.maximum(done.astype(jnp.float32), offline_boundary)
+                c_t_raw = hparams.lmbda * jnp.minimum(
+                    1.0, jnp.exp(current_log_prob - behavior_log_prob)
+                )
+                c_t = jnp.where(truncated, 0.0, c_t_raw)
                 # G_t = r_tilde[t] + gamma * (1 - d[t]) * (V[t+1] + c_{t+1} * (G_{t+1} - Q(x[t+1], a[t+1])))
-                lambda_return = reward + hparams.gamma * bootstrap * (
-                    next_value + retrace_coeff_next * (lambda_return - q_next)
+                lambda_return = reward + hparams.gamma * jnp.where(
+                    truncated,
+                    next_value,
+                    (1.0 - done.astype(jnp.float32))
+                    * (next_value + retrace_coeff_next * (lambda_return - q_next)),
                 )
 
                 # GAE calculation
-                delta = reward + hparams.gamma * bootstrap * next_value - policy_value
-                gae = delta + hparams.gamma * bootstrap * hparams.lmbda * gae
-                gae = jnp.where(truncated, delta, gae)
+                delta = reward + hparams.gamma * (1.0 - done.astype(jnp.float32)) * next_value - policy_value
+                gae = delta + hparams.gamma * (1.0 - done.astype(jnp.float32)) * hparams.lmbda * gae
+                truncated_gae = delta
+                gae = jnp.where(truncated, truncated_gae, gae)
 
                 return (
                     lambda_return,
@@ -774,6 +753,7 @@ def make_learner_fn(
 
         # compute log probs for offline and online samples if initialised with bc policy
         current_log_prob = batch.extras["current_log_prob"]
+        reward_mean = batch.reward.mean()
         if hparams.bc_indicator:
             policy_log_prob_mean = current_log_prob.mean()
             source_is_offline = batch.extras.get("source_is_offline")
@@ -781,6 +761,16 @@ def make_learner_fn(
                 offline_count = source_is_offline.sum()
                 online_mask = 1.0 - source_is_offline
                 online_count = online_mask.sum()
+                reward_mean_offline = jnp.where(
+                    offline_count > 0,
+                    (batch.reward * source_is_offline).sum() / offline_count,
+                    0.0,
+                )
+                reward_mean_online = jnp.where(
+                    online_count > 0,
+                    (batch.reward * online_mask).sum() / online_count,
+                    0.0,
+                )
                 policy_log_prob_offline = jnp.where(
                     offline_count > 0,
                     (current_log_prob * source_is_offline).sum() / offline_count,
@@ -792,6 +782,8 @@ def make_learner_fn(
                     0.0,
                 )
             else:
+                reward_mean_offline = jnp.array(0.0, dtype=reward_mean.dtype)
+                reward_mean_online = reward_mean
                 policy_log_prob_offline = current_log_prob.mean()
                 policy_log_prob_online = jnp.array(0.0, dtype=policy_log_prob_mean.dtype)
 
@@ -829,6 +821,9 @@ def make_learner_fn(
         if hparams.bc_indicator:
             update_metrics = {
                 **update_metrics,
+                "reward_mean": reward_mean,
+                "reward_mean_offline": reward_mean_offline,
+                "reward_mean_online": reward_mean_online,
                 "policy_log_prob_mean": policy_log_prob_mean,
                 "policy_log_prob_offline_replay": policy_log_prob_offline,
                 "policy_log_prob_online_replay": policy_log_prob_online,
@@ -837,6 +832,7 @@ def make_learner_fn(
         else:
             update_metrics = {
                 **update_metrics,
+                "reward_mean": reward_mean,
                 "policy_log_prob_mean": policy_log_prob_mean,
             }
         return train_state, update_metrics

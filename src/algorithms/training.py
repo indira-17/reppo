@@ -33,6 +33,20 @@ def _stack_and_transpose(arrays):
     stacked = jnp.stack(arrays, axis=0)  # [num_envs, num_steps, ...]
     return jnp.swapaxes(stacked, 0, 1)   # [num_steps, num_envs, ...]
 
+def _align_partial_reset_flags(terminated, truncated):
+        """Replicate online ManiSkill partial-reset semantics for offline data.
+
+        When partial-reset is used online:
+            - done is always 0
+            - boundaries are carried by truncated := terminated OR truncated
+        We mirror that exactly here and force a terminal boundary at cut end.
+        """
+        boundary = jnp.logical_or(terminated.astype(bool), truncated.astype(bool))
+        boundary = boundary.at[-1].set(True)
+        done = jnp.zeros_like(terminated)
+        trunc = boundary.astype(truncated.dtype)
+        return done, trunc
+
 def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_success, cut_at_first_success):
     config = DemoConfig(device=torch.device("cpu"), filter_success_only=filter_success, cut_at_first_success=cut_at_first_success)
     loader = ManiSkillDemoLoader(config, env_id)
@@ -48,7 +62,7 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
         next_obs = to_jax(traj['next_observations'])
         act = to_jax(traj['actions'])
         rew = to_jax(traj['rewards']).squeeze(-1)
-        done = to_jax(traj['dones']).squeeze(-1)
+        terminated = to_jax(traj['dones']).squeeze(-1)
         trunc = to_jax(traj['truncations']).squeeze(-1)
 
         traj_len = int(obs.shape[0])
@@ -56,12 +70,8 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
             dropped_short += 1
             continue
 
-        # Match online ManiSkill partial-reset semantics:
-        # done is always 0; episode boundaries are encoded via truncated=1.
-        boundary = jnp.logical_or(done.astype(bool), trunc.astype(bool))
-        boundary = boundary.at[-1].set(True)
-        done = jnp.zeros_like(done)
-        trunc = boundary.astype(trunc.dtype)
+        # Match online partial-reset training semantics exactly.
+        done, trunc = _align_partial_reset_flags(terminated, trunc)
 
         j = 0
         while j < traj_len:
@@ -79,13 +89,18 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
             j = end
 
             if curr_len == num_steps:
+                seg_trunc = jnp.concatenate(curr_trunc, axis=0)
+                # Fixed-horizon replay samples must terminate at the segment boundary
+                # to prevent bootstrap/retrace leakage into data not included in sample.
+                seg_trunc = seg_trunc.at[-1].set(jnp.array(1, dtype=seg_trunc.dtype))
+
                 obs_list.append(jnp.concatenate(curr_obs, axis=0))
                 next_obs_list.append(jnp.concatenate(curr_next_obs, axis=0))
                 # Keep raw (unnormalized) demo actions in replay buffer.
                 act_list.append(jnp.concatenate(curr_act, axis=0))
                 rew_list.append(jnp.concatenate(curr_rew, axis=0))
                 done_list.append(jnp.concatenate(curr_done, axis=0))
-                trunc_list.append(jnp.concatenate(curr_trunc, axis=0))
+                trunc_list.append(seg_trunc)
 
                 curr_obs, curr_next_obs, curr_act = [], [], []
                 curr_rew, curr_done, curr_trunc = [], [], []
@@ -244,7 +259,7 @@ def make_loop_train_fn(
     bc_indicator: bool = False,
     decay_rate: float = 1.0,
     filter_success: bool = True,
-    cut_at_first_success: bool = False,
+    cut_at_first_success: bool = True,
     critic_offline_warmup_iters: int = 2,
     critic_mixed_warmup_iters: int = 2,
     mixed_offline_start_ratio: float = 0.75,
@@ -271,27 +286,25 @@ def make_loop_train_fn(
 
     def _offline_ratio_for_iteration(iter_idx: int, num_iterations: int) -> float:
         """
-        Phase schedule:
-          1) warmup the critic on offline data only
-          2) warmup the critic on mixed offline+online data, decaying offline ratio
-          3) continue decaying via `decay_rate`
-        Actor freezing/unfreezing is handled in learner via `bc_actor_update_delay`.
+        Schedule:
+            1) pure offline critic warmup for `critic_offline_warmup_iters`
+            2) then linearly decrease offline ratio to 0 by the final iteration
+
+        Example (num_eval=20, critic_offline_warmup_iters=3):
+            - iterations 1..3: offline ratio = 1.0
+            - iteration 20: offline ratio = 0.0
         """
         off_end = max(0, int(critic_offline_warmup_iters))
-        mix_len = max(0, int(critic_mixed_warmup_iters))
-        mix_end = off_end + mix_len
 
+        # Warmup: fully offline
         if iter_idx < off_end:
             return 1.0
 
-        if iter_idx < mix_end and mix_len > 0:
-            mix_progress = (iter_idx - off_end) / max(1, mix_len - 1)
-            return float(max(0.0, mixed_offline_start_ratio * (1.0 - mix_progress)))
-
-        # After explicit warmup phases, keep old global decay behaviour.
-        post_start_ratio = 0.0 if mix_len > 0 else float(mixed_offline_start_ratio)
-        post_steps = iter_idx - mix_end
-        return float(max(0.0, post_start_ratio - (float(decay_rate) / max(1, num_iterations)) * post_steps))
+        # Linear decay after warmup, reaching 0.0 at final iteration.
+        # Use +1 so decay starts immediately after warmup.
+        remaining = max(1, num_iterations - off_end)
+        progress = (iter_idx - off_end + 1) / remaining
+        return float(max(0.0, 1.0 - progress))
 
     def loop_train_fn(key: Key) -> tuple[TrainState, dict]:
         # Initialize the policy, environment and map that across the number of random seeds
@@ -310,7 +323,10 @@ def make_loop_train_fn(
             # initialise the offline replay buffer before the training loop starts
             offline_replay_buffer = _create_replay_buffer_from_demos(demo_path, env.spec.id, num_steps, filter_success=filter_success, cut_at_first_success=cut_at_first_success)
             dataset_low, dataset_high = _compute_action_bounds(
-                demo_path, env.spec.id, filter_success=filter_success
+                demo_path,
+                env.spec.id,
+                filter_success=filter_success,
+                cut_at_first_success=cut_at_first_success,
             )
             offline_normalized_actions = [
                 to_jax(normalize_action(np.asarray(a), dataset_low, dataset_high))
@@ -374,7 +390,10 @@ def make_loop_train_fn(
                     # Use current rollout transitions as truly on-policy online data
                     # rollout_transitions shape: [num_steps, num_envs, ...]
                     if num_online > 0:
-                        for env_idx in range(num_online):
+                        off_subkey, env_pick_key = jax.random.split(off_subkey)
+                        online_env_idxs = jax.random.permutation(env_pick_key, num_envs)[:num_online]
+                        for env_idx in np.asarray(online_env_idxs):
+                            env_idx = int(env_idx)
                             traj_obs.append(rollout_transitions.obs[:, env_idx])
                             traj_next_obs.append(rollout_transitions.next_obs[:, env_idx])
                             traj_action.append(rollout_transitions.action[:, env_idx])
