@@ -1,12 +1,11 @@
 import logging
+import torch
 import gymnasium
 import numpy as np
 from gymnax.environments.environment import Environment
 import jax
-import torch
 from src.common import (
     EvalFn,
-    InitFn,
     Key,
     LearnerFn,
     LogCallback,
@@ -23,10 +22,6 @@ from src.common import Transition
 from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
 from src.runners.maniskill_runner import _compute_action_bounds, normalize_action
-
-def _take_fixed_horizon(arr, length):
-    """Take first `length` steps. Caller guarantees arr.shape[0] >= length."""
-    return arr[:length]
 
 # stack each list has num_envs arrays of shape [num_steps, ...]
 def _stack_and_transpose(arrays):
@@ -52,11 +47,11 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
     loader = ManiSkillDemoLoader(config, env_id)
     trajectories, _ = loader.load_demo_dataset(demo_path)
     obs_list, next_obs_list, act_list, rew_list, done_list, trunc_list = [], [], [], [], [], []
-    dropped_short = 0
+
     curr_obs, curr_next_obs, curr_act = [], [], []
     curr_rew, curr_done, curr_trunc = [], [], []
     curr_len = 0
-    dropped_tail = 0
+
     for traj in trajectories:
         obs = to_jax(traj['observations'])
         next_obs = to_jax(traj['next_observations'])
@@ -67,10 +62,8 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
 
         traj_len = int(obs.shape[0])
         if traj_len == 0:
-            dropped_short += 1
             continue
 
-        # Match online partial-reset training semantics exactly.
         done, trunc = _align_partial_reset_flags(terminated, trunc)
 
         j = 0
@@ -90,13 +83,10 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
 
             if curr_len == num_steps:
                 seg_trunc = jnp.concatenate(curr_trunc, axis=0)
-                # Fixed-horizon replay samples must terminate at the segment boundary
-                # to prevent bootstrap/retrace leakage into data not included in sample.
                 seg_trunc = seg_trunc.at[-1].set(jnp.array(1, dtype=seg_trunc.dtype))
 
                 obs_list.append(jnp.concatenate(curr_obs, axis=0))
                 next_obs_list.append(jnp.concatenate(curr_next_obs, axis=0))
-                # Keep raw (unnormalized) demo actions in replay buffer.
                 act_list.append(jnp.concatenate(curr_act, axis=0))
                 rew_list.append(jnp.concatenate(curr_rew, axis=0))
                 done_list.append(jnp.concatenate(curr_done, axis=0))
@@ -106,14 +96,11 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
                 curr_rew, curr_done, curr_trunc = [], [], []
                 curr_len = 0
 
-    if curr_len > 0:
-        dropped_tail = curr_len
-
     if len(obs_list) == 0:
         raise ValueError(
             f"Not enough offline transitions to build one segment of length {num_steps}."
         )
-    
+
     replay_buffer = OfflineReplayBuffer(
         obs=obs_list,
         next_obs=next_obs_list,
@@ -125,10 +112,6 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
         size=len(obs_list),
     )
     print(f"[REPLAY] Offline buffer created: {replay_buffer.size} trajectories")
-    if dropped_short > 0:
-        print(f"[REPLAY] Dropped {dropped_short} short trajectories (< {num_steps} steps)")
-    if dropped_tail > 0:
-        print(f"[REPLAY] Dropped {dropped_tail} leftover transitions (< {num_steps}) after packing")
     print(f"  traj[0] obs={replay_buffer.obs[0].shape} action={replay_buffer.action[0].shape} "
               f"reward={replay_buffer.reward[0].shape} done={replay_buffer.done[0].shape} "
               f"behavior_log_prob={replay_buffer.behavior_log_prob[0].shape}")
@@ -185,7 +168,7 @@ def make_scan_train_fn(
         state, update_metrics = learner_fn(
             key=learn_key, train_state=state, batch=transitions
         )
-        metrics = {**update_metrics, **update_metrics}
+        metrics = update_metrics
         state = state.replace(iteration=state.iteration + 1)
         return state, metrics
 
@@ -257,12 +240,14 @@ def make_loop_train_fn(
     log_callback: LogCallback | None = None,
     demo_path: str | None = None,
     bc_indicator: bool = False,
-    decay_rate: float = 1.0,
     filter_success: bool = True,
+    wandb_run = None,
     cut_at_first_success: bool = True,
-    critic_offline_warmup_iters: int = 2,
-    critic_mixed_warmup_iters: int = 2,
-    mixed_offline_start_ratio: float = 0.75,
+    critic_offline_warmup_iters: int = 0,
+    data_type: str = "expert",
+    max_buffer_size: int = 1_000_000,
+    per_alpha: float = 0.6,
+    per_beta: float = 0.4,
 ):
     from src.runners.gymnasium_runner import (
         make_eval_fn as make_gymnasium_eval_fn,
@@ -296,6 +281,10 @@ def make_loop_train_fn(
         """
         off_end = max(0, int(critic_offline_warmup_iters))
 
+        # No warmup configured → pure online
+        if off_end == 0:
+            return 0.0
+
         # Warmup: fully offline
         if iter_idx < off_end:
             return 1.0
@@ -319,40 +308,71 @@ def make_loop_train_fn(
         logging.info(f"Train steps per iteration: {train_steps_per_iteration}.")
         logging.info(f"Total time steps: {total_time_steps}.")
 
+        buffer_memory_gb = 0.0
+
         if bc_indicator:
-            # initialise the offline replay buffer before the training loop starts
-            offline_replay_buffer = _create_replay_buffer_from_demos(demo_path, env.spec.id, num_steps, filter_success=filter_success, cut_at_first_success=cut_at_first_success)
-            dataset_low, dataset_high = _compute_action_bounds(
-                demo_path,
-                env.spec.id,
-                filter_success=filter_success,
-                cut_at_first_success=cut_at_first_success,
-            )
-            offline_normalized_actions = [
-                to_jax(normalize_action(np.asarray(a), dataset_low, dataset_high))
-                for a in offline_replay_buffer.action
-            ]
+            num_segments_cap = (max_buffer_size + num_steps - 1) // num_steps
+            ring_write_idx = 0  # FIFO pointer; used by near_on_policy and PER
 
-            # Compute initial behavior_log_probs for offline data using current policy
-            policy_for_logprobs = policy_fn(state, True)
-            for traj_idx in range(offline_replay_buffer.size):
-                traj_obs = offline_replay_buffer.obs[traj_idx]  # [T, obs_dim]
-                traj_action = offline_normalized_actions[traj_idx]  # normalized to [-1, 1]
-                key, lp_key = jax.random.split(key)
-                # Compute behavior log-prob on dataset action under BC-initialized actor.
-                _, extras = policy_for_logprobs(lp_key, traj_obs, action_input=traj_action)
-                if "behavior_log_prob" not in extras:
-                    raise KeyError(
-                        "Policy must return 'behavior_log_prob' when action_input is provided."
-                    )
-                offline_replay_buffer.behavior_log_prob[traj_idx] = extras["behavior_log_prob"]
+            if data_type == 'expert':
+                offline_replay_buffer = _create_replay_buffer_from_demos(demo_path, env.spec.id, num_steps, filter_success=filter_success, cut_at_first_success=cut_at_first_success)
+                # normalize actions in-place to [-1, 1] to match online rollouts
+                dataset_low, dataset_high = _compute_action_bounds(demo_path, env.spec.id, filter_success=filter_success, cut_at_first_success=cut_at_first_success)
+                offline_replay_buffer.action = [
+                    to_jax(normalize_action(np.asarray(a), dataset_low, dataset_high))
+                    for a in offline_replay_buffer.action
+                ]
+                # compute behavior log-probs under the current (BC-initialized) actor
+                policy_for_logprobs = policy_fn(state, True)
+                for traj_idx in range(offline_replay_buffer.size):
+                    traj_obs = offline_replay_buffer.obs[traj_idx]
+                    traj_action = offline_replay_buffer.action[traj_idx]
+                    key, lp_key = jax.random.split(key)
+                    _, extras = policy_for_logprobs(lp_key, traj_obs, action_input=traj_action)
+                    if "behavior_log_prob" not in extras:
+                        raise KeyError("Policy must return 'behavior_log_prob' when action_input is provided.")
+                    offline_replay_buffer.behavior_log_prob[traj_idx] = extras["behavior_log_prob"]
+                print(f"[REPLAY] Offline behavior_log_probs computed for {offline_replay_buffer.size} trajectories")
+            else:
+                # random: fixed buffer for near_on_policy, FIFO ring for uniform, FIFO ring prioritized for PER
+                logging.info(f"[REPLAY] Collecting {data_type} buffer ({max_buffer_size} transitions)...")
+                buf_obs, buf_next_obs, buf_action = [], [], []
+                buf_reward, buf_done, buf_trunc, buf_blp = [], [], [], []
+                buf_priority = [] if data_type == 'PER' else None
+                while len(buf_obs) < num_segments_cap:
+                    key, rk = jax.random.split(key)
+                    policy = policy_fn(state, False)
+                    rt, state = rollout_fn(key=rk, train_state=state, policy=policy)
+                    for ei in range(num_envs):
+                        if len(buf_obs) >= num_segments_cap:
+                            break
+                        buf_obs.append(rt.obs[:, ei])
+                        buf_next_obs.append(rt.next_obs[:, ei])
+                        buf_action.append(rt.action[:, ei])
+                        buf_reward.append(rt.reward[:, ei])
+                        buf_done.append(rt.done[:, ei])
+                        buf_trunc.append(rt.truncated[:, ei])
+                        blp = rt.extras.get("behavior_log_prob", None)
+                        buf_blp.append(blp[:, ei] if blp is not None else jnp.zeros(num_steps))
+                        if data_type == 'PER':
+                            buf_priority.append(1.0)
+                offline_replay_buffer = OfflineReplayBuffer(
+                    obs=buf_obs, next_obs=buf_next_obs, action=buf_action,
+                    reward=buf_reward, done=buf_done, truncated=buf_trunc,
+                    behavior_log_prob=buf_blp, priority=buf_priority, size=len(buf_obs),
+                )
 
-            print(f"[REPLAY] Offline behavior_log_probs computed for {offline_replay_buffer.size} trajectories")
-            print(f"  traj[0] behavior_log_prob shape={offline_replay_buffer.behavior_log_prob[0].shape} "
-                f"min={float(offline_replay_buffer.behavior_log_prob[0].min()):.4f} "
-                f"max={float(offline_replay_buffer.behavior_log_prob[0].max()):.4f}")
+            buffer_memory_gb = sum(
+                a.nbytes
+                for field in ('obs', 'next_obs', 'action', 'reward', 'done', 'truncated', 'behavior_log_prob')
+                for a in getattr(offline_replay_buffer, field, [])
+            ) / 1e9
+            logging.info(f"[REPLAY] {data_type} buffer: {offline_replay_buffer.size} segments, {buffer_memory_gb:.3f} GB")
 
         step = 0
+        online_transitions_used = 0
+        offline_transitions_used = 0
+
         for iter_idx in range(num_iterations):
             ratio = _offline_ratio_for_iteration(iter_idx, num_iterations) if bc_indicator else 0.0
             for _ in range(train_steps_per_iteration):
@@ -369,25 +389,41 @@ def make_loop_train_fn(
                     # Sample num_envs trajectories of fixed length num_steps.
                     num_offline = num_envs if ratio >= 1.0 else int(ratio * num_envs)
                     num_online = num_envs - num_offline
+                    online_transitions_used += num_online * num_steps
+                    offline_transitions_used += num_offline * num_steps
 
                     traj_obs, traj_next_obs, traj_action = [], [], []
                     traj_reward, traj_done, traj_truncated, traj_behavior_log_prob = [], [], [], []
                     traj_source_is_offline = []
 
                     # Sample num_offline trajectories from offline buffer (already fixed to num_steps)
+                    sampled_offline_indices = []
+                    traj_is_weight = []
+                    if data_type == 'PER':
+                        # proportional priority sampling
+                        all_p = np.array([p ** per_alpha for p in offline_replay_buffer.priority])
+                        all_p /= all_p.sum()
+                        N = offline_replay_buffer.size
+                        max_w = float((N * all_p.min()) ** (-per_beta))
                     for _ in range(num_offline):
                         off_subkey, pick_key = jax.random.split(off_subkey)
-                        idx = int(jax.random.choice(pick_key, offline_replay_buffer.size))
+                        if data_type == 'PER':
+                            idx = int(np.random.choice(N, p=all_p))
+                            w = float((N * all_p[idx]) ** (-per_beta)) / max_w
+                            traj_is_weight.append(jnp.full((num_steps,), w, dtype=jnp.float32))
+                        else:
+                            idx = int(jax.random.choice(pick_key, offline_replay_buffer.size))
+                        sampled_offline_indices.append(idx)
                         traj_obs.append(offline_replay_buffer.obs[idx])
                         traj_next_obs.append(offline_replay_buffer.next_obs[idx])
-                        traj_action.append(offline_normalized_actions[idx])
+                        traj_action.append(offline_replay_buffer.action[idx])
                         traj_reward.append(offline_replay_buffer.reward[idx])
                         traj_done.append(offline_replay_buffer.done[idx])
                         traj_truncated.append(offline_replay_buffer.truncated[idx])
                         traj_behavior_log_prob.append(offline_replay_buffer.behavior_log_prob[idx])
                         traj_source_is_offline.append(jnp.ones((num_steps,), dtype=jnp.float32))
 
-                    # Use current rollout transitions as truly on-policy online data
+                    # Use current rollout transitions as on-policy online data
                     # rollout_transitions shape: [num_steps, num_envs, ...]
                     if num_online > 0:
                         off_subkey, env_pick_key = jax.random.split(off_subkey)
@@ -403,6 +439,15 @@ def make_loop_train_fn(
                             traj_behavior_log_prob.append(rollout_transitions.extras["behavior_log_prob"][:, env_idx])
                             traj_source_is_offline.append(jnp.zeros((num_steps,), dtype=jnp.float32))
 
+                    # for online slots IS weight = 1.0
+                    if data_type == 'PER':
+                        for _ in range(num_online):
+                            traj_is_weight.append(jnp.ones(num_steps, dtype=jnp.float32))
+                        is_weight_batch = _stack_and_transpose(traj_is_weight)
+                    else:
+                        # uniform: IS weight = 1 everywhere (no bias correction needed)
+                        is_weight_batch = jnp.ones((num_steps, num_envs), dtype=jnp.float32)
+
                     source_is_offline_batch = _stack_and_transpose(traj_source_is_offline)
                     transitions = Transition(
                         obs=_stack_and_transpose(traj_obs),
@@ -412,6 +457,7 @@ def make_loop_train_fn(
                         done=_stack_and_transpose(traj_done),
                         truncated=_stack_and_transpose(traj_truncated),
                         extras={
+                            "is_weight": is_weight_batch,
                             "behavior_log_prob": _stack_and_transpose(traj_behavior_log_prob),
                             "source_is_offline": source_is_offline_batch,
                         },
@@ -446,6 +492,10 @@ def make_loop_train_fn(
                 else:
                     transitions = rollout_transitions
                     replay_logprob_stats = {}
+                    online_transitions_used += num_envs * num_steps
+
+                # total transitions consumed by the learner (online + offline replayed)
+                num_samples = online_transitions_used + offline_transitions_used
 
                 # Execute an update to the policy with `transitions`
                 state, train_metrics = learner_fn(
@@ -455,6 +505,42 @@ def make_loop_train_fn(
                 if step % train_log_interval == 0:
                     log_metrics = {**train_metrics, **replay_logprob_stats}
                     log_callback(state, utils.prefix_dict("train", log_metrics))
+
+                # ring buffer FIFO-insert for PER and near_on_policy
+                if bc_indicator and data_type in ('PER', 'near_on_policy'):
+                    max_p = max(offline_replay_buffer.priority) if (data_type == 'PER' and offline_replay_buffer.priority) else 1.0
+                    for ei in range(num_envs):
+                        w_idx = ring_write_idx % num_segments_cap
+                        if offline_replay_buffer.size < num_segments_cap:
+                            offline_replay_buffer.obs.append(rollout_transitions.obs[:, ei])
+                            offline_replay_buffer.next_obs.append(rollout_transitions.next_obs[:, ei])
+                            offline_replay_buffer.action.append(rollout_transitions.action[:, ei])
+                            offline_replay_buffer.reward.append(rollout_transitions.reward[:, ei])
+                            offline_replay_buffer.done.append(rollout_transitions.done[:, ei])
+                            offline_replay_buffer.truncated.append(rollout_transitions.truncated[:, ei])
+                            blp = rollout_transitions.extras.get("behavior_log_prob", None)
+                            offline_replay_buffer.behavior_log_prob.append(blp[:, ei] if blp is not None else jnp.zeros(num_steps))
+                            if data_type == 'PER':
+                                offline_replay_buffer.priority.append(max_p)
+                            offline_replay_buffer.size += 1
+                        else:
+                            offline_replay_buffer.obs[w_idx] = rollout_transitions.obs[:, ei]
+                            offline_replay_buffer.next_obs[w_idx] = rollout_transitions.next_obs[:, ei]
+                            offline_replay_buffer.action[w_idx] = rollout_transitions.action[:, ei]
+                            offline_replay_buffer.reward[w_idx] = rollout_transitions.reward[:, ei]
+                            offline_replay_buffer.done[w_idx] = rollout_transitions.done[:, ei]
+                            offline_replay_buffer.truncated[w_idx] = rollout_transitions.truncated[:, ei]
+                            blp = rollout_transitions.extras.get("behavior_log_prob", None)
+                            offline_replay_buffer.behavior_log_prob[w_idx] = blp[:, ei] if blp is not None else jnp.zeros(num_steps)
+                            if data_type == 'PER':
+                                offline_replay_buffer.priority[w_idx] = max_p
+                        ring_write_idx += 1
+                    if data_type == 'PER':
+                        # update priorities for sampled segments (Algorithm 1, line 12: p_j <- |delta_j|)
+                        new_p = float(abs(train_metrics.get("critic_diag/td_error_mean", 1.0))) + 1e-6
+                        for sidx in sampled_offline_indices:
+                            offline_replay_buffer.priority[sidx] = new_p
+
                 step += 1
             policy = policy_fn(state, not stochastic_eval)
             key, eval_key = jax.random.split(key)
@@ -463,6 +549,21 @@ def make_loop_train_fn(
 
             state = state.replace(iteration=state.iteration + 1)
             log_callback(state, utils.prefix_dict("eval", eval_metrics))
+
+            eval_return = float(eval_metrics["episode_return"])
+            grad_updates = float(train_metrics.get("sys/grad_updates", 1.0))
+
+            # for sample efficiency - x-axis: num_samples; y-axis: return
+            wandb_run.log({"num_samples": num_samples, "eval_return": eval_return})
+            # resource cost metrics
+            wandb_run.log({
+                "sys/online_transitions": online_transitions_used,
+                "sys/offline_transitions": offline_transitions_used,
+                "sys/replay_buffer_memory_gb": buffer_memory_gb,
+                "sys/grad_updates": grad_updates,
+                "sys/perf_per_gb": eval_return / max(buffer_memory_gb, 1e-6),
+                "sys/perf_per_grad_update": eval_return / max(grad_updates, 1.0),
+            })
 
             if bc_indicator:
                 print(f"[REPLAY] ratio for iteration {iter_idx}: {ratio:.4f}")

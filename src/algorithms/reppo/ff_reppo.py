@@ -228,6 +228,8 @@ def make_learner_fn(
 ) -> LearnerFn:
     normalizer = Normalizer() if cfg.algorithm.normalize_env else None
     hparams = cfg.algorithm
+    data_type = getattr(hparams, 'data_type', 'expert')
+    per_beta = getattr(hparams, 'per_beta', 0.4)
     discrete_actions = isinstance(action_space, Discrete)
     d = action_space.shape[-1] if not discrete_actions else action_space.n
 
@@ -271,25 +273,46 @@ def make_learner_fn(
             target_values,
         )
         critic_loss = jnp.mean(critic_loss)
+        # Critic bias and error variance (using n-step/Retrace targets as G_t)
+        mc_error = value.reshape(-1) - target_values.reshape(-1)
+        mc_bias = jnp.mean(mc_error)           # E[Q - G_t]  (signed)
+        mc_error_var = jnp.var(mc_error)        # Var(Q - G_t)
+        # TD error: r + γ·E_a'[Q(s',a')] - Q(s,a)
+        td_error = (
+            minibatch.extras["soft_reward"].reshape(-1)
+            + hparams.gamma * minibatch.extras["next_policy_value"].reshape(-1)
+            - minibatch.extras["action_value"].reshape(-1)
+        )
+        td_error_mean = jnp.mean(td_error)
         mask_truncated = hparams.mask_truncated
         mask = (1.0 - minibatch.truncated) if mask_truncated else 1.0
+        # PER: scale loss by importance-sampling weight to correct for sampling bias
+        is_w = minibatch.extras.get("is_weight", None)
+        per_scale = is_w.reshape(-1) if (data_type == 'PER' and is_w is not None) else 1.0
         unmasked_critic_total_loss = jnp.mean(
             critic_update_loss + hparams.aux_loss_mult * aux_loss
         )
         loss = jnp.mean(
-            mask
+            per_scale * mask
             * (critic_update_loss + hparams.aux_loss_mult * aux_loss)
         )
         return loss, dict(
-            value_loss=critic_loss,
             critic_update_loss=critic_update_loss,
             masked_critic_total_loss=loss,
             unmasked_critic_total_loss=unmasked_critic_total_loss,
             aux_loss=aux_loss,
             rew_aux_loss=aux_rew_loss,
-            q=value.mean(),
             abs_batch_action=jnp.abs(minibatch.action).mean(),
-            target_values=target_values.mean(),
+            # --- critic diagnostics ---
+            **{
+                "critic_diag/critic_loss": critic_loss,
+                "critic_diag/mc_bias": mc_bias,
+                "critic_diag/mc_error_var": mc_error_var,
+                "critic_diag/td_error_mean": td_error_mean,
+                "critic_diag/target_mean": target_values.mean(),
+                "critic_diag/target_var": jnp.var(target_values),
+                "critic_diag/q": value.mean(),
+            },
         )
 
     def actor_loss(
@@ -418,21 +441,20 @@ def make_learner_fn(
         real_action_log_prob = old_pi.log_prob(minibatch.action.clip(-0.999, 0.999)).mean()
 
         return loss, dict(
-            actor_loss=actor_loss,
-            loss=loss,
             temp=actor_model.temperature(),
-            abs_batch_action=jnp.abs(minibatch.action).mean(),
             abs_pred_action=jnp.abs(pred_action).mean()
             if not discrete_actions
             else 0.0,
-            kl=kl.mean(),
             lagrangian=lagrangian,
-            kl_bound=hparams.kl_bound,
             lagrangian_loss=lagrangian_loss,
-            entropy=entropy,
             entropy_loss=target_entropy_loss,
-            target_values=minibatch.extras["target_values"].mean(),
-            real_action_log_prob=real_action_log_prob,
+            # --- actor diagnostics ---
+            **{
+                "actor_diag/kl": kl.mean(),
+                "actor_diag/entropy": jnp.mean(entropy),
+                "actor_diag/actor_loss": jnp.mean(actor_loss),
+                "actor_diag/real_action_log_prob": real_action_log_prob,
+            },
         )
 
     def compute_policy_kl(
@@ -532,7 +554,7 @@ def make_learner_fn(
         return train_state, {
             **critic_metrics,
             **actor_metrics,
-            "grad_norm": grad_norm,
+            "actor_diag/grad_norm": grad_norm,
         }
 
     def run_epoch(
@@ -564,6 +586,8 @@ def make_learner_fn(
         train_state, metrics = jax.lax.scan(update, train_state, minibatches)
         # Compute mean metrics across mini-batches
         metrics_mean = jax.tree.map(lambda x: x.mean(0), metrics)
+        # Gradient variance: Var(||g_θ||) across mini-batches
+        metrics_mean["actor_diag/grad_norm_var"] = jnp.var(metrics["actor_diag/grad_norm"])
         # Compute max metrics across mini-batches
         # metrics_max = jax.tree.map(lambda x: x.max(), metrics)
         # metrics_min = jax.tree.map(lambda x: x.min(), metrics)
@@ -573,7 +597,7 @@ def make_learner_fn(
         )  # {**metrics_mean, **{k + "_max": v for k, v in metrics_max.items()}, **{k + "_min": v for k, v in metrics_min.items()}}
 
     def nstep_lambda(batch: Transition):
-        if not hparams.bc_indicator:
+        if not hparams.bc_indicator or not getattr(hparams, "use_retrace", True):
             def loop(carry: tuple[jax.Array, ...], transition: Transition):
                 lambda_return, gae, truncated, next_value = carry
 
@@ -807,8 +831,10 @@ def make_learner_fn(
                 params=train_state.actor.params
             )
         )
+        # J(π_before): already computed in compute_extras using the old actor
+        policy_value_before = batch.extras["policy_value"].mean()
         # Update the model for a number of epochs
-        key, train_key = jax.random.split(key)
+        key, train_key, pv_after_key = jax.random.split(key, 3)
         train_state, update_metrics = jax.lax.scan(
             f=lambda train_state, key: run_epoch(key, train_state, batch),
             init=train_state,
@@ -816,6 +842,18 @@ def make_learner_fn(
         )
         # Get metrics from the last epoch
         update_metrics = jax.tree.map(lambda x: x[-1], update_metrics)
+        
+        # J(π_after): updated actor's expected value on the same states
+        _n_pv = 8 * d if hparams.scale_samples_with_action_d else 8
+        actor_after = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
+        critic_after = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
+        actor_after.eval()
+        critic_after.eval()
+        action_after = actor_after(batch.obs).sample(seed=pv_after_key, sample_shape=(_n_pv,))
+        action_after = jnp.clip(action_after, -0.999, 0.999)
+        obs_tiled = jnp.repeat(batch.obs[None, ...], action_after.shape[0], axis=0)
+        policy_value_after = critic_after(obs_tiled, action_after)["value"].mean()
+        policy_improvement = policy_value_after - policy_value_before
 
         # log seperate log probs for offline and online samples if initialised with bc policy, else log the overall mean log prob
         if hparams.bc_indicator:
@@ -824,16 +862,20 @@ def make_learner_fn(
                 "reward_mean": reward_mean,
                 "reward_mean_offline": reward_mean_offline,
                 "reward_mean_online": reward_mean_online,
-                "policy_log_prob_mean": policy_log_prob_mean,
-                "policy_log_prob_offline_replay": policy_log_prob_offline,
-                "policy_log_prob_online_replay": policy_log_prob_online,
-                "retrace_coeff_mean": retrace_coeff_mean,
+                "actor_diag/policy_log_prob_mean": policy_log_prob_mean,
+                "actor_diag/policy_log_prob_offline_replay": policy_log_prob_offline,
+                "actor_diag/policy_log_prob_online_replay": policy_log_prob_online,
+                "actor_diag/retrace_coeff_mean": retrace_coeff_mean,
+                "actor_diag/policy_improvement": policy_improvement,
+                "sys/grad_updates": (train_state.time_steps // (hparams.num_steps * hparams.num_envs)) * hparams.num_epochs * hparams.num_mini_batches,
             }
         else:
             update_metrics = {
                 **update_metrics,
                 "reward_mean": reward_mean,
-                "policy_log_prob_mean": policy_log_prob_mean,
+                "actor_diag/policy_log_prob_mean": policy_log_prob_mean,
+                "actor_diag/policy_improvement": policy_improvement,
+                "sys/grad_updates": (train_state.time_steps // (hparams.num_steps * hparams.num_envs)) * hparams.num_epochs * hparams.num_mini_batches,
             }
         return train_state, update_metrics
 

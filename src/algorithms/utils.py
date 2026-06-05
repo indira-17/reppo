@@ -1,13 +1,9 @@
 import time
-import distrax
 import logging
-import gymnax
 import jax
 import jax.numpy as jnp
-from mujoco_playground import State
+import distrax
 import wandb
-import numpy as np
-import torch
 
 from gymnax.environments.environment import Environment
 from flax import struct
@@ -200,19 +196,7 @@ def make_log_callback():
 
 def init_env_state(
     key: jax.Array, env: Environment, num_envs: int, bc_indicator: bool = False
-) -> tuple[jax.Array, gymnax.EnvState]:
+) -> tuple[jax.Array, object]:
     key, env_key = jax.random.split(key)
     obs, env_state = env.reset(env_key)
-    # For non-BC mode (JAX environments), randomize steps if available
-    if isinstance(env_state.unwrapped(), State):
-        _env_state = env_state.unwrapped()
-        key, randomize_steps_key = jax.random.split(key)
-        _env_state.info["steps"] = jax.random.randint(
-            randomize_steps_key,
-            _env_state.info["steps"].shape,
-            0,
-            env.episode_length,
-        ).astype(jnp.float32)
-        env_state.set_env_state(_env_state)
-    
     return obs, env_state

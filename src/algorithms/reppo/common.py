@@ -62,27 +62,26 @@ class REPPOTrainState(TrainState):
     normalization_state: PyTreeNode | None = None
 
 class OfflineReplayBuffer:
-    def __init__(self, obs, next_obs, action, reward, done, truncated, behavior_log_prob=None, log_prob=None, size=0):
+    def __init__(
+        self,
+        obs,
+        next_obs,
+        action,
+        reward,
+        done,
+        truncated,
+        behavior_log_prob=None,
+        episode_boundary=None,
+        priority=None,
+        size=0,
+    ):
         self.obs = obs
         self.next_obs = next_obs
         self.action = action
         self.reward = reward
         self.done = done
         self.truncated = truncated
-        self.behavior_log_prob = (
-            behavior_log_prob if behavior_log_prob is not None else log_prob
-        )
-        self.size = size
-
-class OnlineReplayBuffer:
-    def __init__(self, obs, next_obs, action, reward, done, truncated, behavior_log_prob=None, log_prob=None, size=0):
-        self.obs = obs
-        self.next_obs = next_obs
-        self.action = action
-        self.reward = reward
-        self.done = done
-        self.truncated = truncated
-        self.behavior_log_prob = (
-            behavior_log_prob if behavior_log_prob is not None else log_prob
-        )
+        self.behavior_log_prob = behavior_log_prob
+        self.episode_boundary = episode_boundary
+        self.priority = priority
         self.size = size

@@ -1,13 +1,9 @@
-import time
 import torch
 import gymnasium
 import jax
 import numpy as np
 import jax.numpy as jnp
 from collections import defaultdict
-import sys
-import os
-import imageio
 import h5py
 
 from src.common import (
@@ -159,7 +155,7 @@ def make_rollout_fn(
             obs_dict = train_state.last_obs
             obs = flatten_obs(obs_dict, env=env, demo_obs_keys=demo_obs_keys)
 
-            for i in range(num_steps):
+            for _ in range(num_steps):
                 key, act_key = jax.random.split(key)
                 action, policy_extras = policy(act_key, obs)
 
@@ -207,9 +203,7 @@ def make_rollout_fn(
         ) -> tuple[Transition, TrainState]:
             transitions = []
             obs = train_state.last_obs
-            prev_step = train_state.time_steps
-            prev_time = time.perf_counter()
-            for i in range(num_steps):
+            for _ in range(num_steps):
                 key, act_key = jax.random.split(key)
                 action, _ = policy(act_key, obs)
                 # Take a step in the environment

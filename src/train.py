@@ -7,10 +7,6 @@ from omegaconf import DictConfig, OmegaConf
 from src.algorithms import envs, utils
 from src.common import InitFn, LearnerFn, PolicyFn
 from src.cfg_utils import fix_cfg
-import jax.numpy as jnp
-from gymnasium import spaces
-from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
-import torch
 
 logging.basicConfig(level=logging.INFO)
 
@@ -25,11 +21,11 @@ def main(cfg: DictConfig):
     logging.info("\n" + OmegaConf.to_yaml(cfg))
     
     # Modify run name based on bc_indicator
-    run_name = f"bc-reppo-{cfg.env.name}-retrace" if cfg.algorithm.bc_indicator else f"reppo-{cfg.env.name}"
+    run_name = f"reppo-{cfg.env.name}-retrace" if cfg.algorithm.bc_indicator else f"reppo-{cfg.env.name}"
     
-    wandb.init(
+    run = wandb.init(
         mode=cfg.logging.mode,
-        project="bc-reppo-ablations",
+        project="replay-buffer-study",
         entity=cfg.logging.entity,
         tags=cfg.tags,
         config=OmegaConf.to_container(cfg),
@@ -37,23 +33,12 @@ def main(cfg: DictConfig):
         save_code=True,
     )
 
+    run.define_metric("eval_return", step_metric="num_samples")
+
     key = jax.random.PRNGKey(cfg.seed)
     
-    if cfg.algorithm.bc_indicator:
-        # Load dataset first to get observation dimension (dataset dims) like test_bc.py does
-        logging.info(f"Loading dataset from {cfg.env.demo.demo_path}")
-        filter_success = True
-        config = DemoConfig(device=torch.device("cpu"), filter_success_only=True)
-        loader = ManiSkillDemoLoader(config, cfg.env.name)
-        trajectories, _ = loader.load_demo_dataset(cfg.env.demo.demo_path)
-        n_obs_dataset = trajectories[0]['observations'].shape[1]
-        logging.info(f"Dataset observation dimension: {n_obs_dataset}")
-        # Create environment with the correct observation dimension
-        env_setup = envs.make_env(cfg, n_obs_dataset=n_obs_dataset)
-        obs_space = env_setup.observation_space
-    else:
-        env_setup = envs.make_env(cfg)
-        obs_space = env_setup.observation_space
+    env_setup = envs.make_env(cfg)
+    obs_space = env_setup.observation_space
     
     init_fn: InitFn = hydra.utils.call(cfg.algorithm.init)(
         cfg=cfg,
@@ -83,8 +68,12 @@ def main(cfg: DictConfig):
         log_callback=utils.make_log_callback(),
         demo_path=cfg.env.demo.demo_path,
         bc_indicator=cfg.algorithm.bc_indicator,
-        decay_rate=cfg.algorithm.online_sample_decay_rate,
         filter_success=True,
+        wandb_run=run,
+        data_type=cfg.algorithm.data_type,
+        max_buffer_size=cfg.algorithm.max_buffer_size,
+        per_alpha=cfg.algorithm.per_alpha,
+        per_beta=cfg.algorithm.per_beta,
     )
     start = time.perf_counter()
     _, metrics = train_fn(key)
