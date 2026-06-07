@@ -15,15 +15,15 @@ bc_checkpoint_path: /scratch/cluster/idutta/reppo/outputs/2026-04-04/23-07-29/Pi
 # /scratch/cluster/idutta/reppo/outputs/2026-04-11/23-57-16/AnymalC-Reach-v1/saved_models/20260411_235716_seed0/bc_model_actor_best.pkl
 bc_actor_update_delay : 6
 bc_indicator: True
-data_type: "expert"  # "expert" | "random" | "near_on_policy" | "PER"
+data_type: "expert"  # "expert" | "PER" | "random" | "online" | "with_bc"
 max_buffer_size: 1_000_000  # standard SAC replay buffer size
 per_alpha: 0.6  # PER priority exponent (0 = uniform, 1 = fully prioritized)
 per_beta: 0.4   # PER IS weight exponent (0 = no correction, 1 = full correction)
-use_retrace: False
+use_retrace: True
 bc_pretrain_seeds: [0] # [0, 1, 2, 3, 4]
 
 # phased replay schedule
-critic_offline_warmup_iters: 0
+critic_offline_warmup_iters: 3
 
 # BC pretraining entropy ablation controls
 bc_use_entropy: True
@@ -77,7 +77,7 @@ use_actor_skip: False
 
 # actor & critic loss settings (seem remarkably stable)
 ## kl settings
-kl_start: 0.01
+kl_start: 0.0001
 kl_bound: 0.1 # switched to tighter bounds for MJX
 reduce_kl: true
 reverse_kl: false # previous default "false"
@@ -85,7 +85,7 @@ update_kl_lagrangian: true
 actor_kl_clip_mode: "clipped" # "full", "clipped", "kl_relu_clipped", "kl_bound_clipped", "value"
 ## entropy settings
 ent_start: 0.01
-ent_target_mult: 0.5
+ent_target_mult: 1.5
 update_entropy_lagrangian: true
 ## auxiliary loss settings
 aux_loss_mult: 1.0

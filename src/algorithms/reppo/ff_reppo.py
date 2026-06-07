@@ -63,6 +63,26 @@ def load_bc_weights_to_actor(bc_checkpoint_path: str, jax_actor: nnx.Module) -> 
         traceback.print_exc()
         return jax_actor
 
+def _split_online_offline_mean(values: jax.Array, source_is_offline: jax.Array | None):
+    vals = jnp.asarray(values).reshape(-1)
+    if source_is_offline is None:
+        return vals.mean(), jnp.array(0.0, dtype=vals.dtype)
+    offline_mask = jnp.asarray(source_is_offline).reshape(-1).astype(vals.dtype)
+    online_mask = 1.0 - offline_mask
+    online_count = online_mask.sum()
+    offline_count = offline_mask.sum()
+    online_mean = jnp.where(
+        online_count > 0,
+        (vals * online_mask).sum() / online_count,
+        jnp.array(0.0, dtype=vals.dtype),
+    )
+    offline_mean = jnp.where(
+        offline_count > 0,
+        (vals * offline_mask).sum() / offline_count,
+        jnp.array(0.0, dtype=vals.dtype),
+    )
+    return online_mean, offline_mean
+
 class REPPOPolicy(nnx.Module):
     def __init__(
         self,
@@ -267,23 +287,41 @@ def make_learner_fn(
             axis=-1,
         )
 
+        source_is_offline = minibatch.extras.get("source_is_offline", None)
         # compute l2 error for logging
-        critic_loss = optax.squared_error(
+        critic_loss_arr = optax.squared_error(
             value,
             target_values,
         )
-        critic_loss = jnp.mean(critic_loss)
+        critic_loss, critic_loss_offline = _split_online_offline_mean(
+            critic_loss_arr, source_is_offline
+        )
+
         # Critic bias and error variance (using n-step/Retrace targets as G_t)
         mc_error = value.reshape(-1) - target_values.reshape(-1)
-        mc_bias = jnp.mean(mc_error)           # E[Q - G_t]  (signed)
-        mc_error_var = jnp.var(mc_error)        # Var(Q - G_t)
+        mc_bias, mc_bias_offline = _split_online_offline_mean(mc_error, source_is_offline)  # E[Q - G_t] (signed)
+        mc_second_moment, mc_second_moment_offline = _split_online_offline_mean(
+            jnp.square(mc_error), source_is_offline
+        )
+        mc_error_var = mc_second_moment - jnp.square(mc_bias)
+        mc_error_var_offline = mc_second_moment_offline - jnp.square(mc_bias_offline)
+        
         # TD error: r + γ·E_a'[Q(s',a')] - Q(s,a)
         td_error = (
             minibatch.extras["soft_reward"].reshape(-1)
             + hparams.gamma * minibatch.extras["next_policy_value"].reshape(-1)
             - minibatch.extras["action_value"].reshape(-1)
         )
-        td_error_mean = jnp.mean(td_error)
+        td_error_mean, td_error_mean_offline = _split_online_offline_mean(td_error, source_is_offline)
+        target_mean, target_mean_offline = _split_online_offline_mean(target_values, source_is_offline)
+        target_second_moment, target_second_moment_offline = _split_online_offline_mean(
+            jnp.square(target_values), source_is_offline
+        )
+        target_var = target_second_moment - jnp.square(target_mean)
+        target_var_offline = target_second_moment_offline - jnp.square(target_mean_offline)
+       
+        q_mean, q_mean_offline = _split_online_offline_mean(value, source_is_offline)
+        
         mask_truncated = hparams.mask_truncated
         mask = (1.0 - minibatch.truncated) if mask_truncated else 1.0
         # PER: scale loss by importance-sampling weight to correct for sampling bias
@@ -306,12 +344,19 @@ def make_learner_fn(
             # --- critic diagnostics ---
             **{
                 "critic_diag/critic_loss": critic_loss,
+                "critic_diag/critic_loss_offline": critic_loss_offline,
                 "critic_diag/mc_bias": mc_bias,
+                "critic_diag/mc_bias_offline": mc_bias_offline,
                 "critic_diag/mc_error_var": mc_error_var,
+                "critic_diag/mc_error_var_offline": mc_error_var_offline,
                 "critic_diag/td_error_mean": td_error_mean,
-                "critic_diag/target_mean": target_values.mean(),
-                "critic_diag/target_var": jnp.var(target_values),
-                "critic_diag/q": value.mean(),
+                "critic_diag/td_error_mean_offline": td_error_mean_offline,
+                "critic_diag/target_mean": target_mean,
+                "critic_diag/target_mean_offline": target_mean_offline,
+                "critic_diag/target_var": target_var,
+                "critic_diag/target_var_offline": target_var_offline,
+                "critic_diag/q": q_mean,
+                "critic_diag/q_offline": q_mean_offline,
             },
         )
 
@@ -554,7 +599,7 @@ def make_learner_fn(
         return train_state, {
             **critic_metrics,
             **actor_metrics,
-            "actor_diag/grad_norm": grad_norm,
+            "actor_diag/grad_norm": grad_norm
         }
 
     def run_epoch(
@@ -597,7 +642,7 @@ def make_learner_fn(
         )  # {**metrics_mean, **{k + "_max": v for k, v in metrics_max.items()}, **{k + "_min": v for k, v in metrics_min.items()}}
 
     def nstep_lambda(batch: Transition):
-        if not hparams.bc_indicator or not getattr(hparams, "use_retrace", True):
+        if not getattr(hparams, "use_retrace", True):
             def loop(carry: tuple[jax.Array, ...], transition: Transition):
                 lambda_return, gae, truncated, next_value = carry
 
@@ -775,44 +820,40 @@ def make_learner_fn(
         extras = compute_extras(key=act_key, train_state=train_state, batch=batch)
         batch.extras.update(extras)
 
-        # compute log probs for offline and online samples if initialised with bc policy
+        # compute log probs; split by source when offline/online data is mixed
         current_log_prob = batch.extras["current_log_prob"]
         reward_mean = batch.reward.mean()
-        if hparams.bc_indicator:
-            policy_log_prob_mean = current_log_prob.mean()
-            source_is_offline = batch.extras.get("source_is_offline")
-            if source_is_offline is not None:
-                offline_count = source_is_offline.sum()
-                online_mask = 1.0 - source_is_offline
-                online_count = online_mask.sum()
-                reward_mean_offline = jnp.where(
-                    offline_count > 0,
-                    (batch.reward * source_is_offline).sum() / offline_count,
-                    0.0,
-                )
-                reward_mean_online = jnp.where(
-                    online_count > 0,
-                    (batch.reward * online_mask).sum() / online_count,
-                    0.0,
-                )
-                policy_log_prob_offline = jnp.where(
-                    offline_count > 0,
-                    (current_log_prob * source_is_offline).sum() / offline_count,
-                    0.0,
-                )
-                policy_log_prob_online = jnp.where(
-                    online_count > 0,
-                    (current_log_prob * online_mask).sum() / online_count,
-                    0.0,
-                )
-            else:
-                reward_mean_offline = jnp.array(0.0, dtype=reward_mean.dtype)
-                reward_mean_online = reward_mean
-                policy_log_prob_offline = current_log_prob.mean()
-                policy_log_prob_online = jnp.array(0.0, dtype=policy_log_prob_mean.dtype)
-
+        policy_log_prob_mean = current_log_prob.mean()
+        source_is_offline = batch.extras.get("source_is_offline")
+        if source_is_offline is not None:
+            offline_count = source_is_offline.sum()
+            online_mask = 1.0 - source_is_offline
+            online_count = online_mask.sum()
+            reward_mean_offline = jnp.where(
+                offline_count > 0,
+                (batch.reward * source_is_offline).sum() / offline_count,
+                0.0,
+            )
+            reward_mean_online = jnp.where(
+                online_count > 0,
+                (batch.reward * online_mask).sum() / online_count,
+                0.0,
+            )
+            policy_log_prob_offline = jnp.where(
+                offline_count > 0,
+                (current_log_prob * source_is_offline).sum() / offline_count,
+                0.0,
+            )
+            policy_log_prob_online = jnp.where(
+                online_count > 0,
+                (current_log_prob * online_mask).sum() / online_count,
+                0.0,
+            )
         else:
-            policy_log_prob_mean = current_log_prob.mean()
+            reward_mean_offline = jnp.array(0.0, dtype=reward_mean.dtype)
+            reward_mean_online = reward_mean
+            policy_log_prob_offline = jnp.array(0.0, dtype=policy_log_prob_mean.dtype)
+            policy_log_prob_online = policy_log_prob_mean
 
         (
             batch.extras["target_values"],
@@ -820,8 +861,11 @@ def make_learner_fn(
             retrace_coeff_mean,
         ) = nstep_lambda(batch=batch)
 
-        # Reshape data to (num_steps * num_envs, ...)
+        # Per-env-slot TD error for PER priority updates
+        # Shape: [num_envs]. Offline segments occupy slots 0..num_offline-1.
+        per_env_td_error = jnp.abs(batch.extras["action_value"] - batch.extras["target_values"]).mean(axis=0)
 
+        # Reshape data to (num_steps * num_envs, ...)
         batch = jax.tree.map(
             lambda x: x.reshape((hparams.num_steps * hparams.num_envs, *x.shape[2:])),
             batch,
@@ -832,7 +876,7 @@ def make_learner_fn(
             )
         )
         # J(π_before): already computed in compute_extras using the old actor
-        policy_value_before = batch.extras["policy_value"].mean()
+        policy_value_before_vec = batch.extras["policy_value"].reshape(-1)
         # Update the model for a number of epochs
         key, train_key, pv_after_key = jax.random.split(key, 3)
         train_state, update_metrics = jax.lax.scan(
@@ -852,31 +896,27 @@ def make_learner_fn(
         action_after = actor_after(batch.obs).sample(seed=pv_after_key, sample_shape=(_n_pv,))
         action_after = jnp.clip(action_after, -0.999, 0.999)
         obs_tiled = jnp.repeat(batch.obs[None, ...], action_after.shape[0], axis=0)
-        policy_value_after = critic_after(obs_tiled, action_after)["value"].mean()
-        policy_improvement = policy_value_after - policy_value_before
+        policy_value_after_vec = critic_after(obs_tiled, action_after)["value"].mean(0).reshape(-1)
+        policy_improvement_online, policy_improvement_offline = _split_online_offline_mean(
+            policy_value_after_vec - policy_value_before_vec,
+            batch.extras.get("source_is_offline"),
+        )
 
-        # log seperate log probs for offline and online samples if initialised with bc policy, else log the overall mean log prob
-        if hparams.bc_indicator:
-            update_metrics = {
-                **update_metrics,
-                "reward_mean": reward_mean,
-                "reward_mean_offline": reward_mean_offline,
-                "reward_mean_online": reward_mean_online,
-                "actor_diag/policy_log_prob_mean": policy_log_prob_mean,
-                "actor_diag/policy_log_prob_offline_replay": policy_log_prob_offline,
-                "actor_diag/policy_log_prob_online_replay": policy_log_prob_online,
-                "actor_diag/retrace_coeff_mean": retrace_coeff_mean,
-                "actor_diag/policy_improvement": policy_improvement,
-                "sys/grad_updates": (train_state.time_steps // (hparams.num_steps * hparams.num_envs)) * hparams.num_epochs * hparams.num_mini_batches,
-            }
-        else:
-            update_metrics = {
-                **update_metrics,
-                "reward_mean": reward_mean,
-                "actor_diag/policy_log_prob_mean": policy_log_prob_mean,
-                "actor_diag/policy_improvement": policy_improvement,
-                "sys/grad_updates": (train_state.time_steps // (hparams.num_steps * hparams.num_envs)) * hparams.num_epochs * hparams.num_mini_batches,
-            }
-        return train_state, update_metrics
+        update_metrics = {
+            **update_metrics,
+            "reward_mean": reward_mean,
+            "reward_mean_offline": reward_mean_offline,
+            "reward_mean_online": reward_mean_online,
+            "actor_diag/policy_log_prob_mean": policy_log_prob_mean,
+            "actor_diag/policy_log_prob_offline_replay": policy_log_prob_offline,
+            "actor_diag/policy_log_prob_online_replay": policy_log_prob_online,
+            # retrace coefficient: measure of off-policyness (1.0 = on-policy, < 1.0 = off-policy)
+            "critic_diag/retrace_coeff_mean": retrace_coeff_mean,
+            "actor_diag/retrace_coeff_mean": retrace_coeff_mean,
+            "actor_diag/policy_improvement": policy_improvement_online,
+            "actor_diag/policy_improvement_offline": policy_improvement_offline,
+            "sys/grad_updates": (train_state.time_steps // (hparams.num_steps * hparams.num_envs)) * hparams.num_epochs * hparams.num_mini_batches,
+        }
+        return train_state, update_metrics, per_env_td_error
 
     return jax.jit(learner_fn)

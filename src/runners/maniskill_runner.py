@@ -1,9 +1,13 @@
+import time
 import torch
 import gymnasium
 import jax
 import numpy as np
 import jax.numpy as jnp
 from collections import defaultdict
+import sys
+import os
+import imageio
 import h5py
 
 from src.common import (
@@ -131,13 +135,13 @@ def make_rollout_fn(
     num_steps: int,
     num_envs: int,
     demo_path: str = None,
-    bc_indicator: bool = False,
+    data_type: str = None,
     env_id: str = None,
     filter_success: bool = True,
     cut_at_first_success: bool = True,
 ) -> RolloutFn:
     # BC-specific rollout function with demo observation flattening
-    if bc_indicator:
+    if data_type == 'expert':
         demo_obs_keys = get_demo_obs_keys(demo_path) if demo_path else None
         # Compute action bounds once at function creation time
         _env_id = env_id or (env.spec.id if hasattr(env, 'spec') and env.spec else "PushCube-v1")
@@ -155,7 +159,7 @@ def make_rollout_fn(
             obs_dict = train_state.last_obs
             obs = flatten_obs(obs_dict, env=env, demo_obs_keys=demo_obs_keys)
 
-            for _ in range(num_steps):
+            for i in range(num_steps):
                 key, act_key = jax.random.split(key)
                 action, policy_extras = policy(act_key, obs)
 
@@ -203,9 +207,11 @@ def make_rollout_fn(
         ) -> tuple[Transition, TrainState]:
             transitions = []
             obs = train_state.last_obs
-            for _ in range(num_steps):
+            prev_step = train_state.time_steps
+            prev_time = time.perf_counter()
+            for i in range(num_steps):
                 key, act_key = jax.random.split(key)
-                action, _ = policy(act_key, obs)
+                action, policy_extras = policy(act_key, obs)
                 # Take a step in the environment
                 next_obs, reward, done, truncated, info = env.step(action)
                 if "final_observation" in info:
@@ -220,7 +226,9 @@ def make_rollout_fn(
                     reward=reward,
                     done=done,
                     truncated=truncated,
-                    extras={},
+                    extras={
+                        "behavior_log_prob": policy_extras.get("behavior_log_prob", jnp.zeros_like(reward)),
+                    },
                 )
                 transitions.append(transition)
                 obs = next_obs
@@ -239,13 +247,13 @@ def make_eval_fn(
     env: gymnasium.Env,
     max_episode_steps: int,
     demo_path: str = None,
-    bc_indicator: bool = False,
+    data_type: str = None,
     env_id: str = None,
     filter_success: bool = True,
     cut_at_first_success: bool = True,
 ) -> EvalFn:
     # BC-specific evaluation function with demo observation flattening
-    if bc_indicator:
+    if data_type == 'expert':
         demo_obs_keys = get_demo_obs_keys(demo_path) if demo_path else None
         # Compute action bounds once at function creation time
         _env_id = env_id or (env.spec.id if hasattr(env, 'spec') and env.spec else "PushCube-v1")

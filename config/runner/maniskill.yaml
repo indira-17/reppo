@@ -4,7 +4,7 @@ rollout_fn:
   num_steps: ${algorithm.num_steps}
   num_envs: ${algorithm.num_envs}
   demo_path: ${env.demo.demo_path}
-  bc_indicator: ${algorithm.bc_indicator}
+  data_type: ${algorithm.data_type}
   env_id: ${env.name}
   filter_success: ${env.demo.filter_success}
   cut_at_first_success: ${env.demo.cut_at_first_success}
@@ -14,7 +14,7 @@ eval_fn:
   _partial_: true
   max_episode_steps: ${algorithm.max_episode_steps}
   demo_path: ${env.demo.demo_path}
-  bc_indicator: ${algorithm.bc_indicator}
+  data_type: ${algorithm.data_type}
   env_id: ${env.name}
   filter_success: ${env.demo.filter_success}
   cut_at_first_success: ${env.demo.cut_at_first_success}

@@ -3,7 +3,11 @@ import jax
 import logging
 import time
 import wandb
+import torch
+import jax.numpy as jnp
+from gymnasium import spaces
 from omegaconf import DictConfig, OmegaConf
+from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
 from src.algorithms import envs, utils
 from src.common import InitFn, LearnerFn, PolicyFn
 from src.cfg_utils import fix_cfg
@@ -20,8 +24,8 @@ def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     logging.info("\n" + OmegaConf.to_yaml(cfg))
     
-    # Modify run name based on bc_indicator
-    run_name = f"reppo-{cfg.env.name}-retrace" if cfg.algorithm.bc_indicator else f"reppo-{cfg.env.name}"
+    # Modify run name based on data_type
+    run_name = f"reppo-{cfg.env.name}-{cfg.algorithm.data_type}" if cfg.algorithm.data_type else f"reppo-{cfg.env.name}"
     
     run = wandb.init(
         mode=cfg.logging.mode,
@@ -33,12 +37,29 @@ def main(cfg: DictConfig):
         save_code=True,
     )
 
-    run.define_metric("eval_return", step_metric="num_samples")
+    # eval/num_samples is injected into every eval log call (training.py) and is used
+    # as the x-axis for the sample-efficiency curve.
+    # hidden=True keeps it out of the workspace summary charts.
+    run.define_metric("eval/num_samples", hidden=True)
+    run.define_metric("eval/episode_return", step_metric="eval/num_samples")
 
     key = jax.random.PRNGKey(cfg.seed)
     
-    env_setup = envs.make_env(cfg)
-    obs_space = env_setup.observation_space
+    if cfg.algorithm.bc_indicator:
+        # Load dataset first to get observation dimension (dataset dims) like test_bc.py does
+        logging.info(f"Loading dataset from {cfg.env.demo.demo_path}")
+        filter_success = True
+        config = DemoConfig(device=torch.device("cpu"), filter_success_only=True)
+        loader = ManiSkillDemoLoader(config, cfg.env.name)
+        trajectories, _ = loader.load_demo_dataset(cfg.env.demo.demo_path)
+        n_obs_dataset = trajectories[0]['observations'].shape[1]
+        logging.info(f"Dataset observation dimension: {n_obs_dataset}")
+        # Create environment with the correct observation dimension
+        env_setup = envs.make_env(cfg, n_obs_dataset=n_obs_dataset)
+        obs_space = env_setup.observation_space
+    else:
+        env_setup = envs.make_env(cfg)
+        obs_space = env_setup.observation_space
     
     init_fn: InitFn = hydra.utils.call(cfg.algorithm.init)(
         cfg=cfg,
@@ -55,8 +76,18 @@ def main(cfg: DictConfig):
         action_space=env_setup.action_space,
         observation_space=obs_space,
     )
-    rollout_fn = hydra.utils.call(cfg.runner.rollout_fn)(env_setup.env, demo_path=cfg.env.demo.demo_path, bc_indicator=cfg.algorithm.bc_indicator, filter_success=True)
-    eval_fn = hydra.utils.call(cfg.runner.eval_fn)(env_setup.eval_env, demo_path=cfg.env.demo.demo_path, bc_indicator=cfg.algorithm.bc_indicator, filter_success=True)
+    rollout_fn = hydra.utils.call(cfg.runner.rollout_fn)(
+        env_setup.env,
+        demo_path=cfg.env.demo.demo_path,
+        data_type=cfg.algorithm.data_type,
+        filter_success=True,
+    )
+    eval_fn = hydra.utils.call(cfg.runner.eval_fn)(
+        env_setup.eval_env,
+        demo_path=cfg.env.demo.demo_path,
+        data_type=cfg.algorithm.data_type,
+        filter_success=True,
+    )
     make_train_fn = hydra.utils.call(cfg.runner.train_fn)
     train_fn = make_train_fn(
         env=(env_setup.env, env_setup.eval_env),
@@ -67,7 +98,6 @@ def main(cfg: DictConfig):
         eval_fn=eval_fn,
         log_callback=utils.make_log_callback(),
         demo_path=cfg.env.demo.demo_path,
-        bc_indicator=cfg.algorithm.bc_indicator,
         filter_success=True,
         wandb_run=run,
         data_type=cfg.algorithm.data_type,

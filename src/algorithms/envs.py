@@ -206,17 +206,10 @@ def _make_maniskill_env(cfg: DictConfig, n_obs_dataset: int = None) -> EnvSetup[
     env = make_env(eval=False)
     eval_env = make_env(eval=True)
     
-    if cfg.algorithm.bc_indicator:
-        # Debug: check observation space from wrapper
-        logging.debug(f"[make_maniskill_env] env.single_observation_space: {env.single_observation_space}")
-        logging.debug(f"[make_maniskill_env] env.single_observation_space.shape: {env.single_observation_space.shape}")
-        logging.debug(f"[make_maniskill_env] env.observation_space: {env.observation_space}")
-        logging.debug(f"[make_maniskill_env] env.observation_space.shape: {env.observation_space.shape}")
-        
+    if cfg.algorithm.data_type == "expert" or cfg.algorithm.bc_indicator:  
         # Override observation space to match dataset dimension
         obs_space = env.single_observation_space
         if n_obs_dataset is not None:
-            logging.debug(f"[make_maniskill_env] Overriding observation space from {obs_space.shape} to ({cfg.runner.train_fn.num_envs}, {n_obs_dataset})")
             # Create new observation space with dataset dims
             new_shape = (n_obs_dataset,)
             obs_space = gymnasium.spaces.Box(
