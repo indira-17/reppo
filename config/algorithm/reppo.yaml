@@ -77,14 +77,14 @@ use_actor_skip: False
 
 # actor & critic loss settings (seem remarkably stable)
 ## kl settings
-kl_start: 0.0001
+kl_start: 0.01
 kl_bound: 0.1 # switched to tighter bounds for MJX
 reduce_kl: true
 reverse_kl: false # previous default "false"
 update_kl_lagrangian: true
 actor_kl_clip_mode: "clipped" # "full", "clipped", "kl_relu_clipped", "kl_bound_clipped", "value"
 ## entropy settings
-ent_start: 0.01
+ent_start: 0.0001
 ent_target_mult: 1.5
 update_entropy_lagrangian: true
 ## auxiliary loss settings
