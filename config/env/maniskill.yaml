@@ -17,7 +17,7 @@ control_mode: pd_joint_delta_pos
 capture_video: false
 save_train_video_freq: null
 env_kwargs:
-  obs_mode: state_dict
+  obs_mode: state
   render_mode: rgb_array
   sim_backend: physx_cuda
 

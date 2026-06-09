@@ -1,7 +1,7 @@
 defaults:
   - algorithm: reppo
   - env: mjx_dmc
-  - logging: wandb_offline
+  - logging: wandb_online
   - runner: gymnax
   - _self_
 
