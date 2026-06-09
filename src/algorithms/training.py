@@ -110,6 +110,7 @@ def _create_replay_buffer_from_demos(demo_path, env_id, num_steps, filter_succes
         done=done_list,
         truncated=trunc_list,
         behavior_log_prob=[jnp.zeros(num_steps) for _ in obs_list],
+        insertion_step=[0 for _ in obs_list],
         size=len(obs_list),
     )
     print(f"[REPLAY] Offline buffer created: {replay_buffer.size} segments")
@@ -362,7 +363,8 @@ def make_loop_train_fn(
                 offline_replay_buffer = OfflineReplayBuffer(
                     obs=buf_obs, next_obs=buf_next_obs, action=buf_action,
                     reward=buf_reward, done=buf_done, truncated=buf_trunc,
-                    behavior_log_prob=buf_blp, priority=buf_priority, size=len(buf_obs),
+                    behavior_log_prob=buf_blp, priority=buf_priority,
+                    insertion_step=[0 for _ in buf_obs], size=len(buf_obs),
                 )
 
             buffer_memory_gb = sum(
@@ -388,6 +390,7 @@ def make_loop_train_fn(
                     key=rollout_key, train_state=state, policy=policy
                 )
 
+                avg_age_sampled = 0.0
                 if data_type in ('expert', 'PER', 'random'):
                     # Sample num_envs trajectories of fixed length num_steps.
                     num_offline = num_envs if ratio >= 1.0 else int(ratio * num_envs)
@@ -425,6 +428,12 @@ def make_loop_train_fn(
                         traj_truncated.append(offline_replay_buffer.truncated[idx])
                         traj_behavior_log_prob.append(offline_replay_buffer.behavior_log_prob[idx])
                         traj_source_is_offline.append(jnp.ones((num_steps,), dtype=jnp.float32))
+
+                    # Average age (in training steps) of the sampled buffered transitions.
+                    if offline_replay_buffer.insertion_step is not None and len(sampled_offline_indices) > 0:
+                        avg_age_sampled = float(
+                            np.mean([step - offline_replay_buffer.insertion_step[i] for i in sampled_offline_indices])
+                        )
 
                     # Use current rollout transitions as on-policy online data
                     # rollout_transitions shape: [num_steps, num_envs, ...]
@@ -506,8 +515,21 @@ def make_loop_train_fn(
                 )
 
                 if step % train_log_interval == 0:
-                    log_metrics = {**train_metrics, **replay_logprob_stats}
-                    # critic_diag/, actor_diag/, sys/ stay at top level and only plain scalar metrics get the "train/" prefix.
+                    # "data/" section: off-policiness of buffered data (log importance ratio
+                    # between current and behavior policy) and average age of sampled transitions.
+                    data_stats = {}
+                    if data_type in ('expert', 'PER', 'random'):
+                        b_off = replay_logprob_stats.get("behavior_log_prob_offline_replay")
+                        p_off = train_metrics.get("actor_diag/policy_log_prob_offline_replay")
+                        if b_off is not None and p_off is not None:
+                            data_stats["data/offpolicyness_offline"] = p_off - b_off
+                        b_on = replay_logprob_stats.get("behavior_log_prob_online_replay")
+                        p_on = train_metrics.get("actor_diag/policy_log_prob_online_replay")
+                        if b_on is not None and p_on is not None:
+                            data_stats["data/offpolicyness_online"] = p_on - b_on
+                        data_stats["data/avg_age_sampled"] = avg_age_sampled
+                    log_metrics = {**train_metrics, **replay_logprob_stats, **data_stats}
+                    # critic_diag/, actor_diag/, sys/, data/ stay at top level and only plain scalar metrics get the "train/" prefix.
                     namespaced = {k: v for k, v in log_metrics.items() if "/" in k}
                     plain = {k: v for k, v in log_metrics.items() if "/" not in k}
                     log_callback(state, {**utils.prefix_dict("train", plain), **namespaced})
@@ -526,6 +548,7 @@ def make_loop_train_fn(
                             offline_replay_buffer.truncated.append(rollout_transitions.truncated[:, ei])
                             blp = rollout_transitions.extras.get("behavior_log_prob", None)
                             offline_replay_buffer.behavior_log_prob.append(blp[:, ei] if blp is not None else jnp.zeros(num_steps))
+                            offline_replay_buffer.insertion_step.append(step)
                             if data_type == 'PER':
                                 offline_replay_buffer.priority.append(max_p)
                             offline_replay_buffer.size += 1
@@ -538,6 +561,7 @@ def make_loop_train_fn(
                             offline_replay_buffer.truncated[w_idx] = rollout_transitions.truncated[:, ei]
                             blp = rollout_transitions.extras.get("behavior_log_prob", None)
                             offline_replay_buffer.behavior_log_prob[w_idx] = blp[:, ei] if blp is not None else jnp.zeros(num_steps)
+                            offline_replay_buffer.insertion_step[w_idx] = step
                             if data_type == 'PER':
                                 offline_replay_buffer.priority[w_idx] = max_p
                         ring_write_idx += 1

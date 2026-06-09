@@ -171,6 +171,15 @@ def make_log_callback():
         metrics["sys/wall_time"] = duration
         metrics["sys/sps"] = sps
 
+        # "data/" section: efficiency of the data used so far. Sample efficiency is
+        # return per environment step (online interaction); wall-clock efficiency is
+        # return per second of training. Only available on steps that ran evaluation.
+        eval_return = metrics.get("eval/episode_return")
+        if eval_return is not None:
+            env_steps = metrics["sys/time_step"]
+            metrics["data/sample_efficiency"] = eval_return / jnp.maximum(env_steps, 1)
+            metrics["data/wall_clock_efficiency"] = eval_return / jnp.maximum(duration, 1e-6)
+
     def print_logs(metrics):
         log_strs = []
         pev_category = None

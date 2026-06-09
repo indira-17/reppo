@@ -73,6 +73,7 @@ class OfflineReplayBuffer:
         behavior_log_prob=None,
         episode_boundary=None,
         priority=None,
+        insertion_step=None,
         size=0,
     ):
         self.obs = obs
@@ -84,4 +85,7 @@ class OfflineReplayBuffer:
         self.behavior_log_prob = behavior_log_prob
         self.episode_boundary = episode_boundary
         self.priority = priority
+        # Training-step index at which each segment was written into the buffer.
+        # Used to measure the age (staleness) of sampled transitions.
+        self.insertion_step = insertion_step
         self.size = size
