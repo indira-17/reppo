@@ -27,6 +27,7 @@ from src.env_utils.jax_wrappers import (
     MjxGymnaxWrapper,
 )
 from src.env_utils.torch_wrappers.maniskill_wrapper import ManiSkillWrapper
+from src.env.utils.torch_wrappers.humanoid_bench_env import HumanoidBenchEnv
 
 Env = gymnasium.Env | Environment[EnvState, EnvParams]
 Space = gymnasium.Space | GymnaxSpace
@@ -254,6 +255,20 @@ def _make_atari_env(cfg: DictConfig) -> EnvSetup[gymnasium.Env]:
         observation_space=_gymnasium_to_gymnax_space(env.observation_space),
     )
 
+def _make_humanoid_bench_env(cfg: DictConfig) -> EnvSetup[gymnasium.Env]:
+    env = HumanoidBenchEnv(cfg.env.name, num_envs=cfg.algorithm.num_envs)
+    eval_env = HumanoidBenchEnv(cfg.env.name, num_envs=cfg.algorithm.num_envs)
+    
+    return EnvSetup(
+        env=env,
+        eval_env=eval_env,
+        action_space=GymnaxBox(
+            low=-1.0, high=1.0, shape=(env.num_actions,), dtype=jnp.float32
+        ),  # HumanoidBench actions are already normalized to [-1, 1]
+        observation_space=GymnaxBox(
+            low=-jnp.inf, high=jnp.inf, shape=(env.num_obs,), dtype=jnp.float32
+        ),
+    )
 
 def make_env(cfg: DictConfig, n_obs_dataset: int = None) -> EnvSetup[Env]:
     if cfg.env.type == "brax":
@@ -270,5 +285,7 @@ def make_env(cfg: DictConfig, n_obs_dataset: int = None) -> EnvSetup[Env]:
         return _make_atari_env(cfg)
     elif cfg.env.type == "maniskill":
         return _make_maniskill_env(cfg, n_obs_dataset=n_obs_dataset)
+    elif cfg.env.type == "humanoid_bench":
+        return _make_humanoid_bench_env(cfg)
     else:
         raise ValueError(f"Unknown environment type: {cfg.env.type}")

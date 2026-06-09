@@ -1,0 +1,7 @@
+type: humanoid_bench
+name: 
+max_episode_steps: 1000
+asymmetric_observation: false
+
+vmin: -10
+vmax:  10

@@ -408,6 +408,7 @@ def make_scan_train_fn(
             if data_type == 'PER':
                 per_env_td = np.asarray(per_env_td_error)
                 for i, sidx in enumerate(sampled_offline_indices):
+                    offline_replay_buffer.priority[sidx] = float(abs(per_env_td[i])) + 1e-6
         return state, metrics
 
     def train_eval_step(key, train_state):

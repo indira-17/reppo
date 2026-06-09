@@ -1,0 +1,15 @@
+defaults:
+  - algorithm: reppo
+  - env: humanoid_bench
+  - logging: wandb_online
+  - runner: humanoid_bench
+  - _self_
+
+seed: 0
+name: "reppo"
+tags: []
+hydra:
+  job:
+    chdir: True
+  searchpath:
+    - file://config

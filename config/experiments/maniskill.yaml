@@ -2,7 +2,7 @@
 algorithm:
   gamma: 0.8
   lmbda: 0.95
-  num_envs: 1024
+  num_envs: 32
   num_steps: 128
   num_mini_batches: 128
   num_epochs: 4

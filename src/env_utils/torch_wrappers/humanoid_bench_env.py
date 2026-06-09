@@ -83,7 +83,7 @@ class HumanoidBenchEnv:
         observations = torch.from_numpy(observations).to(
             device=self.sim_device, dtype=torch.float
         )
-        return observations
+        return observations, {} # to be compatible with the training files
 
     def render(self):
         assert self.num_envs == 1, (
