@@ -27,7 +27,7 @@ from src.env_utils.jax_wrappers import (
     MjxGymnaxWrapper,
 )
 from src.env_utils.torch_wrappers.maniskill_wrapper import ManiSkillWrapper
-from src.env.utils.torch_wrappers.humanoid_bench_env import HumanoidBenchEnv
+from src.env_utils.torch_wrappers.humanoid_bench_env import HumanoidBenchEnv
 
 Env = gymnasium.Env | Environment[EnvState, EnvParams]
 Space = gymnasium.Space | GymnaxSpace

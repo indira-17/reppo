@@ -26,18 +26,18 @@ def make_rollout_fn(
             action_torch = torch.as_tensor(np.asarray(action), device=env.sim_device)
 
             next_obs, reward, done, info = env.step(action_torch)   # 4-tuple
-            truncated = info["time_outs"]
-            # wrapper already put terminal obs into this for truncated envs:
+            done_j = to_jax(info["terminated"]).astype(jnp.float32)
+            truncated_j = to_jax(info["time_outs"]).astype(jnp.float32)
             bootstrap_next_obs = to_jax(info["observations"]["raw"]["obs"])
-
             reward_j = to_jax(reward)
+            
             transitions.append(Transition(
                 obs=obs,
                 next_obs=bootstrap_next_obs,
                 action=action,
                 reward=reward_j,
-                done=to_jax(done),
-                truncated=to_jax(truncated),
+                done=done_j,
+                truncated=truncated_j,
                 extras={"behavior_log_prob":
                         policy_extras.get("behavior_log_prob", jnp.zeros_like(reward_j))},
             ))
@@ -63,7 +63,7 @@ def make_eval_fn(
     cut_at_first_success: bool = True,
 ) -> EvalFn:
     def evaluate(key, policy):
-        obs, _ = to_jax(env.reset())                 # no args; single return
+        obs, _ = env.reset()                 # no args; single return
         n = env.num_envs
         ep_return = np.zeros(n, dtype=np.float64)
         done_mask = np.zeros(n, dtype=bool)

@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import humanoid_bench
 import gymnasium as gym
 import numpy as np
 import torch
@@ -96,17 +96,24 @@ class HumanoidBenchEnv:
         actions = actions.cpu().numpy()
 
         observations, rewards, dones, raw_infos = self.envs.step(actions)
+        dones = np.asarray(dones, dtype=bool)
 
-        # This will be used for getting 'true' next observations
+        # Split time-limit (truncation) from true termination using a per-env step counter, so it does not depend on the (often missing) "TimeLimit.truncated".
+        self.episode_steps += 1
+        truncateds = np.logical_and(dones, self.episode_steps >= self.max_episode_steps)
+        terminateds = np.logical_and(dones, np.logical_not(truncateds))
+
+        # substitute the terminal observation on every boundary.
         infos = dict()
         infos["observations"] = {"raw": {"obs": observations.copy()}}
-        truncateds = np.zeros_like(dones)
         for i in range(self.num_envs):
-            if raw_infos[i].get("TimeLimit.truncated", False):
-                truncateds[i] = True
+            if dones[i] and "terminal_observation" in raw_infos[i]:
                 infos["observations"]["raw"]["obs"][i] = raw_infos[i][
                     "terminal_observation"
                 ]
+
+        # reset the step counter for envs that just finished an episode
+        self.episode_steps[dones] = 0
 
         observations = torch.from_numpy(observations).to(
             device=self.sim_device, dtype=torch.float
@@ -116,9 +123,11 @@ class HumanoidBenchEnv:
         )
         dones = torch.from_numpy(dones).to(device=self.sim_device)
         truncateds = torch.from_numpy(truncateds).to(device=self.sim_device)
+        terminateds = torch.from_numpy(terminateds).to(device=self.sim_device)
         infos["observations"]["raw"]["obs"] = torch.from_numpy(
             infos["observations"]["raw"]["obs"]
         ).to(device=self.sim_device, dtype=torch.float)
-        infos["time_outs"] = truncateds
+        infos["time_outs"] = truncateds      # time-limit only  -> Transition.truncated
+        infos["terminated"] = terminateds    # true termination -> Transition.done
 
         return observations, rewards, dones, infos

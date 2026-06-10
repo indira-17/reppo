@@ -2,6 +2,9 @@ type: humanoid_bench
 name: 
 max_episode_steps: 1000
 asymmetric_observation: false
+stochastic_eval: True
+filter_success: True
+cut_at_first_success: True
 
 vmin: -10
 vmax:  10
