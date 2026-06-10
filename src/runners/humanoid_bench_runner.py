@@ -63,7 +63,8 @@ def make_eval_fn(
     cut_at_first_success: bool = True,
 ) -> EvalFn:
     def evaluate(key, policy):
-        obs, _ = env.reset()                 # no args; single return
+        obs, _ = env.reset()                 # returns (obs, {})
+        obs = to_jax(obs)
         n = env.num_envs
         ep_return = np.zeros(n, dtype=np.float64)
         done_mask = np.zeros(n, dtype=bool)

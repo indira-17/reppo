@@ -77,9 +77,13 @@ class HumanoidBenchEnv:
         self.num_obs = self.envs.observation_space.shape[-1]
         self.num_actions = self.envs.action_space.shape[-1]
 
+        # Per-env elapsed step counter (used to split time-limit vs true termination).
+        self.episode_steps = np.zeros(self.num_envs, dtype=np.int64)
+
     def reset(self):
         """Reset the environment."""
         observations = self.envs.reset()
+        self.episode_steps[:] = 0
         observations = torch.from_numpy(observations).to(
             device=self.sim_device, dtype=torch.float
         )

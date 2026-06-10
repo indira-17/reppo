@@ -313,22 +313,15 @@ def make_scan_train_fn(
         eval_metrics = eval_fn(eval_key, policy)
         eval_return = eval_metrics["episode_return"]
         grad_updates = train_metrics.get("sys/grad_updates", jnp.array(1.0))
-        if data_type == 'expert':
-            offline_transitions_used = train_state.time_steps
-            offline_transitions_used = jnp.array(0)
-        else:
-            offline_transitions_used = jnp.array(0)
-            offline_transitions_used = jnp.array(0)
-            transitions_used = train_state.time_steps
-        
+        # Scan trainer is single-source (expert = fully offline), so log one unified count.
+        transitions_used = train_state.time_steps
+
         # Everything goes through log_callback so all logging shares the same wandb step (step=state.time_steps)
         log_metrics_eval = utils.prefix_dict("eval", eval_metrics)
         log_metrics_eval.update({
             "sys/perf_per_gb":            eval_return / buffer_memory_gb if buffer_memory_gb > 0 else 0.0,
             "sys/perf_per_grad_update":   eval_return / jnp.maximum(grad_updates, 1.0),
-            "sys/perf_per_offline_transaction": eval_return / jnp.maximum(offline_transitions_used, 1) if data_type == 'expert' else 0.0,
-            "sys/perf_per_online_transaction": eval_return / jnp.maximum(online_transitions_used, 1) if data_type == 'expert' else 0.0,
-            "sys/perf_per_transaction": eval_return / jnp.maximum(transitions_used, 1),
+            "sys/perf_per_transaction":   eval_return / jnp.maximum(transitions_used, 1),
         })
         log_callback(train_state, log_metrics_eval)
         return train_state, {
@@ -365,22 +358,13 @@ def make_scan_train_fn(
         init_keys = jax.random.split(init_key, num_seeds)
 
         if data_type in ("PER", "random"):
-            train_state = jax.vmap(init_train_state)(init_keys)
-
-            def _seed_replay(ts, k):
-                k, rk = jax.random.split(k)
-                policy = policy_fn(ts, False)
-                rt, _ = rollout_fn(key=rk, train_state=ts, policy=policy)
-                return _init_replay_from_rollout(rt)
-
-            replay_state = jax.vmap(_seed_replay)(train_state, init_keys)
-            keys = jax.random.split(key, num_iterations)
-            (state, _), metrics = jax.lax.scan(
-                f=train_eval_loop_body_replay,
-                init=(train_state, replay_state),
-                xs=keys,
+            # FIFO/PER replay needs Python-side buffer mutation, which cannot run
+            # inside a jitted jax.lax.scan. Use the loop trainer for these modes.
+            raise NotImplementedError(
+                "PER/random replay buffers are only supported by the Python-loop "
+                "trainer (make_loop_train_fn); the scan trainer supports 'expert' "
+                "(fully-offline) and 'online' only."
             )
-            return state, metrics
 
         train_state = jax.vmap(init_train_state)(init_keys)
         keys = jax.random.split(key, num_iterations)
@@ -456,13 +440,11 @@ def make_loop_train_fn(
 
         if data_type == 'expert':
             off_end = max(0, int(critic_offline_warmup_iters))
+            # Warmup: fully offline for the first `off_end` iterations.
             if iter_idx < off_end:
                 return 1.0
-
-            if off_end == 0:
-                return 0.5
-
-            # Linear decay after warmup, reaching 0.0 at the final iteration.
+            # Then linearly decay the offline ratio to 0.0 by the final iteration
+            # (with off_end == 0 this simply decays from the start).
             remaining = max(1, num_iterations - off_end)
             progress = (iter_idx - off_end + 1) / remaining
             return float(max(0.0, 1.0 - progress))
@@ -627,6 +609,16 @@ def make_loop_train_fn(
                         is_weight_batch = jnp.ones((num_steps, num_envs), dtype=jnp.float32)
 
                     source_is_offline_batch = _stack_and_transpose(traj_source_is_offline)
+                    behavior_lp_batch = _stack_and_transpose(traj_behavior_log_prob)
+                    # Only the expert path mixes offline+online, so only it carries
+                    # `source_is_offline` (which drives the per-source metric split downstream).
+                    # PER/random/online are single-source -> logged under one unified name.
+                    extras = {
+                        "is_weight": is_weight_batch,
+                        "behavior_log_prob": behavior_lp_batch,
+                    }
+                    if data_type == 'expert':
+                        extras["source_is_offline"] = source_is_offline_batch
                     transitions = Transition(
                         obs=_stack_and_transpose(traj_obs),
                         next_obs=_stack_and_transpose(traj_next_obs),
@@ -634,30 +626,29 @@ def make_loop_train_fn(
                         reward=_stack_and_transpose(traj_reward),
                         done=_stack_and_transpose(traj_done),
                         truncated=_stack_and_transpose(traj_truncated),
-                        extras={
-                            "is_weight": is_weight_batch,
-                            "behavior_log_prob": _stack_and_transpose(traj_behavior_log_prob),
-                            "source_is_offline": source_is_offline_batch,
-                        },
+                        extras=extras,
                     )
-                    behavior_lp_batch = transitions.extras["behavior_log_prob"]
-                    offline_count = source_is_offline_batch.sum()
-                    online_count = (1.0 - source_is_offline_batch).sum()
-                    offline_mean = jnp.where(
-                        offline_count > 0,
-                        (behavior_lp_batch * source_is_offline_batch).sum() / offline_count,
-                        0.0,
-                    )
-                    online_mean = jnp.where(
-                        online_count > 0,
-                        (behavior_lp_batch * (1.0 - source_is_offline_batch)).sum() / online_count,
-                        0.0,
-                    )
-
-                    replay_logprob_stats = {
-                        "behavior_log_prob_offline_replay": offline_mean,
-                        "behavior_log_prob_online_replay": online_mean,
-                    }
+                    if data_type == 'expert':
+                        offline_count = source_is_offline_batch.sum()
+                        online_count = (1.0 - source_is_offline_batch).sum()
+                        offline_mean = jnp.where(
+                            offline_count > 0,
+                            (behavior_lp_batch * source_is_offline_batch).sum() / offline_count,
+                            0.0,
+                        )
+                        online_mean = jnp.where(
+                            online_count > 0,
+                            (behavior_lp_batch * (1.0 - source_is_offline_batch)).sum() / online_count,
+                            0.0,
+                        )
+                        replay_logprob_stats = {
+                            "behavior_log_prob_offline_replay": offline_mean,
+                            "behavior_log_prob_online_replay": online_mean,
+                        }
+                    else:
+                        replay_logprob_stats = {
+                            "behavior_log_prob": behavior_lp_batch.mean(),
+                        }
                     if step == 0:
                         print(f"[REPLAY] Sampled batch (step={step}, ratio={ratio:.3f}): "
                               f"num_offline={num_offline}, num_online={num_online}")

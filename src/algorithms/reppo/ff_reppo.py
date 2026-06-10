@@ -334,6 +334,27 @@ def make_learner_fn(
             per_scale * mask
             * (critic_update_loss + hparams.aux_loss_mult * aux_loss)
         )
+        # Unified critic diagnostics (overall means). The per-source `_offline`
+        # split is only added when the batch actually mixes sources (expert path).
+        critic_diag = {
+            "critic_diag/critic_loss": critic_loss,
+            "critic_diag/mc_bias": mc_bias,
+            "critic_diag/mc_error_var": mc_error_var,
+            "critic_diag/td_error_mean": td_error_mean,
+            "critic_diag/target_mean": target_mean,
+            "critic_diag/target_var": target_var,
+            "critic_diag/q": q_mean,
+        }
+        if source_is_offline is not None:
+            critic_diag.update({
+                "critic_diag/critic_loss_offline": critic_loss_offline,
+                "critic_diag/mc_bias_offline": mc_bias_offline,
+                "critic_diag/mc_error_var_offline": mc_error_var_offline,
+                "critic_diag/td_error_mean_offline": td_error_mean_offline,
+                "critic_diag/target_mean_offline": target_mean_offline,
+                "critic_diag/target_var_offline": target_var_offline,
+                "critic_diag/q_offline": q_mean_offline,
+            })
         return loss, dict(
             critic_update_loss=critic_update_loss,
             masked_critic_total_loss=loss,
@@ -341,23 +362,7 @@ def make_learner_fn(
             aux_loss=aux_loss,
             rew_aux_loss=aux_rew_loss,
             abs_batch_action=jnp.abs(minibatch.action).mean(),
-            # --- critic diagnostics ---
-            **{
-                "critic_diag/critic_loss": critic_loss,
-                "critic_diag/critic_loss_offline": critic_loss_offline,
-                "critic_diag/mc_bias": mc_bias,
-                "critic_diag/mc_bias_offline": mc_bias_offline,
-                "critic_diag/mc_error_var": mc_error_var,
-                "critic_diag/mc_error_var_offline": mc_error_var_offline,
-                "critic_diag/td_error_mean": td_error_mean,
-                "critic_diag/td_error_mean_offline": td_error_mean_offline,
-                "critic_diag/target_mean": target_mean,
-                "critic_diag/target_mean_offline": target_mean_offline,
-                "critic_diag/target_var": target_var,
-                "critic_diag/target_var_offline": target_var_offline,
-                "critic_diag/q": q_mean,
-                "critic_diag/q_offline": q_mean_offline,
-            },
+            **critic_diag,
         )
 
     def actor_loss(
@@ -902,21 +907,25 @@ def make_learner_fn(
             batch.extras.get("source_is_offline"),
         )
 
-        update_metrics = {
-            **update_metrics,
+        base_metrics = {
             "reward_mean": reward_mean,
-            "reward_mean_offline": reward_mean_offline,
-            "reward_mean_online": reward_mean_online,
             "actor_diag/policy_log_prob_mean": policy_log_prob_mean,
-            "actor_diag/policy_log_prob_offline_replay": policy_log_prob_offline,
-            "actor_diag/policy_log_prob_online_replay": policy_log_prob_online,
             # retrace coefficient: measure of off-policyness (1.0 = on-policy, < 1.0 = off-policy)
             "critic_diag/retrace_coeff_mean": retrace_coeff_mean,
             "actor_diag/retrace_coeff_mean": retrace_coeff_mean,
             "actor_diag/policy_improvement": policy_improvement_online,
-            "actor_diag/policy_improvement_offline": policy_improvement_offline,
             "sys/grad_updates": (train_state.time_steps // (hparams.num_steps * hparams.num_envs)) * hparams.num_epochs * hparams.num_mini_batches,
         }
+        # Per-source split only for the mixed-source (expert) path.
+        if source_is_offline is not None:
+            base_metrics.update({
+                "reward_mean_offline": reward_mean_offline,
+                "reward_mean_online": reward_mean_online,
+                "actor_diag/policy_log_prob_offline_replay": policy_log_prob_offline,
+                "actor_diag/policy_log_prob_online_replay": policy_log_prob_online,
+                "actor_diag/policy_improvement_offline": policy_improvement_offline,
+            })
+        update_metrics = {**update_metrics, **base_metrics}
         return train_state, update_metrics, per_env_td_error
 
     return jax.jit(learner_fn)
