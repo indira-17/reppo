@@ -36,16 +36,16 @@ class ManiSkillWrapper(Wrapper):
     with the other environments in the codebase.
     """
 
-    def __init__(self, env, max_episode_steps: int, partial_reset):
+    def __init__(self, env, max_episode_steps: int, partial_reset, device=None):
         super().__init__(env)
-        self.metadata = env.metadata
         self.asymmetric_obs = False
         self.max_episode_steps = max_episode_steps
         self.partial_reset = partial_reset
+        self.device = device
 
-        self.returns = jnp.zeros(env.num_envs, dtype=np.float32)
-        self.episode_len = jnp.zeros(env.num_envs, dtype=np.float32)
-        self.success = jnp.zeros(env.num_envs, dtype=np.float32)
+        self.returns = jnp.zeros(self.num_envs, dtype=np.float32)
+        self.episode_len = jnp.zeros(self.num_envs, dtype=np.float32)
+        self.success = jnp.zeros(self.num_envs, dtype=np.float32)
 
     @property
     def action_space(self):

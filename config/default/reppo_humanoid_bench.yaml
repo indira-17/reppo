@@ -6,10 +6,11 @@ defaults:
   - _self_
 
 seed: 0
-name: "reppo"
+name: "reppo_humanoid_bench"
 tags: []
+
 hydra:
   job:
-    chdir: True
+    chdir: true
   searchpath:
     - file://config
