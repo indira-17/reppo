@@ -98,18 +98,22 @@ class REPPOPolicy(nnx.Module):
         self._eval_mode = eval
         self.action_space = action_space
 
-    def __call__(self, key: jax.Array, x: jax.Array, **kwargs) -> distrax.Distribution:
+    def __call__(self, key: jax.Array, x: jax.Array, **kwargs):
         if self.normalizer is not None:
             x = self.normalizer.normalize(self.normalization_state, x)
+
         if self._eval_mode:
             action = self.base.det_action(x)
-        else:
-            pi = self.base(x, **kwargs)
-            action = pi.sample(seed=key)
+            return action, {}
+
+        pi = self.base(x, **kwargs)
+        action = pi.sample(seed=key)
+
         if isinstance(self.action_space, Box):
             action = action.clip(-0.999, 0.999)
-        return action, {}
 
+        behavior_log_prob = pi.log_prob(action)
+        return action, {"behavior_log_prob": behavior_log_prob}
 
 def make_policy_fn(
     cfg: DictConfig, observation_space: Space, action_space: Space

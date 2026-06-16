@@ -4,15 +4,14 @@ import logging
 import time
 import wandb
 import torch
-import jax.numpy as jnp
-from gymnasium import spaces
 from omegaconf import DictConfig, OmegaConf
-from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
+
 from src.algorithms import envs, utils
 from src.common import InitFn, LearnerFn, PolicyFn
 from src.cfg_utils import fix_cfg
 
 logging.basicConfig(level=logging.INFO)
+
 
 @hydra.main(
     version_base=None,
@@ -23,13 +22,26 @@ def main(cfg: DictConfig):
     cfg = fix_cfg(cfg)
     OmegaConf.resolve(cfg)
     logging.info("\n" + OmegaConf.to_yaml(cfg))
-    
-    # Modify run name based on data_type
-    run_name = f"reppo-{cfg.env.name}-{cfg.algorithm.data_type}" if cfg.algorithm.data_type else f"reppo-{cfg.env.name}"
-    
+
+    demo_cfg = cfg.env.get("demo", {})
+    demo_path = demo_cfg.get("demo_path", None)
+    filter_success = cfg.env.get("filter_success", demo_cfg.get("filter_success", True))
+    cut_at_first_success = cfg.env.get(
+        "cut_at_first_success", demo_cfg.get("cut_at_first_success", True)
+    )
+
+    bc_indicator = cfg.algorithm.get("bc_indicator", False)
+    data_type = cfg.algorithm.get("data_type", "online")
+
+    run_name = (
+        f"bc-reppo-{cfg.env.name}-retrace"
+        if bc_indicator
+        else f"reppo-{cfg.env.name}-{data_type}"
+    )
+
     run = wandb.init(
         mode=cfg.logging.mode,
-        project="replay-buffer-study",
+        project=cfg.logging.get("project", "bc-reppo-ablations"),
         entity=cfg.logging.entity,
         tags=cfg.tags,
         config=OmegaConf.to_container(cfg),
@@ -37,30 +49,28 @@ def main(cfg: DictConfig):
         save_code=True,
     )
 
-    # eval/num_samples is injected into every eval log call (training.py) and is used
-    # as the x-axis for the sample-efficiency curve.
-    # hidden=True keeps it out of the workspace summary charts.
-    run.define_metric("eval/num_samples", hidden=True)
-    run.define_metric("eval/episode_return", step_metric="eval/num_samples")
-
     key = jax.random.PRNGKey(cfg.seed)
-    
-    if cfg.algorithm.bc_indicator:
-        # Load dataset first to get observation dimension (dataset dims) like test_bc.py does
-        logging.info(f"Loading dataset from {cfg.env.demo.demo_path}")
-        filter_success = True
-        config = DemoConfig(device=torch.device("cpu"), filter_success_only=True)
-        loader = ManiSkillDemoLoader(config, cfg.env.name)
-        trajectories, _ = loader.load_demo_dataset(cfg.env.demo.demo_path)
-        n_obs_dataset = trajectories[0]['observations'].shape[1]
+
+    if bc_indicator:
+        from src.maniskill_utils.maniskill_dataloader_shabnam import DemoConfig, ManiSkillDemoLoader
+        if demo_path is None:
+            raise ValueError("bc_indicator=True requires cfg.env.demo.demo_path.")
+        logging.info(f"Loading dataset from {demo_path}")
+        demo_loader_cfg = DemoConfig(
+            device=torch.device("cpu"),
+            filter_success_only=filter_success,
+            cut_at_first_success=cut_at_first_success,
+        )
+        loader = ManiSkillDemoLoader(demo_loader_cfg, cfg.env.name)
+        trajectories, _ = loader.load_demo_dataset(demo_path)
+        n_obs_dataset = trajectories[0]["observations"].shape[1]
         logging.info(f"Dataset observation dimension: {n_obs_dataset}")
-        # Create environment with the correct observation dimension
         env_setup = envs.make_env(cfg, n_obs_dataset=n_obs_dataset)
         obs_space = env_setup.observation_space
     else:
         env_setup = envs.make_env(cfg)
         obs_space = env_setup.observation_space
-    
+
     init_fn: InitFn = hydra.utils.call(cfg.algorithm.init)(
         cfg=cfg,
         observation_space=obs_space,
@@ -76,18 +86,24 @@ def main(cfg: DictConfig):
         action_space=env_setup.action_space,
         observation_space=obs_space,
     )
+
     rollout_fn = hydra.utils.call(cfg.runner.rollout_fn)(
         env_setup.env,
-        demo_path=cfg.env.demo.demo_path,
-        data_type=cfg.algorithm.data_type,
-        filter_success=True,
+        demo_path=demo_path,
+        data_type=data_type,
+        bc_indicator=bc_indicator,
+        filter_success=filter_success,
+        cut_at_first_success=cut_at_first_success
     )
     eval_fn = hydra.utils.call(cfg.runner.eval_fn)(
         env_setup.eval_env,
-        demo_path=cfg.env.demo.demo_path,
-        data_type=cfg.algorithm.data_type,
-        filter_success=True,
+        demo_path=demo_path,
+        data_type=data_type,
+        bc_indicator=bc_indicator,
+        filter_success=filter_success,
+        cut_at_first_success=cut_at_first_success,
     )
+
     make_train_fn = hydra.utils.call(cfg.runner.train_fn)
     train_fn = make_train_fn(
         env=(env_setup.env, env_setup.eval_env),
@@ -97,14 +113,17 @@ def main(cfg: DictConfig):
         rollout_fn=rollout_fn,
         eval_fn=eval_fn,
         log_callback=utils.make_log_callback(),
-        demo_path=cfg.env.demo.demo_path,
-        filter_success=True,
+        demo_path=demo_path,
+        filter_success=filter_success,
+        cut_at_first_success=cut_at_first_success,
         wandb_run=run,
-        data_type=cfg.algorithm.data_type,
-        max_buffer_size=cfg.algorithm.max_buffer_size,
-        per_alpha=cfg.algorithm.per_alpha,
-        per_beta=cfg.algorithm.per_beta,
+        critic_offline_warmup_iters=cfg.algorithm.get("critic_offline_warmup_iters", 0),
+        data_type=data_type,
+        max_buffer_size=cfg.algorithm.get("max_buffer_size", 1_000_000),
+        per_alpha=cfg.algorithm.get("per_alpha", 0.6),
+        per_beta=cfg.algorithm.get("per_beta", 0.4),
     )
+
     start = time.perf_counter()
     _, metrics = train_fn(key)
     jax.block_until_ready(metrics)

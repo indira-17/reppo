@@ -1,5 +1,4 @@
 from __future__ import annotations
-import humanoid_bench
 import gymnasium as gym
 import numpy as np
 import torch
@@ -35,6 +34,7 @@ def make_env(env_name, rank, render_mode=None, seed=0):
         max_episode_steps = 1000
 
     def _init():
+        import humanoid_bench
         env = gym.make(env_name, render_mode=render_mode)
         env = TimeLimit(env, max_episode_steps=max_episode_steps)
         env.unwrapped.seed(seed + rank)

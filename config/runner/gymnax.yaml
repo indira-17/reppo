@@ -3,11 +3,19 @@ rollout_fn:
   _partial_: true
   num_steps: ${algorithm.num_steps}
   num_envs: ${algorithm.num_envs}
+  demo_path: ${env.demo.demo_path}
+  filter_success: ${env.demo.filter_success}
+  cut_at_first_success: ${env.demo.cut_at_first_success}
+  data_type: ${algorithm.data_type}
 
 eval_fn:
   _target_: src.runners.gymnax_runner.make_eval_fn
   _partial_: true
   max_episode_steps: ${algorithm.max_episode_steps}
+  demo_path: ${env.demo.demo_path}
+  filter_success: ${env.demo.filter_success}
+  cut_at_first_success: ${env.demo.cut_at_first_success}
+  data_type: ${algorithm.data_type}
 
 train_fn:
   _target_: src.algorithms.training.make_scan_train_fn
@@ -16,6 +24,16 @@ train_fn:
   total_time_steps: ${algorithm.total_time_steps}
   num_envs: ${algorithm.num_envs}
   num_eval: ${algorithm.num_eval}
-  max_episode_steps: ${algorithm.max_episode_steps}
   num_seeds: 1
-  stochastic_eval: False
+  max_episode_steps: ${algorithm.max_episode_steps}
+  stochastic_eval: ${env.stochastic_eval}
+
+  demo_path: ${env.demo.demo_path}
+  filter_success: ${env.demo.filter_success}
+  cut_at_first_success: ${env.demo.cut_at_first_success}
+
+  data_type: ${algorithm.data_type}
+  max_buffer_size: ${algorithm.max_buffer_size}
+  per_alpha: ${algorithm.per_alpha}
+  per_beta: ${algorithm.per_beta}
+  critic_offline_warmup_iters: ${algorithm.critic_offline_warmup_iters}

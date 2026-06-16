@@ -14,6 +14,7 @@ def make_rollout_fn(
     demo_path: str = None,
     data_type: str = None,
     env_id: str = None,
+    bc_indicator: bool = False,
     filter_success: bool = True,
     cut_at_first_success: bool = True,
 ) -> RolloutFn:
@@ -59,6 +60,7 @@ def make_eval_fn(
     demo_path: str = None,
     data_type: str = None,
     env_id: str = None,
+    bc_indicator: bool = False,
     filter_success: bool = True,
     cut_at_first_success: bool = True,
 ) -> EvalFn:

@@ -1,14 +1,12 @@
 type: humanoid_bench
 name: h1hand-walk-v0
 max_episode_steps: 1000
-asymmetric_observation: false
 stochastic_eval: true
 
 # REPPO HL-Gauss target support.
 # Current [-10, 10] is likely too narrow for 1000-step humanoid returns.
-vmin: -100
-vmax: 100
-reward_scaling: 1.0
+vmin: -250
+vmax: 250
 filter_success: false
 cut_at_first_success: false
 

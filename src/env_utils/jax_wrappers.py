@@ -17,7 +17,6 @@ from mujoco_playground import MjxEnv, registry
 from mujoco_playground._src.wrapper import wrap_for_brax_training, Wrapper
 import numpy as np
 
-
 class MjxGymnaxWrapper(Environment):
     def __init__(
         self,
@@ -32,6 +31,7 @@ class MjxGymnaxWrapper(Environment):
         if isinstance(env_or_name, str):
             if config is None:
                 config = registry.get_default_config(env_or_name)
+                config.impl = "jax"
                 is_humanoid_task = env_or_name in [
                     "G1JoystickRoughTerrain",
                     "G1JoystickFlatTerrain",
@@ -71,27 +71,35 @@ class MjxGymnaxWrapper(Environment):
         )
 
     def observation_space(self, params):
+        obs_size = self.env.observation_size
+
         if self.asymmetric_observation:
             return gymnax.environments.spaces.Dict(
                 {
                     "state": gymnax.environments.spaces.Box(
                         low=-float("inf"),
                         high=float("inf"),
-                        shape=self.env.observation_size["state"],
+                        shape=obs_size["state"] if isinstance(obs_size, dict) else obs_size[0],
                     ),
                     "privileged_state": gymnax.environments.spaces.Box(
                         low=-float("inf"),
                         high=float("inf"),
-                        shape=self.env.observation_size["privileged_state"],
+                        shape=obs_size["privileged_state"] if isinstance(obs_size, dict) else obs_size[1],
                     ),
                 }
             )
+
+        # Non-asymmetric REPPO: actor/critic both use only the normal state.
+        if isinstance(obs_size, dict):
+            state_shape = obs_size["state"]
         else:
-            return Box(
-                low=-float("inf"),
-                high=float("inf"),
-                shape=(self.env.observation_size,),
-            )
+            state_shape = (obs_size,)
+
+        return gymnax.environments.spaces.Box(
+            low=-float("inf"),
+            high=float("inf"),
+            shape=state_shape,
+        )
 
     @property
     def default_params(self) -> gymnax.EnvParams:
@@ -106,7 +114,11 @@ class MjxGymnaxWrapper(Environment):
                 else state.obs[..., 1, :],
             }
         else:
-            obs = state.obs
+            if self.dict_obs:
+                obs = state.obs["state"]
+            else:
+                obs = state.obs[..., 0, :] if state.obs.ndim >= 2 and state.obs.shape[-2] == 2 else state.obs
+
         return obs
 
     def reset(self, key):
@@ -146,8 +158,12 @@ class LogEnvState:
     env_state: environment.EnvState
     episode_returns: jnp.ndarray
     episode_lengths: jnp.ndarray
+    episode_tracking_lin_vel: jnp.ndarray
+    episode_tracking_ang_vel: jnp.ndarray
     returned_episode_returns: jnp.ndarray
     returned_episode_lengths: jnp.ndarray
+    returned_episode_tracking_lin_vel: jnp.ndarray
+    returned_episode_tracking_ang_vel: jnp.ndarray
     timestep: jnp.ndarray
     truncated: jnp.ndarray
     info: Any = None
@@ -173,18 +189,15 @@ class LogWrapper(Wrapper):
             env_state=env_state,
             episode_returns=jnp.zeros((self.num_envs,)),
             episode_lengths=jnp.zeros((self.num_envs,), dtype=jnp.int32),
+            episode_tracking_lin_vel=jnp.zeros((self.num_envs,)),
+            episode_tracking_ang_vel=jnp.zeros((self.num_envs,)),
             returned_episode_returns=jnp.zeros((self.num_envs,)),
             returned_episode_lengths=jnp.zeros((self.num_envs,), dtype=jnp.int32),
+            returned_episode_tracking_lin_vel=jnp.zeros((self.num_envs,)),
+            returned_episode_tracking_ang_vel=jnp.zeros((self.num_envs,)),
             timestep=jnp.zeros((self.num_envs,), dtype=jnp.int32),
             truncated=jnp.ones((self.num_envs,), dtype=jnp.float32),
-            info={
-                "returned_episode": jnp.zeros((self.num_envs,), dtype=jnp.bool_),
-                "returned_episode_returns": jnp.zeros((self.num_envs,)),
-                "timestep": jnp.zeros((self.num_envs,), dtype=jnp.int32),
-                "returned_episode_lengths": jnp.zeros(
-                    (self.num_envs,), dtype=jnp.int32
-                ),
-            },
+            info=None,
         )
         return obs, state
 
@@ -195,35 +208,55 @@ class LogWrapper(Wrapper):
         state: environment.EnvState,
         action: Union[int, float],
     ) -> Tuple[chex.Array, environment.EnvState, float, bool, dict]:
-        obs, env_state, reward, done, info = self.env.step(key, state.env_state, action)
+        obs, env_state, reward, done, info = self.env.step(
+            key, state.env_state, action
+        )
+
+        lin_vel = env_state.metrics["reward/tracking_lin_vel"]
+        ang_vel = env_state.metrics["reward/tracking_ang_vel"]
+
         new_episode_return = state.episode_returns + reward
         new_episode_length = state.episode_lengths + 1
-        info["returned_episode_returns"] = (
-            state.returned_episode_returns * (1 - done) + new_episode_return * done
+        new_episode_tracking_lin_vel = state.episode_tracking_lin_vel + lin_vel
+        new_episode_tracking_ang_vel = state.episode_tracking_ang_vel + ang_vel
+
+        returned_episode_returns = jnp.where(
+            done, new_episode_return, state.returned_episode_returns
         )
-        info["returned_episode_lengths"] = (
-            state.returned_episode_lengths * (1 - done) + new_episode_length * done
+        returned_episode_lengths = jnp.where(
+            done, new_episode_length, state.returned_episode_lengths
         )
-        info["timestep"] = state.timestep
-        info["returned_episode"] = done
+        returned_episode_tracking_lin_vel = jnp.where(
+            done, new_episode_tracking_lin_vel, state.returned_episode_tracking_lin_vel
+        )
+        returned_episode_tracking_ang_vel = jnp.where(
+            done, new_episode_tracking_ang_vel, state.returned_episode_tracking_ang_vel
+        )
+
+        out_info = dict(info)
+        out_info["returned_episode"] = done
+        out_info["returned_episode_returns"] = returned_episode_returns
+        out_info["returned_episode_lengths"] = returned_episode_lengths
+        out_info["returned_episode_tracking_lin_vel"] = returned_episode_tracking_lin_vel
+        out_info["returned_episode_tracking_ang_vel"] = returned_episode_tracking_ang_vel
+        out_info["timestep"] = state.timestep
+
         state = LogEnvState(
             env_state=env_state,
-            episode_returns=new_episode_return * (1 - done),
-            episode_lengths=new_episode_length * (1 - done),
-            returned_episode_returns=state.returned_episode_returns * (1 - done)
-            + new_episode_return * done,
-            returned_episode_lengths=state.returned_episode_lengths * (1 - done)
-            + new_episode_length * done,
+            episode_returns=jnp.where(done, 0.0, new_episode_return),
+            episode_lengths=jnp.where(done, 0, new_episode_length),
+            episode_tracking_lin_vel=jnp.where(done, 0.0, new_episode_tracking_lin_vel),
+            episode_tracking_ang_vel=jnp.where(done, 0.0, new_episode_tracking_ang_vel),
+            returned_episode_returns=returned_episode_returns,
+            returned_episode_lengths=returned_episode_lengths,
+            returned_episode_tracking_lin_vel=returned_episode_tracking_lin_vel,
+            returned_episode_tracking_ang_vel=returned_episode_tracking_ang_vel,
             timestep=state.timestep + 1,
             truncated=info.get("truncation", jnp.zeros_like(done, dtype=jnp.float32)),
-            info={
-                "returned_episode": done,
-                "returned_episode_returns": state.returned_episode_returns,
-                "timestep": state.timestep,
-                "returned_episode_lengths": state.returned_episode_lengths,
-            },
+            info=None,
         )
-        return obs, state, reward, done, info
+
+        return obs, state, reward, done, out_info
 
 
 class BraxGymnaxWrapper:

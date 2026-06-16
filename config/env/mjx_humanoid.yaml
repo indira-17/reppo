@@ -1,10 +1,23 @@
 type: mjx
-name: G1JoystickRoughTerrain
-max_episode_steps: 1000
-reward_scaling: 1.0
-terminate: false
-push_distractions: false
-asymmetric_observation: true
+name: G1JoystickFlatTerrain
 
-vmin: -10
-vmax:  10
+defaults:
+  - _self_
+
+max_episode_steps: 1000
+asymmetric_observation: false
+stochastic_eval: false
+
+# FastSAC-style task variants
+push_distractions: false
+
+# Reward/value scale
+reward_scaling: 1.0
+vmin: -100
+vmax: 100
+
+# Keep this dummy demo block so train.py does not fail if it still references cfg.env.demo
+demo:
+  demo_path: null
+  filter_success: false
+  cut_at_first_success: false

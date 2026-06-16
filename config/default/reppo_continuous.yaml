@@ -1,6 +1,6 @@
 defaults:
   - algorithm: reppo
-  - env: mjx_dmc
+  - env: mjx_humanoid # humanoid_bench # 
   - logging: wandb_online
   - runner: gymnax
   - _self_
