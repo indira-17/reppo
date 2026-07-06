@@ -24,12 +24,14 @@ class REPPOPolicy(nnx.Module):
         normalization_state,
         eval: bool,
         action_space: Space,
+        action_std_scale: float = 1.0,
     ):
         self.base = base
         self.normalizer = normalizer
         self.normalization_state = nnx.data(normalization_state) if normalization_state is not None else None
         self._eval_mode = eval
         self.action_space = action_space
+        self.action_std_scale = action_std_scale
 
     def __call__(self, key: jax.Array, x: jax.Array, **kwargs) -> distrax.Distribution:
         action_input = kwargs.pop("action_input", None)
@@ -39,11 +41,11 @@ class REPPOPolicy(nnx.Module):
             action = self.base.det_action(x)
             extras = {}
             if action_input is not None:
-                pi = self.base(x, **kwargs)
+                pi = self.base(x, scale=self.action_std_scale, **kwargs)
                 log_prob = pi.log_prob(action_input)
                 extras = {"behavior_log_prob": log_prob}
         else:
-            pi = self.base(x, **kwargs)
+            pi = self.base(x, scale=self.action_std_scale, **kwargs)
             action, log_prob = pi.sample_and_log_prob(seed=key)
             extras = {"behavior_log_prob": log_prob}
         if isinstance(self.action_space, Box):
@@ -240,11 +242,11 @@ def get_langevin_action(
 
 def make_policy_fn(
     cfg: DictConfig, observation_space: Space, action_space: Space
-) -> Callable[[REPPOTrainState, bool], Policy]:
+) -> Callable[[REPPOTrainState, bool, float], Policy]:
     cfg = cfg.algorithm
     offset = None
 
-    def policy_fn(train_state: REPPOTrainState, eval: bool) -> Policy:
+    def policy_fn(train_state: REPPOTrainState, eval: bool, action_std_scale: float = 1.0) -> Policy:
         normalizer = Normalizer()
         actor_model = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
         critic_model = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
@@ -264,6 +266,7 @@ def make_policy_fn(
                 normalization_state=train_state.normalization_state,
                 eval=eval,
                 action_space=action_space,
+                action_std_scale=action_std_scale
             )
         policy.eval()
 

@@ -24,7 +24,6 @@ train_fn:
   num_steps: ${algorithm.num_steps}
   num_envs: ${algorithm.num_envs}
   num_eval: ${algorithm.num_eval}
-  num_seeds: 1
   max_episode_steps: ${algorithm.max_episode_steps}
   stochastic_eval: ${env.stochastic_eval}
   cut_at_first_success: ${env.cut_at_first_success}
