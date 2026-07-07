@@ -25,6 +25,72 @@ import distrax
 
 logging.basicConfig(level=logging.INFO)
 
+def make_aux_weights(done: jax.Array, truncated: jax.Array, mask_truncated: bool, dtype) -> jax.Array:
+    """Weights defining the empirical Xi matrix for the auxiliary loss."""
+    valid = 1.0 - done.reshape(-1).astype(dtype)
+
+    if mask_truncated:
+        valid = valid * (1.0 - truncated.reshape(-1).astype(dtype))
+
+    normalizer = jnp.maximum(valid.sum(), 1.0)
+    return valid / normalizer
+
+def invariance_aux_loss(
+    curr_emb: jax.Array,         # [B, d], live critic encoder output
+    next_emb_target: jax.Array, # [B, d], frozen target embedding
+    weights: jax.Array,          # [B], sums to 1 over valid samples
+    eps: float = 1e-5,
+):
+    """
+    Learns a shared row-vector transition map F such that
+        Z_next ~= Z_curr @ F.
+    Equivalently, with column-vector features,
+        E[phi(s', a') | s, a] ~= F.T @ phi(s, a).
+    """
+    _, feature_dim = curr_emb.shape
+    identity = jnp.eye(feature_dim, dtype=curr_emb.dtype)
+    weight_column = weights[:, None]
+
+    # C = Z_curr^T Xi Z_curr.
+    covariance = curr_emb.T @ (weight_column * curr_emb)
+
+    # W = C^{-1/2}. Ridge makes this well-defined for finite minibatches.
+    eigenvalues, eigenvectors = jnp.linalg.eigh(covariance + eps * identity)
+    inverse_sqrt = 1.0 / jnp.sqrt(jnp.maximum(eigenvalues, eps))
+    whitening = (eigenvectors * inverse_sqrt) @ eigenvectors.T
+    whitening = jax.lax.stop_gradient(whitening)
+
+    # Whitening matrix to transform the current and next features.
+    # Z = W^TZ
+    Z_curr = curr_emb @ whitening
+    Z_next = jax.lax.stop_gradient(next_emb_target) @ whitening
+
+    # Although whitening makes this approximately I, solve explicitly because the ridge term makes it not exactly equal to I.
+    gram = Z_curr.T @ (weight_column * Z_curr) # Zcurr⊤​ΞZcurr
+    cross = Z_curr.T @ (weight_column * Z_next) # Zcurr⊤​ΞZnext
+
+    # The optimal F is the solution to Zcurr⊤​ΞZcurr​+ϵI)F=Zcurr⊤​ΞZnext​
+    # => F* = (Zcurr⊤​ΞZcurr​+ϵI)^{-1} Zcurr⊤​ΞZnext​
+    # => F* = ZcurrΞZnextT if ZcurrΞZcurr = Id
+    feature_dynamics = jnp.linalg.solve(gram + eps * identity, cross)
+    feature_dynamics = jax.lax.stop_gradient(feature_dynamics)
+
+    # Znext​−Zcurr​F
+    residual = Z_next - Z_curr @ feature_dynamics
+
+    # 1/2 ||Z_next - Z_curr F||^2_Xi,F.
+    per_sample_loss = 0.5 * jnp.sum(jnp.square(residual), axis=-1)
+    loss = jnp.sum(weights * per_sample_loss)
+
+    # (Zcurr⊤​ΞZcurr​ - I)
+    orthonormality_error = jnp.linalg.norm(gram - identity, ord="fro")
+
+    return loss, feature_dynamics, {
+        "inv_residual": loss,
+        "inv_orth_error": orthonormality_error,
+        "inv_fro_norm": jnp.linalg.norm(feature_dynamics, ord="fro"),
+    }
+
 def load_bc_weights_to_actor(bc_checkpoint_path: str, jax_actor: nnx.Module) -> nnx.Module:
     """
     Load JAX BC pretrained weights into JAX actor.
@@ -265,7 +331,7 @@ def make_learner_fn(
         critic_model = nnx.merge(train_state.critic.graphdef, params)
         critic_model.train()
         critic_output = critic_model(minibatch.obs, minibatch.action)
-
+        curr_emb = critic_output["embed"]
         target_values = minibatch.extras["target_values"]
 
         if hparams.hl_gauss:
@@ -281,17 +347,19 @@ def make_learner_fn(
                 target_values.reshape(-1, 1),
             )
 
+        # Add invriance loss to the aux loss
+        td_mask = 1.0 - minibatch.truncated if hparams.mask_truncated else jnp.ones_like(minibatch.done, dtype=curr_emb.dtype)
+        aux_weights = make_aux_weights(done=minibatch.done, truncated=minibatch.truncated, mask_truncated=hparams.mask_truncated, dtype=curr_emb.dtype)
+        inv_loss, feature_dynamics, inv_metrics = invariance_aux_loss(curr_emb=curr_emb, next_emb_target=minibatch.extras["next_emb"], weights=aux_weights)
+
         # Aux loss
         pred = critic_output["pred_features"]
         pred_rew = critic_output["pred_rew"]
         value = critic_output["value"]
-        aux_loss = optax.squared_error(pred, minibatch.extras["next_emb"])
-        aux_rew_loss = optax.squared_error(pred_rew, minibatch.reward.reshape(-1, 1))
-        aux_loss = jnp.mean(
-            (1 - minibatch.done.reshape(-1, 1))
-            * jnp.concatenate([aux_loss, aux_rew_loss], axis=-1),
-            axis=-1,
-        )
+        aux_loss = optax.squared_error(pred.reshape(-1), minibatch.extras["next_emb"])
+        aux_rew_loss = optax.squared_error(pred_rew.reshape(-1), minibatch.reward.reshape(-1, 1))
+        rew_aux_loss = jnp.sum(aux_weights * aux_rew_loss)
+        aux_loss = inv_loss + rew_aux_loss
 
         source_is_offline = minibatch.extras.get("source_is_offline", None)
         # compute l2 error for logging
@@ -333,13 +401,11 @@ def make_learner_fn(
         # PER: scale loss by importance-sampling weight to correct for sampling bias
         is_w = minibatch.extras.get("is_weight", None)
         per_scale = is_w.reshape(-1) if (data_type == 'PER' and is_w is not None) else 1.0
-        unmasked_critic_total_loss = jnp.mean(
-            critic_update_loss + hparams.aux_loss_mult * aux_loss
+        td_loss = jnp.mean(
+            per_scale * mask * critic_update_loss
         )
-        loss = jnp.mean(
-            per_scale * mask
-            * (critic_update_loss + hparams.aux_loss_mult * aux_loss)
-        )
+        loss = td_loss + hparams.aux_loss_mult * aux_loss
+        unmasked_critic_total_loss = jnp.mean(critic_update_loss) + hparams.aux_loss_mult * aux_loss
         # Unified critic diagnostics (overall means). The per-source `_offline`
         # split is only added when the batch actually mixes sources (expert path).
         critic_diag = {
