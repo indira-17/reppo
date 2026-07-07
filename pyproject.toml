@@ -35,6 +35,7 @@ dependencies = [
     "scalene>=1.5.51",
     "torchinfo>=1.8.0",
     "debugpy>=1.8.14",
+    "flashbax>=0.1.3",
 ]
 
 [build-system]

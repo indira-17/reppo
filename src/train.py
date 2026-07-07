@@ -34,14 +34,14 @@ def main(cfg: DictConfig):
     data_type = cfg.algorithm.get("data_type", "online")
 
     run_name = (
-        f"bc-reppo-{cfg.env.name}-retrace"
+        f"reppo-{cfg.env.name}-retrace"
         if bc_indicator
         else f"reppo-{cfg.env.name}-{data_type}"
     )
 
     run = wandb.init(
         mode=cfg.logging.mode,
-        project=cfg.logging.get("project", "bc-reppo-ablations"),
+        project="replay-buffer-study",
         entity=cfg.logging.entity,
         tags=cfg.tags,
         config=OmegaConf.to_container(cfg),
@@ -91,7 +91,6 @@ def main(cfg: DictConfig):
         env_setup.env,
         demo_path=demo_path,
         data_type=data_type,
-        bc_indicator=bc_indicator,
         filter_success=filter_success,
         cut_at_first_success=cut_at_first_success
     )
@@ -99,7 +98,6 @@ def main(cfg: DictConfig):
         env_setup.eval_env,
         demo_path=demo_path,
         data_type=data_type,
-        bc_indicator=bc_indicator,
         filter_success=filter_success,
         cut_at_first_success=cut_at_first_success,
     )

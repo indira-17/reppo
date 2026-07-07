@@ -58,6 +58,7 @@ class ReppoConfig(struct.PyTreeNode):
 class REPPOTrainState(TrainState):
     critic: nnx.TrainState
     actor: nnx.TrainState
+    target_critic: nnx.TrainState
     actor_target: nnx.TrainState
     normalization_state: PyTreeNode | None = None
 

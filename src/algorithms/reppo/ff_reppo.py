@@ -600,7 +600,6 @@ def make_learner_fn(
             )
             critic_train_state = train_state.critic.apply_gradients(grads)
             train_state = train_state.replace(critic=critic_train_state)
-            train_state = polyak_update_target_critic(train_state)
             critic_metrics = output[1]
 
             actor_grad_fn = jax.value_and_grad(actor_loss, has_aux=True)

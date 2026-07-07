@@ -1,4 +1,5 @@
 from gymnasium import Wrapper
+from gymnasium.vector import VectorWrapper
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -29,7 +30,7 @@ def to_torch(x):
         raise ValueError(f"Cannot convert type {type(x)} to torch.Tensor")
 
 
-class ManiSkillWrapper(Wrapper):
+class ManiSkillWrapper(VectorWrapper):
     """
     A wrapper for ManiSkill environments to ensure compatibility with the expected API.
     This wrapper is used to handle the ManiSkill environments in a way that is consistent

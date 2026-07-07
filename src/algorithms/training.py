@@ -49,7 +49,8 @@ def make_scan_train_fn(
     max_buffer_size: int = 1_000_000,
     per_alpha: float = 0.6,
     per_beta: float = 0.4,
-    num_epochs: int = 1,
+    num_epochs: int = 4,
+    learning_starts: int = 1,
 ) -> TrainFn:
     from src.runners.gymnax_runner import (
         make_eval_fn as make_gymnax_eval_fn,
@@ -80,25 +81,26 @@ def make_scan_train_fn(
         )
     if num_steps != 1:
         raise ValueError(
-            "Flashbax flat replay here is one-step only; set algorithm.num_steps=1."
+            "Flashbax item replay here is one-step only; set algorithm.num_steps=1."
         )
 
     if data_type == "random":
-        buffer_fn = fbx.make_flat_buffer(
+        buffer_fn = fbx.make_item_buffer(
             max_length=max_buffer_size,
             min_length=num_envs,
             sample_batch_size=num_envs,
             add_sequences=True,
-            add_batch_size=num_envs,
+            add_batches=True,
         )
     else:
-        buffer_fn = fbx.make_prioritised_flat_buffer(
+        buffer_fn = fbx.make_prioritised_item_buffer(
             max_length=max_buffer_size,
             min_length=num_envs,
             sample_batch_size=num_envs,
             add_sequences=True,
-            add_batch_size=num_envs,
+            add_batches=True,
             priority_exponent=per_alpha,
+            device="gpu",
         )
 
     # One collection step, followed by `num_epochs` replay update blocks.
@@ -140,26 +142,22 @@ def make_scan_train_fn(
             if data_type == "PER":
                 def _sample_from_buffer(_):
                     sampled = buffer_fn.sample(buffer_state, sample_key)
-                    first = sampled.experience.first
                     num_valid = jnp.where(
                         buffer_state.is_full,
-                        (max_buffer_size // num_envs - 1) * num_envs,
-                        (buffer_state.current_index - 1) * num_envs,
+                        max_buffer_size,
+                        buffer_state.current_index,
                     )
-                    is_weight = (
-                        jnp.maximum(num_valid, 1)
-                        * jnp.maximum(sampled.probabilities, 1e-8)
-                    ) ** (-per_beta)
+                    is_weight = (jnp.maximum(num_valid, 1) * jnp.maximum(sampled.probabilities, 1e-8)) ** (-per_beta)
                     is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
                     transitions = Transition(
-                        obs=first.obs[None],
-                        next_obs=first.next_obs[None],
-                        action=first.action[None],
-                        reward=first.reward[None],
-                        done=first.done[None],
-                        truncated=first.truncated[None],
+                        obs=sampled.experience.obs[None],
+                        next_obs=sampled.experience.next_obs[None],
+                        action=sampled.experience.action[None],
+                        reward=sampled.experience.reward[None],
+                        done=sampled.experience.done[None],
+                        truncated=sampled.experience.truncated[None],
                         extras={
-                            "behavior_log_prob": first.extras["behavior_log_prob"][None],
+                            "behavior_log_prob": sampled.experience.extras["behavior_log_prob"][None],
                             "is_weight": is_weight[None],
                         },
                     )
@@ -169,9 +167,7 @@ def make_scan_train_fn(
                     transitions = replay_transitions.replace(
                         extras={
                             **replay_transitions.extras,
-                            "is_weight": jnp.ones(
-                                (1, num_envs), dtype=jnp.float32
-                            ),
+                            "is_weight": jnp.ones((1, num_envs), dtype=jnp.float32),
                         }
                     )
                     return (
@@ -188,16 +184,16 @@ def make_scan_train_fn(
                 )
             else:
                 def _sample_from_buffer(_):
-                    first = buffer_fn.sample(buffer_state, sample_key).experience.first
+                    sampled = buffer_fn.sample(buffer_state, sample_key)
                     return Transition(
-                        obs=first.obs[None],
-                        next_obs=first.next_obs[None],
-                        action=first.action[None],
-                        reward=first.reward[None],
-                        done=first.done[None],
-                        truncated=first.truncated[None],
+                        obs=sampled.experience.obs[None],
+                        next_obs=sampled.experience.next_obs[None],
+                        action=sampled.experience.action[None],
+                        reward=sampled.experience.reward[None],
+                        done=sampled.experience.done[None],
+                        truncated=sampled.experience.truncated[None],
                         extras={
-                            "behavior_log_prob": first.extras["behavior_log_prob"][None],
+                            "behavior_log_prob": sampled.experience.extras["behavior_log_prob"][None],
                         },
                     )
 
@@ -351,16 +347,17 @@ def make_loop_train_fn(
     max_buffer_size: int = 1_000_000,
     per_alpha: float = 0.6,
     per_beta: float = 0.4,
-    num_epochs: int = 1,
+    num_epochs: int = 4,
+    learning_starts: int = 1,
 ):
     from src.runners.gymnasium_runner import (
         make_eval_fn as make_gymnasium_eval_fn,
         make_rollout_fn as make_gymnasium_rollout_fn,
     )
 
-    train_log_interval = max(
-        1, int((total_time_steps / (num_steps * num_envs)) // num_eval) // 4
-    )
+    train_log_interval = 125 # max(
+    #     1, int((total_time_steps / (num_steps * num_envs)) // num_eval) // 4
+    # )
 
     if isinstance(env, tuple):
         env, eval_env = env
@@ -380,26 +377,33 @@ def make_loop_train_fn(
         )
     if num_steps != 1:
         raise ValueError(
-            "Flashbax flat replay here is one-step only; set algorithm.num_steps=1."
+            "Flashbax item replay here is one-step only; set algorithm.num_steps=1."
         )
 
     if data_type == "random":
-        buffer_fn = fbx.make_flat_buffer(
+        buffer_fn = fbx.make_item_buffer(
             max_length=max_buffer_size,
             min_length=num_envs,
             sample_batch_size=num_envs,
             add_sequences=True,
-            add_batch_size=num_envs,
+            add_batches=True,
         )
     else:
-        buffer_fn = fbx.make_prioritised_flat_buffer(
+        buffer_fn = fbx.make_prioritised_item_buffer(
             max_length=max_buffer_size,
             min_length=num_envs,
             sample_batch_size=num_envs,
             add_sequences=True,
-            add_batch_size=num_envs,
+            add_batches=True,
             priority_exponent=per_alpha,
+            device="gpu",
         )
+
+    # The Python ManiSkill loop calls these repeatedly. Compile them once and donate the old state so Flashbax can reuse its device allocation.
+    buffer_add = jax.jit(buffer_fn.add, donate_argnums=(0,))
+    buffer_sample = jax.jit(buffer_fn.sample)
+    if data_type == "PER":
+        buffer_set_priorities = jax.jit(buffer_fn.set_priorities, donate_argnums=(0,))
 
     def loop_train_fn(key: Key) -> tuple[TrainState, dict]:
         # Initialize the policy, environment and map that across the number of random seeds
@@ -422,7 +426,7 @@ def make_loop_train_fn(
         offline_transitions_used = 0
         prefill_stds = [] # [0.6, 0.8, 1.0, 1.2]
 
-        for prefill_idx in range((max_buffer_size // (num_steps * num_envs))//2):
+        for _ in range(learning_starts):
             key, rollout_key = jax.random.split(key)
             policy = policy_fn(state, False)
             rollout_transitions, state = rollout_fn(
@@ -442,7 +446,7 @@ def make_loop_train_fn(
             if buffer_state is None:
                 buffer_state = buffer_fn.init(jax.tree.map(lambda x: x[0, 0], replay_transitions))
             
-            buffer_state = buffer_fn.add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
+            buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
 
         for iter_idx in range(num_iterations):
             for _ in range(train_steps_per_iteration):
@@ -470,46 +474,40 @@ def make_loop_train_fn(
                         jax.tree.map(lambda x: x[0, 0], replay_transitions)
                     )
 
-                buffer_state = buffer_fn.add(
-                    buffer_state,
-                    jax.tree.map(
-                        lambda x: jnp.swapaxes(x, 0, 1),
-                        replay_transitions,
-                    ),
-                )
+                buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
 
-                # One frozen KL reference for all replay epochs from this
-                # collection step; the live actor is updated in every minibatch.
+                # One frozen KL reference for all replay epochs from this collection step; the live actor is updated in every minibatch.
                 state = state.replace(actor_target=state.actor_target.replace(params=state.actor.params))
 
                 for _ in range(num_epochs):
                     key, learn_key, sample_key = jax.random.split(key, 3)
 
                     if bool(buffer_fn.can_sample(buffer_state)):
-                        sampled = buffer_fn.sample(buffer_state, sample_key)
-                        first = sampled.experience.first
+                        sampled = buffer_sample(buffer_state, sample_key)
                         transitions = Transition(
-                            obs=first.obs[None],
-                            next_obs=first.next_obs[None],
-                            action=first.action[None],
-                            reward=first.reward[None],
-                            done=first.done[None],
-                            truncated=first.truncated[None],
+                            obs=sampled.experience.obs[None],
+                            next_obs=sampled.experience.next_obs[None],
+                            action=sampled.experience.action[None],
+                            reward=sampled.experience.reward[None],
+                            done=sampled.experience.done[None],
+                            truncated=sampled.experience.truncated[None],
                             extras={
-                                "behavior_log_prob": first.extras[
-                                    "behavior_log_prob"
-                                ][None],
+                                "behavior_log_prob": sampled.experience.extras["behavior_log_prob"][None],
                             },
                         )
                         used_replay = True
                         if data_type == "PER":
-                            num_valid = ((max_buffer_size // num_envs - 1) * num_envs if bool(buffer_state.is_full) else (int(buffer_state.current_index) - 1) * num_envs)
-                            is_weight = (max(num_valid, 1) * np.maximum(np.asarray(sampled.probabilities), 1e-8)) ** (-per_beta)
-                            is_weight = is_weight / max(float(is_weight.max()), 1e-8)
+                            num_valid = (
+                                max_buffer_size
+                                if bool(buffer_state.is_full)
+                                else int(buffer_state.current_index)
+                            )
+                            is_weight = ( max(num_valid, 1) * jnp.maximum(sampled.probabilities, 1e-8)) ** (-per_beta)
+                            is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
                             transitions = transitions.replace(
                                 extras={
                                     **transitions.extras,
-                                    "is_weight": jnp.asarray(is_weight)[None],
+                                    "is_weight": is_weight[None],
                                 }
                             )
                             sampled_indices = sampled.indices
@@ -524,7 +522,7 @@ def make_loop_train_fn(
                     )
 
                     if data_type == "PER" and used_replay:
-                        buffer_state = buffer_fn.set_priorities(
+                        buffer_state = buffer_set_priorities(
                             buffer_state,
                             sampled_indices,
                             jnp.abs(per_env_td_error).reshape(-1) + 1e-6,

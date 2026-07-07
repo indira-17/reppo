@@ -37,7 +37,7 @@ optimizer:
   learning_rate: 3e-4
 anneal_lr: false
 max_grad_norm: 0.5
-polyak: 1.0 # maybe ablate ?
+polyak: 0.005 # maybe ablate ?
 
 # problem discount settings (need tuning)
 gamma: 0.99
@@ -45,9 +45,9 @@ lmbda: 0.95
 lmbda_min: 0.95 # irrelevant if no exploration noise is added
 
 # batch settings (need tuning for MJX humanoid)
-num_steps: 1000
-num_mini_batches: 256
-num_envs: 128
+num_steps: 1
+num_mini_batches: 1
+num_envs: 1024
 num_epochs: 4
 
 # exploration settings (currently not touched)
