@@ -23,6 +23,17 @@ from src.algorithms.reppo.common import OfflineReplayBuffer
 from src.common import Transition
 from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 
+
+def _update_initial_obs_pool(initial_obs_pool: jax.Array, reset_obs: jax.Array, episode_ended: jax.Array) -> jax.Array:
+    """Replace pool entries only with post-auto-reset observations."""
+    mask = episode_ended.astype(bool).reshape(
+        (episode_ended.shape[0],) + (1,) * (reset_obs.ndim - 1)
+    )
+    return jnp.where(mask, reset_obs, initial_obs_pool)
+
+def _sample_initial_obs(key: Key, initial_obs_pool: jax.Array) -> jax.Array:
+    return jnp.take(initial_obs_pool, jax.random.permutation(key, initial_obs_pool.shape[0]), axis=0)
+
 def make_scan_train_fn(
     env: gymnasium.Env | tuple[gymnasium.Env, gymnasium.Env],
     total_time_steps: int,
@@ -103,15 +114,22 @@ def make_scan_train_fn(
             device="gpu",
         )
 
-    # One collection step, followed by `num_epochs` replay update blocks.
+    # One collection step, followed by one staged learner call; learner_fn owns the critic and actor epoch scans.
     def train_step_replay(carry: tuple, key: Key) -> tuple:
-        state, buffer_state = carry
+        state, buffer_state, initial_obs_pool = carry
         key, rollout_key, update_key = jax.random.split(key, 3)
 
         policy = policy_fn(state, False)
         rollout_transitions, state = rollout_fn(
             key=rollout_key, train_state=state, policy=policy
         )
+
+        # In the auto-reset Gymnasium/HumanoidBench runners, `transition.next_obs`
+        # is the terminal observation, whereas `state.last_obs` is the post-reset
+        # observation carried into the next action selection. Hence, for every
+        # completed episode, `state.last_obs[j]` is a genuine s_0 ~ d_0 sample.
+        episode_ended = jnp.logical_or(rollout_transitions.done[-1].astype(bool), rollout_transitions.truncated[-1].astype(bool))
+        initial_obs_pool = _update_initial_obs_pool(initial_obs_pool, state.last_obs, episode_ended)
 
         replay_transitions = Transition(
             obs=rollout_transitions.obs,
@@ -129,15 +147,11 @@ def make_scan_train_fn(
             jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions),
         )
 
-        # Keep the REPPO KL reference fixed across all replay epochs from this
-        # collection step. The live actor remains trainable in every minibatch.
-        state = state.replace(
-            actor_target=state.actor_target.replace(params=state.actor.params)
-        )
-
         def replay_epoch(carry, epoch_key):
             state, buffer_state = carry
-            learn_key, sample_key = jax.random.split(epoch_key)
+            learn_key, sample_key, initial_key = jax.random.split(epoch_key, 3)
+            # initial_obs is sampled only from the post-auto-reset state pool, so s₀ ∼ d₀.
+            initial_obs = _sample_initial_obs(initial_key, initial_obs_pool)
 
             if data_type == "PER":
                 def _sample_from_buffer(_):
@@ -158,6 +172,7 @@ def make_scan_train_fn(
                         truncated=sampled.experience.truncated[None],
                         extras={
                             "behavior_log_prob": sampled.experience.extras["behavior_log_prob"][None],
+                            "initial_obs": initial_obs,
                             "is_weight": is_weight[None],
                         },
                     )
@@ -167,6 +182,7 @@ def make_scan_train_fn(
                     transitions = replay_transitions.replace(
                         extras={
                             **replay_transitions.extras,
+                            "initial_obs": initial_obs,
                             "is_weight": jnp.ones((1, num_envs), dtype=jnp.float32),
                         }
                     )
@@ -194,13 +210,14 @@ def make_scan_train_fn(
                         truncated=sampled.experience.truncated[None],
                         extras={
                             "behavior_log_prob": sampled.experience.extras["behavior_log_prob"][None],
+                            "initial_obs": initial_obs,
                         },
                     )
 
                 transitions = jax.lax.cond(
                     buffer_fn.can_sample(buffer_state),
                     _sample_from_buffer,
-                    lambda _: replay_transitions,
+                    lambda _: replay_transitions.replace(extras={**replay_transitions.extras, "initial_obs": initial_obs}),
                     operand=None,
                 )
 
@@ -225,7 +242,7 @@ def make_scan_train_fn(
         (state, buffer_state), epoch_metrics = jax.lax.scan(
             replay_epoch,
             (state, buffer_state),
-            jax.random.split(update_key, num_epochs),
+            jax.random.split(update_key, 1),
         )
         update_metrics = jax.tree.map(lambda x: x[-1], epoch_metrics)
         state = state.replace(iteration=state.iteration + 1)
@@ -235,16 +252,18 @@ def make_scan_train_fn(
         jax.debug.callback(
             log_callback, state, {**utils.prefix_dict("train", plain), **namespaced}
         )
-        return (state, buffer_state), update_metrics
+        return (state, buffer_state, initial_obs_pool), update_metrics
 
     # Eval step: runs eval_interval train steps then evaluates
     def train_eval_step_replay(key, train_state, scan_buf):
+        buffer_state, initial_obs_pool = scan_buf
         train_key, eval_key = jax.random.split(key)
-        (train_state, scan_buf), stacked_metrics = jax.lax.scan(
+        (train_state, buffer_state, initial_obs_pool), stacked_metrics = jax.lax.scan(
             f=train_step_replay,
-            init=(train_state, scan_buf),
+            init=(train_state, buffer_state, initial_obs_pool),
             xs=jax.random.split(train_key, eval_interval),
         )
+        scan_buf = (buffer_state, initial_obs_pool)
         train_metrics = jax.tree.map(lambda x: x[-1], stacked_metrics)
         policy = policy_fn(train_state, not stochastic_eval)
         eval_metrics = eval_fn(eval_key, policy)
@@ -311,7 +330,10 @@ def make_scan_train_fn(
             },
         )
         seed_buf = buffer_fn.init(jax.tree.map(lambda x: x[0, 0], rt_template))
-        scan_buf_init = jax.tree.map(lambda x: jnp.broadcast_to(x, (num_seeds,) + x.shape), seed_buf)
+        scan_buf_init = (
+            jax.tree.map(lambda x: jnp.broadcast_to(x, (num_seeds,) + x.shape), seed_buf),
+            train_state.last_obs,
+        )
 
         keys = jax.random.split(key, num_iterations)
         (state, _), metrics = jax.lax.scan(
@@ -414,6 +436,7 @@ def make_loop_train_fn(
         state = init_fn(init_key)
         obs, _ = env.reset()
         state = state.replace(last_obs=to_jax(obs), last_env_state=None)
+        initial_obs_pool = to_jax(obs)
         logging.info(f"Starting training for {num_iterations} iterations.")
         logging.info(f"Train steps per iteration: {train_steps_per_iteration}.")
         logging.info(f"Total time steps: {total_time_steps}.")
@@ -432,6 +455,8 @@ def make_loop_train_fn(
             rollout_transitions, state = rollout_fn(
                 key=rollout_key, train_state=state, policy=policy
             )
+            episode_ended = jnp.logical_or(rollout_transitions.done[-1].astype(bool), rollout_transitions.truncated[-1].astype(bool))
+            initial_obs_pool = _update_initial_obs_pool(initial_obs_pool, state.last_obs, episode_ended)
             replay_transitions = Transition(
                 obs=rollout_transitions.obs,
                 next_obs=rollout_transitions.next_obs,
@@ -455,6 +480,8 @@ def make_loop_train_fn(
                 rollout_transitions, state = rollout_fn(
                     key=rollout_key, train_state=state, policy=policy
                 )
+                episode_ended = jnp.logical_or(rollout_transitions.done[-1].astype(bool), rollout_transitions.truncated[-1].astype(bool))
+                initial_obs_pool = _update_initial_obs_pool(initial_obs_pool, state.last_obs, episode_ended)
 
                 replay_transitions = Transition(
                     obs=rollout_transitions.obs,
@@ -476,11 +503,10 @@ def make_loop_train_fn(
 
                 buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
 
-                # One frozen KL reference for all replay epochs from this collection step; the live actor is updated in every minibatch.
-                state = state.replace(actor_target=state.actor_target.replace(params=state.actor.params))
-
                 for _ in range(num_epochs):
-                    key, learn_key, sample_key = jax.random.split(key, 3)
+                    key, learn_key, sample_key, initial_key = jax.random.split(key, 4)
+                    # initial_obs is sampled only from the post-auto-reset state pool, so s₀ ∼ d₀.
+                    initial_obs = _sample_initial_obs(initial_key, initial_obs_pool)
 
                     if bool(buffer_fn.can_sample(buffer_state)):
                         sampled = buffer_sample(buffer_state, sample_key)
@@ -493,6 +519,7 @@ def make_loop_train_fn(
                             truncated=sampled.experience.truncated[None],
                             extras={
                                 "behavior_log_prob": sampled.experience.extras["behavior_log_prob"][None],
+                                "initial_obs": initial_obs,
                             },
                         )
                         used_replay = True
@@ -512,11 +539,10 @@ def make_loop_train_fn(
                             )
                             sampled_indices = sampled.indices
                     else:
-                        transitions = replay_transitions
+                        transitions = replay_transitions.replace(extras={**replay_transitions.extras, "initial_obs": initial_obs})
                         used_replay = False
 
-                    # One sampled N-transition batch is handled by learner_fn:
-                    # target construction, shuffle, critic/actor minibatches and target-critic Polyak updates.
+                    # One sampled N-transition batch is handled by learner_fn: target construction, shuffle, critic/actor minibatches and target-critic Polyak updates.
                     state, train_metrics, per_env_td_error = learner_fn(
                         key=learn_key, train_state=state, batch=transitions
                     )

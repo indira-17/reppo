@@ -7,6 +7,7 @@ import os
 import hydra
 import jax
 import optax
+import distrax
 from flax import nnx
 from jax import numpy as jnp
 from omegaconf import DictConfig
@@ -21,73 +22,181 @@ from src.common import (
 )
 from src.normalization import Normalizer
 from src.algorithms import utils
-import distrax
 
 logging.basicConfig(level=logging.INFO)
 
-def make_aux_weights(done: jax.Array, truncated: jax.Array, mask_truncated: bool, dtype) -> jax.Array:
-    """Weights defining the empirical Xi matrix for the auxiliary loss."""
-    valid = 1.0 - done.reshape(-1).astype(dtype)
+def sr_dice_expectation(values: jax.Array, weights: jax.Array, rho: jax.Array) -> jax.Array:
+    return jnp.sum(weights * rho * values.reshape(-1))
 
+def flatten_time_env(x: jax.Array) -> jax.Array:
+    return x.reshape((-1, *x.shape[2:]))
+
+def clip_action_for_critic(action: jax.Array, action_space: Space) -> jax.Array:
+    return action.clip(-0.999, 0.999) if isinstance(action_space, Box) else action
+
+def sample_actor_action(actor_model: nnx.Module, obs: jax.Array, key: jax.Array, discrete_actions: bool) -> jax.Array:
+    pi = actor_model(obs)
+    if discrete_actions:
+        return pi.sample(seed=key)
+    action, _ = pi.sample_and_log_prob(seed=key)
+    return action.clip(-0.999, 0.999)
+
+def make_aux_weights(done: jax.Array, truncated: jax.Array, mask_truncated: bool, dtype) -> jax.Array:
+    """Empirical batch weights for the implicit diagonal metric Ξ̂_B.
+
+    Uniform replay sampling induces Ξ̂_B = diag(w), where w is uniform over
+    valid sampled transitions. Terminal/truncated masking follows the existing
+    REPPO auxiliary-loss convention.
+    """
+    valid = 1.0 - done.reshape(-1).astype(dtype)
     if mask_truncated:
         valid = valid * (1.0 - truncated.reshape(-1).astype(dtype))
+    return valid / jnp.maximum(valid.sum(), 1.0)
 
-    normalizer = jnp.maximum(valid.sum(), 1.0)
-    return valid / normalizer
+
+def batch_orthonormality_loss(
+    features: jax.Array,
+    weights: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Learn φ so that ZᵀΞ̂_B Z ≈ I under the sampled batch metric.
+
+    For Z ∈ R^{B×d} and Ξ̂_B = diag(weights), optimize
+        L_orth = ½‖ZᵀΞ̂_B Z − I_d‖²_F.
+
+    Ξ̂_B is not a learned parameter: it is the empirical distribution induced
+    by the replay sampler for this minibatch. Gradients flow only through Z.
+    """
+    feature_dim = features.shape[-1]
+    identity = jnp.eye(feature_dim, dtype=features.dtype)
+    gram = features.T @ (weights[:, None] * features)
+    loss = 0.5 * jnp.sum(jnp.square(gram - identity))
+    return loss, gram
+
+
+def fit_sr_dice_ratio(
+    key: jax.Array,
+    train_state: REPPOTrainState,
+    batch: Transition,
+    initial_obs: jax.Array,
+    hparams,
+    action_space: Space,
+    discrete_actions: bool,
+):
+    """Fit F̂ₖ, νₖ⋆, and ρ̂ₖ with the learned approximately Ξₖ-orthonormal features.
+
+    The critic auxiliary loss learns ZᵀΞ̂_B Z ≈ I. Therefore this SR-DICE
+    fit uses the critic embeddings directly: it does not analytically whiten
+    or otherwise transform the features again.
+    """
+    key, next_action_key, start_action_key = jax.random.split(key, 3)
+    actor_ref = nnx.merge(train_state.actor.graphdef, train_state.actor_target.params)
+    critic_ref = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
+    actor_ref.eval()
+    critic_ref.eval()
+
+    obs = flatten_time_env(batch.obs)
+    next_obs = flatten_time_env(batch.next_obs)
+    behavior_action = clip_action_for_critic(flatten_time_env(batch.action), action_space)
+    done = flatten_time_env(batch.done).astype(obs.dtype)
+    truncated = flatten_time_env(batch.truncated).astype(obs.dtype)
+    mu_weights = make_aux_weights(done, truncated, hparams.mask_truncated, obs.dtype)
+    weight_column = mu_weights[:, None]
+
+    # These are the learned features directly. No whitening matrix W is used.
+    phi = jax.lax.stop_gradient(critic_ref(obs, behavior_action)["embed"])
+    next_action = sample_actor_action(actor_ref, next_obs, next_action_key, discrete_actions)
+    next_phi = jax.lax.stop_gradient(critic_ref(next_obs, next_action)["embed"])
+
+    feature_dim = phi.shape[-1]
+    identity = jnp.eye(feature_dim, dtype=phi.dtype)
+    dynamics_ridge = float(getattr(hparams, "sr_dice_dynamics_ridge", 1e-5))
+    nu_ridge = float(getattr(hparams, "sr_dice_nu_ridge", 1e-5))
+
+    # Gₖ = ΦₖᵀΞₖΦₖ ≈ I because of the critic orthonormality loss.
+    # F̂ₖ,λ_F = (Gₖ + λ_F I)⁻¹Bₖ, Bₖ = ΦₖᵀΞₖΦₖ⁺.
+    gram = phi.T @ (weight_column * phi)
+    cross = phi.T @ (weight_column * next_phi)
+    feature_dynamics = jnp.linalg.solve(gram + dynamics_ridge * identity, cross)
+    feature_dynamics = jax.lax.stop_gradient(feature_dynamics)
+
+    # For independently sampled s₀ ∼ d₀, draw a₀ ∼ πₖ(·|s₀).
+    start_action = sample_actor_action(actor_ref, initial_obs, start_action_key, discrete_actions)
+    start_phi = jax.lax.stop_gradient(critic_ref(initial_obs, start_action)["embed"])
+
+    # Row-vector form: ψₖ^{πₖ}(s,a)ᵀ = φψₖ(s,a)ᵀ(I − γF̂ₖ,λ_F)⁻¹.
+    successor_right_transform = jnp.linalg.solve(
+        identity - hparams.gamma * feature_dynamics,
+        identity,
+    )
+    successor_start_phi = start_phi @ successor_right_transform
+    successor_start_mean = successor_start_phi.mean(axis=0)
+
+    # νₖ,λ_ν⋆ = arg min_ν {ℒ_SR-DICE,k(ν) + (λ_ν/2)‖ν‖²₂}.
+    nu = jnp.linalg.solve(
+        gram + nu_ridge * identity,
+        (1.0 - hparams.gamma) * successor_start_mean,
+    )
+    nu = jax.lax.stop_gradient(nu)
+
+    # ρ̂ₖ(s,a) = νₖ,λ_ν⋆ᵀφψₖ(s,a).
+    rho = jax.lax.stop_gradient(phi @ nu)
+
+    # ℒ_SR-DICE,k^{λ_ν}(ν) = ½E_{μₖ}[(νᵀφψₖ)²] − (1 − γ)E_{d₀,πₖ}[νᵀψₖ^{πₖ}] + (λ_ν/2)‖ν‖²₂.
+    sr_dice_loss = (
+        0.5 * jnp.sum(mu_weights * jnp.square(rho))
+        - (1.0 - hparams.gamma) * jnp.dot(nu, successor_start_mean)
+        + 0.5 * nu_ridge * jnp.sum(jnp.square(nu))
+    )
+
+    metrics = {
+        "sr_dice/loss": sr_dice_loss,
+        "sr_dice/rho_mean_mu": jnp.sum(mu_weights * rho),
+        "sr_dice/nu_norm": jnp.linalg.norm(nu),
+        "sr_dice/F_norm": jnp.linalg.norm(feature_dynamics),
+        "sr_dice/initial_batch_size": jnp.array(initial_obs.shape[0], dtype=phi.dtype),
+        # This is now the raw learned-feature Gram error, not an error after whitening.
+        "sr_dice/gram_orth_error": jnp.linalg.norm(gram - identity, ord="fro"),
+    }
+    return rho.reshape(batch.done.shape), metrics
 
 def invariance_aux_loss(
     curr_emb: jax.Array,         # [B, d], live critic encoder output
     next_emb_target: jax.Array, # [B, d], frozen target embedding
-    weights: jax.Array,          # [B], sums to 1 over valid samples
+    weights: jax.Array,          # [B], Ξ̂_B = diag(weights)
     eps: float = 1e-5,
 ):
-    """
-    Learns a shared row-vector transition map F such that
-        Z_next ~= Z_curr @ F.
-    Equivalently, with column-vector features,
-        E[phi(s', a') | s, a] ~= F.T @ phi(s, a).
+    """Fit the invariant feature dynamics with the same implicit batch metric.
+
+    The orthonormality term separately trains Z so that ZᵀΞ̂_B Z ≈ I. Using
+    that same Ξ̂_B here, the ridge dynamics estimate is
+        F̂_ε = (ZᵀΞ̂_B Z + εI)⁻¹ ZᵀΞ̂_B Z⁺,
+    which minimizes
+        ½‖Z⁺ − ZF‖²_{Ξ̂_B,Frob} + (ε/2)‖F‖²_Frob.
     """
     _, feature_dim = curr_emb.shape
     identity = jnp.eye(feature_dim, dtype=curr_emb.dtype)
     weight_column = weights[:, None]
 
-    # C = Z_curr^T Xi Z_curr.
-    covariance = curr_emb.T @ (weight_column * curr_emb)
+    # Z is live so both the invariance and orthonormality losses update φψ.
+    Z_curr = curr_emb
+    Z_next = jax.lax.stop_gradient(next_emb_target)
 
-    # W = C^{-1/2}. Ridge makes this well-defined for finite minibatches.
-    eigenvalues, eigenvectors = jnp.linalg.eigh(covariance + eps * identity)
-    inverse_sqrt = 1.0 / jnp.sqrt(jnp.maximum(eigenvalues, eps))
-    whitening = (eigenvectors * inverse_sqrt) @ eigenvectors.T
-    whitening = jax.lax.stop_gradient(whitening)
+    # G = ZᵀΞ̂_B Z and B = ZᵀΞ̂_B Z⁺.
+    gram = Z_curr.T @ (weight_column * Z_curr)
+    cross = Z_curr.T @ (weight_column * Z_next)
 
-    # Whitening matrix to transform the current and next features.
-    # Z = W^TZ
-    Z_curr = curr_emb @ whitening
-    Z_next = jax.lax.stop_gradient(next_emb_target) @ whitening
-
-    # Although whitening makes this approximately I, solve explicitly because the ridge term makes it not exactly equal to I.
-    gram = Z_curr.T @ (weight_column * Z_curr) # Zcurr⊤​ΞZcurr
-    cross = Z_curr.T @ (weight_column * Z_next) # Zcurr⊤​ΞZnext
-
-    # The optimal F is the solution to Zcurr⊤​ΞZcurr​+ϵI)F=Zcurr⊤​ΞZnext​
-    # => F* = (Zcurr⊤​ΞZcurr​+ϵI)^{-1} Zcurr⊤​ΞZnext​
-    # => F* = ZcurrΞZnextT if ZcurrΞZcurr = Id
+    # Ridge solve: F̂_ε = (G + εI)⁻¹B.
     feature_dynamics = jnp.linalg.solve(gram + eps * identity, cross)
     feature_dynamics = jax.lax.stop_gradient(feature_dynamics)
 
-    # Znext​−Zcurr​F
+    # ½‖Z⁺ − ZF̂_ε‖²_{Ξ̂_B,Frob}.
     residual = Z_next - Z_curr @ feature_dynamics
-
-    # 1/2 ||Z_next - Z_curr F||^2_Xi,F.
     per_sample_loss = 0.5 * jnp.sum(jnp.square(residual), axis=-1)
     loss = jnp.sum(weights * per_sample_loss)
 
-    # (Zcurr⊤​ΞZcurr​ - I)
-    orthonormality_error = jnp.linalg.norm(gram - identity, ord="fro")
-
     return loss, feature_dynamics, {
         "inv_residual": loss,
-        "inv_orth_error": orthonormality_error,
+        "inv_orth_error": jnp.linalg.norm(gram - identity, ord="fro"),
         "inv_fro_norm": jnp.linalg.norm(feature_dynamics, ord="fro"),
     }
 
@@ -347,19 +456,28 @@ def make_learner_fn(
                 target_values.reshape(-1, 1),
             )
 
-        # Add invriance loss to the aux loss
-        td_mask = 1.0 - minibatch.truncated if hparams.mask_truncated else jnp.ones_like(minibatch.done, dtype=curr_emb.dtype)
-        aux_weights = make_aux_weights(done=minibatch.done, truncated=minibatch.truncated, mask_truncated=hparams.mask_truncated, dtype=curr_emb.dtype)
-        inv_loss, feature_dynamics, inv_metrics = invariance_aux_loss(curr_emb=curr_emb, next_emb_target=minibatch.extras["next_emb"], weights=aux_weights)
-
-        # Aux loss
-        pred = critic_output["pred_features"]
+        # The replay sampler implicitly defines Ξ̂_B = diag(batch_weights).
+        # Learn the encoder so ZᵀΞ̂_B Z ≈ I, then use the same Ξ̂_B in the invariance projection.
+        batch_weights = make_aux_weights(
+            minibatch.done,
+            minibatch.truncated,
+            hparams.mask_truncated,
+            curr_emb.dtype,
+        )
+        orth_loss_mult = float(getattr(hparams, "orth_loss_mult", 1.0))
+        invariance_ridge = float(getattr(hparams, "invariance_ridge", 1e-5))
+        orth_loss, _ = batch_orthonormality_loss(curr_emb, batch_weights)
+        inv_loss, feature_dynamics, inv_metrics = invariance_aux_loss(
+            curr_emb,
+            minibatch.extras["next_emb"],
+            batch_weights,
+            eps=invariance_ridge,
+        )
         pred_rew = critic_output["pred_rew"]
         value = critic_output["value"]
-        aux_loss = optax.squared_error(pred.reshape(-1), minibatch.extras["next_emb"])
-        aux_rew_loss = optax.squared_error(pred_rew.reshape(-1), minibatch.reward.reshape(-1, 1))
-        rew_aux_loss = jnp.sum(aux_weights * aux_rew_loss)
-        aux_loss = inv_loss + rew_aux_loss
+        aux_rew_loss = optax.squared_error(pred_rew.reshape(-1), minibatch.reward.reshape(-1))
+        rew_aux_loss = jnp.sum(batch_weights * aux_rew_loss)
+        aux_loss = inv_loss + orth_loss_mult * orth_loss + rew_aux_loss
 
         source_is_offline = minibatch.extras.get("source_is_offline", None)
         # compute l2 error for logging
@@ -432,8 +550,10 @@ def make_learner_fn(
             masked_critic_total_loss=loss,
             unmasked_critic_total_loss=unmasked_critic_total_loss,
             aux_loss=aux_loss,
-            rew_aux_loss=aux_rew_loss,
+            orth_loss=orth_loss,
+            rew_aux_loss=rew_aux_loss,
             abs_batch_action=jnp.abs(minibatch.action).mean(),
+            **inv_metrics,
             **critic_diag,
         )
 
@@ -458,7 +578,8 @@ def make_learner_fn(
 
         # policy KL constraint
         kl = compute_policy_kl(minibatch=minibatch, pi=pi, old_pi=old_pi)
-        alpha = jax.lax.stop_gradient(actor_model.temperature())
+        temperature = jnp.squeeze(actor_model.temperature())
+        alpha = jax.lax.stop_gradient(temperature)
         if discrete_actions:
             critic_pred = critic_target_model(minibatch.obs)
             value = critic_pred["value"]
@@ -527,54 +648,47 @@ def make_learner_fn(
                 )
             action_size_target = d * hparams.ent_target_mult
 
-        lagrangian = actor_model.lagrangian()
+        # ∇θρ̂ₖ = 0.
+        rho = jax.lax.stop_gradient(minibatch.extras["sr_dice_ratio"].reshape(-1))
+        actor_weights = make_aux_weights(minibatch.done, minibatch.truncated, hparams.mask_truncated, rho.dtype)
 
+        lagrangian = lagrangian = actor_model.lagrangian()
         if hparams.actor_kl_clip_mode == "full":
-            loss = jnp.mean(
-                actor_loss + kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl
-            )
+            per_state_loss = actor_loss + kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl
         elif hparams.actor_kl_clip_mode == "clipped":
-            loss = jnp.mean(
-                jnp.where(
-                    kl < hparams.kl_bound,
-                    actor_loss,
-                    kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl,
-                )
-            )
+            per_state_loss = jnp.where(kl < hparams.kl_bound, actor_loss, kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl)
         elif hparams.actor_kl_clip_mode == "value":
-            loss = jnp.mean(actor_loss)
+            per_state_loss = actor_loss
         else:
             raise ValueError(f"Unknown actor loss mode: {hparams.actor_kl_clip_mode}")
 
-        # SAC target entropy loss
+        # ℒπ,k^SR-DICE(θ) = E_{(s,aᵇ)∼μₖ, ε∼p(ε)}[sg[ρ̂ₖ(s,aᵇ)]ℓREPPO,π,k(s, ε; θ)].
+        loss = sr_dice_expectation(per_state_loss, actor_weights, rho)
         target_entropy = action_size_target + entropy
-        target_entropy_loss = actor_model.temperature() * jax.lax.stop_gradient(target_entropy)
+        target_entropy_loss = temperature * jax.lax.stop_gradient(sr_dice_expectation(target_entropy, actor_weights, rho))
 
-        # Lagrangian constraint (follows temperature update)
-        lagrangian_loss = -lagrangian * jax.lax.stop_gradient(kl - hparams.kl_bound)
+        weighted_kl = sr_dice_expectation(kl, actor_weights, rho)
+        lagrangian_loss = -lagrangian * jax.lax.stop_gradient(weighted_kl - hparams.kl_bound)
 
-        # total loss
         if hparams.update_entropy_lagrangian:
-            loss += jnp.mean(target_entropy_loss)
+            loss = loss + target_entropy_loss
         if hparams.update_kl_lagrangian:
-            loss += jnp.mean(lagrangian_loss)
+            loss = loss + lagrangian_loss
 
-        # for logging
-        real_action_log_prob = old_pi.log_prob(minibatch.action.clip(-0.999, 0.999)).mean()
+        loss = jnp.squeeze(loss)
 
+        real_action_log_prob = old_pi.log_prob(clip_action_for_critic(minibatch.action, action_space)).mean()
+        
         return loss, dict(
-            temp=actor_model.temperature(),
-            abs_pred_action=jnp.abs(pred_action).mean()
-            if not discrete_actions
-            else 0.0,
+            temp=temperature,
+            abs_pred_action=jnp.abs(pred_action).mean() if not discrete_actions else 0.0,
             lagrangian=lagrangian,
             lagrangian_loss=lagrangian_loss,
             entropy_loss=target_entropy_loss,
-            # --- actor diagnostics ---
             **{
-                "actor_diag/kl": kl.mean(),
-                "actor_diag/entropy": jnp.mean(entropy),
-                "actor_diag/actor_loss": jnp.mean(actor_loss),
+                "actor_diag/kl": weighted_kl,
+                "actor_diag/entropy": sr_dice_expectation(entropy, actor_weights, rho),
+                "actor_diag/actor_loss": sr_dice_expectation(actor_loss, actor_weights, rho),
                 "actor_diag/real_action_log_prob": real_action_log_prob,
             },
         )
@@ -616,82 +730,34 @@ def make_learner_fn(
         )
         return train_state.replace(target_critic=train_state.target_critic.replace(params=target_params))
 
-    def update(train_state: REPPOTrainState, batch: Transition):
-        # Update the live critic, then move the target critic by one Polyak step.
-        if cfg.algorithm.bc_indicator:
-            def update_critic(_):
-                critic_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
-                output, grads = critic_grad_fn(
-                    train_state.critic.params, train_state, batch
-                )
-                critic_train_state = train_state.critic.apply_gradients(grads)
-                return critic_train_state, output[1]
+    def critic_update(train_state: REPPOTrainState, minibatch: Transition):
+        critic_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
+        output, grads = critic_grad_fn(train_state.critic.params, train_state, minibatch)
+        critic_train_state = train_state.critic.apply_gradients(grads)
+        train_state = train_state.replace(critic=critic_train_state)
+        return polyak_update_target_critic(train_state), output[1]
 
-            critic_train_state, critic_metrics = update_critic(None)
-            train_state = train_state.replace(critic=critic_train_state)
-            delay = cfg.algorithm.bc_actor_update_delay
-
-            def update_actor(_):
-                actor_grad_fn = jax.value_and_grad(actor_loss, has_aux=True)
-                output, grads = actor_grad_fn(
-                    train_state.actor.params, train_state, batch
-                )
-                grad_norm = jax.tree.map(lambda x: jnp.linalg.norm(x), grads)
-                grad_norm = jax.tree.reduce(operator.add, grad_norm)
-                grads = jax.tree.map(
-                    lambda x: jnp.nan_to_num(
-                        x, nan=0.0, posinf=1.0, neginf=-1.0
-                    ),
-                    grads,
-                )
-                actor_train_state = train_state.actor.apply_gradients(grads)
-                return actor_train_state, grad_norm, output[1]
-
-            def hold_update_actor(_):
-                _, actor_metrics = actor_loss(
-                    train_state.actor.params, train_state, batch
-                )
-                return train_state.actor, jnp.array(0.0), actor_metrics
-
-            actor_train_state, grad_norm, actor_metrics = jax.lax.cond(
-                train_state.iteration > delay,
-                update_actor,
-                hold_update_actor,
-                None,
-            )
-        else:
-            critic_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
-            output, grads = critic_grad_fn(
-                train_state.critic.params, train_state, batch
-            )
-            critic_train_state = train_state.critic.apply_gradients(grads)
-            train_state = train_state.replace(critic=critic_train_state)
-            critic_metrics = output[1]
-
+    def actor_update(train_state: REPPOTrainState, minibatch: Transition):
+        def update_actor(_):
             actor_grad_fn = jax.value_and_grad(actor_loss, has_aux=True)
-            output, grads = actor_grad_fn(
-                train_state.actor.params, train_state, batch
-            )
-            grad_norm = jax.tree.map(lambda x: jnp.linalg.norm(x), grads)
-            grad_norm = jax.tree.reduce(operator.add, grad_norm)
-            grads = jax.tree.map(
-                lambda x: jnp.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0),
-                grads,
-            )
-            actor_train_state = train_state.actor.apply_gradients(grads)
-            actor_metrics = output[1]
+            output, grads = actor_grad_fn(train_state.actor.params, train_state, minibatch)
+            grad_norm = jax.tree.reduce(operator.add, jax.tree.map(lambda x: jnp.linalg.norm(x), grads))
+            grads = jax.tree.map(lambda x: jnp.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0), grads)
+            return train_state.actor.apply_gradients(grads), grad_norm, output[1]
 
-        train_state = train_state.replace(actor=actor_train_state)
-        train_state = polyak_update_target_critic(train_state)
-        
-        return train_state, {
-            **critic_metrics,
-            **actor_metrics,
-            "actor_diag/grad_norm": grad_norm,
-        }
+        def hold_actor(_):
+            _, actor_metrics = actor_loss(train_state.actor.params, train_state, minibatch)
+            return train_state.actor, jnp.array(0.0), actor_metrics
+
+        if cfg.algorithm.bc_indicator:
+            delay = getattr(hparams, "bc_actor_update_delay", 0)
+            actor_train_state, grad_norm, actor_metrics = jax.lax.cond(train_state.iteration > delay, update_actor, hold_actor, None)
+        else:
+            actor_train_state, grad_norm, actor_metrics = update_actor(None)
+        return train_state.replace(actor=actor_train_state), {**actor_metrics, "actor_diag/grad_norm": grad_norm}
 
     def run_epoch(
-        key: jax.Array, train_state: REPPOTrainState, batch: Transition
+        key: jax.Array, train_state: REPPOTrainState, batch: Transition, update_fn
     ) -> tuple[REPPOTrainState, dict[str, jax.Array]]:
         key, shuffle_key, act_key, kl_key = jax.random.split(key, 4)
 
@@ -722,12 +788,11 @@ def make_learner_fn(
             }
         )
 
-        train_state, metrics = jax.lax.scan(update, train_state, minibatches)
+        train_state, metrics = jax.lax.scan(update_fn, train_state, minibatches)
 
         metrics_mean = jax.tree.map(lambda x: x.mean(0), metrics)
-        metrics_mean["actor_diag/grad_norm_var"] = jnp.var(
-            metrics["actor_diag/grad_norm"]
-        )
+        if "actor_diag/grad_norm" in metrics:
+            metrics_mean["actor_diag/grad_norm_var"] = jnp.var(metrics["actor_diag/grad_norm"])
         return train_state, metrics_mean
 
     def nstep_lambda(batch: Transition):
@@ -891,37 +956,26 @@ def make_learner_fn(
     def learner_fn(
         key: Key, train_state: REPPOTrainState, batch: Transition
     ) -> tuple[REPPOTrainState, dict[str, jax.Array]]:
+        if "initial_obs" not in batch.extras:
+            raise KeyError("SR-DICE requires a separately sampled batch.extras['initial_obs'] with s₀ ∼ d₀.")
+        initial_obs = batch.extras["initial_obs"]
+        batch = batch.replace(extras={k: v for k, v in batch.extras.items() if k != "initial_obs"})
         if hparams.normalize_env:
-            new_norm_state = normalizer.update(
-                train_state.normalization_state, batch.obs
-            )
-            batch = batch.replace(
-                obs=normalizer.normalize(train_state.normalization_state, batch.obs),
-                next_obs=normalizer.normalize(
-                    train_state.normalization_state, batch.next_obs
-                ),
-            )
+            new_norm_state = normalizer.update(train_state.normalization_state, batch.obs)
+            initial_obs = normalizer.normalize(train_state.normalization_state, initial_obs)
+            batch = batch.replace(obs=normalizer.normalize(train_state.normalization_state, batch.obs), next_obs=normalizer.normalize(train_state.normalization_state, batch.next_obs))
             train_state = train_state.replace(normalization_state=new_norm_state)
 
-        # Build the target map once for this sampled replay batch. training.py
-        # samples a fresh N-transition replay batch for every outer epoch.
+        # Freeze πₖ once: critic targets, SR-DICE, and every actor minibatch use this reference policy.
+        train_state = train_state.replace(actor_target=train_state.actor_target.replace(params=train_state.actor.params))
         key, diag_key = jax.random.split(key)
-        diagnostics_extras = compute_extras(
-            key=diag_key,
-            train_state=train_state,
-            batch=batch,
-        )
-        batch = batch.replace(extras={**batch.extras, **diagnostics_extras})
-        target_values, target_advs, retrace_coeff_mean = nstep_lambda(batch)
-        batch = batch.replace(
-            extras={
-                **batch.extras,
-                "target_values": target_values,
-                "target_advs": target_advs,
-            }
-        )
 
-        # compute log probs; split by source when offline/online data is mixed
+        diagnostics_extras = compute_extras(key=diag_key, train_state=train_state, batch=batch)
+        batch = batch.replace(extras={**batch.extras, **diagnostics_extras})
+
+        target_values, target_advs, retrace_coeff_mean = nstep_lambda(batch)
+        batch = batch.replace(extras={**batch.extras, "target_values": target_values, "target_advs": target_advs})
+
         current_log_prob = batch.extras["current_log_prob"]
         reward_mean = batch.reward.mean()
         policy_log_prob_mean = current_log_prob.mean()
@@ -930,67 +984,70 @@ def make_learner_fn(
             offline_count = source_is_offline.sum()
             online_mask = 1.0 - source_is_offline
             online_count = online_mask.sum()
-            reward_mean_offline = jnp.where(
-                offline_count > 0,
-                (batch.reward * source_is_offline).sum() / offline_count,
-                0.0,
-            )
-            reward_mean_online = jnp.where(
-                online_count > 0,
-                (batch.reward * online_mask).sum() / online_count,
-                0.0,
-            )
-            policy_log_prob_offline = jnp.where(
-                offline_count > 0,
-                (current_log_prob * source_is_offline).sum() / offline_count,
-                0.0,
-            )
-            policy_log_prob_online = jnp.where(
-                online_count > 0,
-                (current_log_prob * online_mask).sum() / online_count,
-                0.0,
-            )
+            reward_mean_offline = jnp.where(offline_count > 0, (batch.reward * source_is_offline).sum() / offline_count, 0.0)
+            reward_mean_online = jnp.where(online_count > 0, (batch.reward * online_mask).sum() / online_count, 0.0)
+            policy_log_prob_offline = jnp.where(offline_count > 0, (current_log_prob * source_is_offline).sum() / offline_count, 0.0)
+            policy_log_prob_online = jnp.where(online_count > 0, (current_log_prob * online_mask).sum() / online_count, 0.0)
         else:
             reward_mean_offline = jnp.array(0.0, dtype=reward_mean.dtype)
             reward_mean_online = reward_mean
             policy_log_prob_offline = jnp.array(0.0, dtype=policy_log_prob_mean.dtype)
             policy_log_prob_online = policy_log_prob_mean
 
-        # Per-env-slot TD error for PER priority updates
-        # Shape: [num_envs]. Offline segments occupy slots 0..num_offline-1.
         per_env_td_error = jnp.abs(batch.extras["action_value"] - batch.extras["target_values"]).mean(axis=0)
+        key, critic_key, sr_dice_key, pv_before_key, actor_key, pv_after_key = jax.random.split(key, 6)
 
-        # training.py snapshots actor_target once before its replay-epoch loop.
-        # J(π_before): already computed in compute_extras using the old actor.
-        policy_value_before_vec = batch.extras["policy_value"].reshape(-1)
-        key, train_key, pv_after_key = jax.random.split(key, 3)
-        train_state, update_metrics = run_epoch(train_key, train_state, batch)
-        
-        # J(π_after): updated actor's expected value on the same states
+        # Critic/representation phase: πₖ is fixed and θ is not updated.
+        train_state, critic_metrics = jax.lax.scan(
+            lambda state, epoch_key: run_epoch(epoch_key, state, batch, critic_update),
+            train_state,
+            jax.random.split(critic_key, 1),
+        )
+        critic_metrics = jax.tree.map(lambda x: x[-1], critic_metrics)
+
+        # freeze φψₖ, F̂ₖ, ψₖ^{πₖ}, and ρ̂ₖ before policy improvement.
+        sr_dice_ratio, sr_dice_metrics = fit_sr_dice_ratio(sr_dice_key, train_state, batch, initial_obs, hparams, action_space, discrete_actions)
+        batch = batch.replace(extras={**batch.extras, "sr_dice_ratio": sr_dice_ratio})
+
+        # Policy Improvement Logging - Evaluate πₖ and πₖ₊₁ with the same frozen post-critic Q
         _n_pv = 8 * d if hparams.scale_samples_with_action_d else 8
+        actor_before = nnx.merge(train_state.actor.graphdef, train_state.actor_target.params)
+        critic_before = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
+        
+        actor_before.eval()
+        critic_before.eval()
+        
+        action_before = actor_before(batch.obs).sample(seed=pv_before_key, sample_shape=(_n_pv,))
+        action_before = clip_action_for_critic(action_before, action_space)
+        obs_tiled = jnp.repeat(batch.obs[None, ...], action_before.shape[0], axis=0)
+        policy_value_before_vec = critic_before(obs_tiled, action_before)["value"].mean(0).reshape(-1)
+
+        # actor-only policy-improvement phase with sg[ρ̂ₖ(s, aᵇ)].
+        train_state, actor_metrics = jax.lax.scan(
+            lambda state, epoch_key: run_epoch(epoch_key, state, batch, actor_update),
+            train_state,
+            jax.random.split(actor_key, 1),
+        )
+        actor_metrics = jax.tree.map(lambda x: x[-1], actor_metrics)
+
         actor_after = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
         critic_after = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
         actor_after.eval()
         critic_after.eval()
         action_after = actor_after(batch.obs).sample(seed=pv_after_key, sample_shape=(_n_pv,))
-        action_after = jnp.clip(action_after, -0.999, 0.999)
+        action_after = clip_action_for_critic(action_after, action_space)
         obs_tiled = jnp.repeat(batch.obs[None, ...], action_after.shape[0], axis=0)
         policy_value_after_vec = critic_after(obs_tiled, action_after)["value"].mean(0).reshape(-1)
-        policy_improvement_online, policy_improvement_offline = _split_online_offline_mean(
-            policy_value_after_vec - policy_value_before_vec,
-            batch.extras.get("source_is_offline"),
-        )
+        policy_improvement_online, policy_improvement_offline = _split_online_offline_mean(policy_value_after_vec - policy_value_before_vec, source_is_offline)
 
         base_metrics = {
             "reward_mean": reward_mean,
             "actor_diag/policy_log_prob_mean": policy_log_prob_mean,
-            # Mean clipped Retrace coefficient.
             "critic_diag/retrace_coeff_mean": retrace_coeff_mean,
             "actor_diag/retrace_coeff_mean": retrace_coeff_mean,
             "actor_diag/policy_improvement": policy_improvement_online,
-            "sys/grad_updates": (train_state.time_steps // (hparams.num_steps * hparams.num_envs)) * hparams.num_epochs * hparams.num_mini_batches,
+            "sys/grad_updates": (train_state.time_steps // (hparams.num_steps * hparams.num_envs)) * 2 * 1 * hparams.num_mini_batches,
         }
-        # Per-source split only for the mixed-source (expert) path.
         if source_is_offline is not None:
             base_metrics.update({
                 "reward_mean_offline": reward_mean_offline,
@@ -999,7 +1056,6 @@ def make_learner_fn(
                 "actor_diag/policy_log_prob_online_replay": policy_log_prob_online,
                 "actor_diag/policy_improvement_offline": policy_improvement_offline,
             })
-        update_metrics = {**update_metrics, **base_metrics}
-        return train_state, update_metrics, per_env_td_error
+        return train_state, {**critic_metrics, **actor_metrics, **sr_dice_metrics, **base_metrics}, per_env_td_error
 
     return jax.jit(learner_fn)
