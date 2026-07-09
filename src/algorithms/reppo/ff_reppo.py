@@ -75,6 +75,7 @@ def batch_orthonormality_loss(
 
 def fit_sr_dice_ratio(
     key: jax.Array,
+    dice_params: dict[str, jax.Array],
     train_state: REPPOTrainState,
     batch: Transition,
     initial_obs: jax.Array,
@@ -82,11 +83,11 @@ def fit_sr_dice_ratio(
     action_space: Space,
     discrete_actions: bool,
 ):
-    """Fit F̂ₖ, νₖ⋆, and ρ̂ₖ with the learned approximately Ξₖ-orthonormal features.
+    """Trainable linear SR-DICE components: successor features and ratio head.
 
-    The critic auxiliary loss learns ZᵀΞ̂_B Z ≈ I. Therefore this SR-DICE
-    fit uses the critic embeddings directly: it does not analytically whiten
-    or otherwise transform the features again.
+    ψ(s,a) = φ(s,a) S, where S is a persistent linear successor-feature layer.
+    ρ(s,a) = φ(s,a)^T ν, where ν is a persistent linear ratio head.
+    Actor and critic features are fixed for this DICE update; only S and ν are updated.
     """
     key, next_action_key, start_action_key = jax.random.split(key, 3)
     actor_ref = nnx.merge(train_state.actor.graphdef, train_state.actor_target.params)
@@ -94,68 +95,64 @@ def fit_sr_dice_ratio(
     actor_ref.eval()
     critic_ref.eval()
 
-    obs = flatten_time_env(batch.obs)
-    next_obs = flatten_time_env(batch.next_obs)
-    behavior_action = clip_action_for_critic(flatten_time_env(batch.action), action_space)
-    done = flatten_time_env(batch.done).astype(obs.dtype)
-    truncated = flatten_time_env(batch.truncated).astype(obs.dtype)
-    mu_weights = make_aux_weights(done, truncated, hparams.mask_truncated, obs.dtype)
-    weight_column = mu_weights[:, None]
+    # Accept both full rollout batches [T, N, ...] and already-flattened minibatches [B, ...].
+    batch_is_sequence = batch.done.ndim > 1
 
-    # These are the learned features directly. No whitening matrix W is used.
+    def _flat(x):
+        if batch_is_sequence:
+            return flatten_time_env(x)
+        return x
+
+    obs = _flat(batch.obs)
+    next_obs = _flat(batch.next_obs)
+    behavior_action = clip_action_for_critic(_flat(batch.action), action_space)
+    done = _flat(batch.done).astype(obs.dtype)
+    truncated = _flat(batch.truncated).astype(obs.dtype)
+    valid_weights = make_aux_weights(done, truncated, hparams.mask_truncated, obs.dtype)
+    weight_column = valid_weights[:, None]
+
+    # Critic features are treated as fixed inputs for DICE/SF training.
     phi = jax.lax.stop_gradient(critic_ref(obs, behavior_action)["embed"])
     next_action = sample_actor_action(actor_ref, next_obs, next_action_key, discrete_actions)
     next_phi = jax.lax.stop_gradient(critic_ref(next_obs, next_action)["embed"])
 
+    nu = dice_params["sr_dice_nu"]
+    successor_matrix = dice_params["sr_dice_successor"]
     feature_dim = phi.shape[-1]
     identity = jnp.eye(feature_dim, dtype=phi.dtype)
-    dynamics_ridge = float(getattr(hparams, "sr_dice_dynamics_ridge", 1e-5))
-    nu_ridge = float(getattr(hparams, "sr_dice_nu_ridge", 1e-5))
 
-    # Gₖ = ΦₖᵀΞₖΦₖ ≈ I because of the critic orthonormality loss.
-    # F̂ₖ,λ_F = (Gₖ + λ_F I)⁻¹Bₖ, Bₖ = ΦₖᵀΞₖΦₖ⁺.
-    gram = phi.T @ (weight_column * phi)
-    cross = phi.T @ (weight_column * next_phi)
-    feature_dynamics = jnp.linalg.solve(gram + dynamics_ridge * identity, cross)
-    feature_dynamics = jax.lax.stop_gradient(feature_dynamics)
+    # Trainable successor features: ψ(s,a) = φ(s,a)S.
+    phi = jax.lax.stop_gradient(phi)
+    next_phi = jax.lax.stop_gradient(next_phi)
+    psi = phi @ successor_matrix
+    next_psi_target = jax.lax.stop_gradient(next_phi @ successor_matrix)
+    bootstrap = (1.0 - done.reshape(-1)) * (1.0 - truncated.reshape(-1))
+    successor_target = phi + hparams.gamma * bootstrap[:, None] * next_psi_target
+    successor_residual = psi - successor_target
+    successor_loss = jnp.sum(valid_weights * 0.5 * jnp.sum(jnp.square(successor_residual), axis=-1))
 
-    # For independently sampled s₀ ∼ d₀, draw a₀ ∼ πₖ(·|s₀).
+    # For independently sampled s₀ ∼ d₀, draw a₀ ∼ πₖ(·|s₀) and evaluate ψ(s₀,a₀).
     start_action = sample_actor_action(actor_ref, initial_obs, start_action_key, discrete_actions)
     start_phi = jax.lax.stop_gradient(critic_ref(initial_obs, start_action)["embed"])
-
-    # Row-vector form: ψₖ^{πₖ}(s,a)ᵀ = φψₖ(s,a)ᵀ(I − γF̂ₖ,λ_F)⁻¹.
-    successor_right_transform = jnp.linalg.solve(
-        identity - hparams.gamma * feature_dynamics,
-        identity,
-    )
-    successor_start_phi = start_phi @ successor_right_transform
+    successor_start_phi = start_phi @ successor_matrix
     successor_start_mean = successor_start_phi.mean(axis=0)
 
-    # νₖ,λ_ν⋆ = arg min_ν {ℒ_SR-DICE,k(ν) + (λ_ν/2)‖ν‖²₂}.
-    nu = jnp.linalg.solve(
-        gram + nu_ridge * identity,
-        (1.0 - hparams.gamma) * successor_start_mean,
+    # Trainable ratio head: ρ(s,a) = φ(s,a)^Tν.
+    rho = phi @ nu
+
+    # SR-DICE ratio objective using the learned successor features.
+    successor_start_mean = jax.lax.stop_gradient(successor_start_mean)
+    dice_ratio_loss = (
+    0.5 * jnp.sum(valid_weights * jnp.square(rho))
+    - (1.0 - hparams.gamma) * jnp.dot(nu, successor_start_mean)
     )
-    nu = jax.lax.stop_gradient(nu)
+    sr_dice_loss = dice_ratio_loss + successor_loss
 
-    # ρ̂ₖ(s,a) = νₖ,λ_ν⋆ᵀφψₖ(s,a).
-    rho = jax.lax.stop_gradient(phi @ nu)
-
-    # ℒ_SR-DICE,k^{λ_ν}(ν) = ½E_{μₖ}[(νᵀφψₖ)²] − (1 − γ)E_{d₀,πₖ}[νᵀψₖ^{πₖ}] + (λ_ν/2)‖ν‖²₂.
-    sr_dice_loss = (
-        0.5 * jnp.sum(mu_weights * jnp.square(rho))
-        - (1.0 - hparams.gamma) * jnp.dot(nu, successor_start_mean)
-        + 0.5 * nu_ridge * jnp.sum(jnp.square(nu))
-    )
-
+    gram = phi.T @ (weight_column * phi)
     metrics = {
-        "sr_dice/loss": sr_dice_loss,
-        "sr_dice/rho_mean_mu": jnp.sum(mu_weights * rho),
-        "sr_dice/nu_norm": jnp.linalg.norm(nu),
-        "sr_dice/F_norm": jnp.linalg.norm(feature_dynamics),
-        "sr_dice/initial_batch_size": jnp.array(initial_obs.shape[0], dtype=phi.dtype),
-        # This is now the raw learned-feature Gram error, not an error after whitening.
-        "sr_dice/gram_orth_error": jnp.linalg.norm(gram - identity, ord="fro"),
+        "sr_dice/total_dice_loss": sr_dice_loss,
+        "sr_dice/ratio_loss": dice_ratio_loss,
+        "sr_dice/successor_loss": successor_loss,
     }
     return rho.reshape(batch.done.shape), metrics
 
@@ -195,9 +192,7 @@ def invariance_aux_loss(
     loss = jnp.sum(weights * per_sample_loss)
 
     return loss, feature_dynamics, {
-        "inv_residual": loss,
-        "inv_orth_error": jnp.linalg.norm(gram - identity, ord="fro"),
-        "inv_fro_norm": jnp.linalg.norm(feature_dynamics, ord="fro"),
+        "sr_dice/inv_loss": loss,
     }
 
 def load_bc_weights_to_actor(bc_checkpoint_path: str, jax_actor: nnx.Module) -> nnx.Module:
@@ -334,6 +329,7 @@ def make_init_fn(
     action_space: Space,
 ) -> InitFn:
     hparams = cfg.algorithm
+    discrete_actions = isinstance(action_space, Discrete)
 
     def init(key: Key):
         key, model_key = jax.random.split(key)
@@ -397,10 +393,24 @@ def make_init_fn(
         else:
             logging.info("bc_indicator=False, using random initialization for actor")
 
+        dummy_obs = jax.tree.map(lambda x: jnp.zeros((1,) + x.shape, dtype=jnp.float32), observation_space.sample(key))
+        if discrete_actions:
+            dummy_action = jnp.zeros((1,), dtype=jnp.int32)
+        else:
+            dummy_action = jnp.zeros((1,) + action_space.shape, dtype=jnp.float32)
+        sr_dice_feature_dim = critic(dummy_obs, dummy_action)["embed"].shape[-1]
+        sr_dice_nu = jnp.zeros((sr_dice_feature_dim,), dtype=jnp.float32)
+        sr_dice_successor = jnp.eye(sr_dice_feature_dim, dtype=jnp.float32)
+
+        dice_optim = optax.adam(learning_rate=float(getattr(hparams, "sr_dice_lr", 1e-3)))
+
         return REPPOTrainState.create(
             graphdef=nnx.graphdef(actor),
-            params=nnx.state(actor),
-            tx=optax.set_to_zero(),
+            params={
+                "sr_dice_nu": sr_dice_nu,
+                "sr_dice_successor": sr_dice_successor,
+            },
+            tx=dice_optim,
             actor=nnx.TrainState.create(
                 graphdef=nnx.graphdef(actor), params=nnx.state(actor), tx=actor_tx
             ),
@@ -464,7 +474,6 @@ def make_learner_fn(
             hparams.mask_truncated,
             curr_emb.dtype,
         )
-        orth_loss_mult = float(getattr(hparams, "orth_loss_mult", 1.0))
         invariance_ridge = float(getattr(hparams, "invariance_ridge", 1e-5))
         orth_loss, _ = batch_orthonormality_loss(curr_emb, batch_weights)
         inv_loss, feature_dynamics, inv_metrics = invariance_aux_loss(
@@ -477,7 +486,7 @@ def make_learner_fn(
         value = critic_output["value"]
         aux_rew_loss = optax.squared_error(pred_rew.reshape(-1), minibatch.reward.reshape(-1))
         rew_aux_loss = jnp.sum(batch_weights * aux_rew_loss)
-        aux_loss = inv_loss + orth_loss_mult * orth_loss + rew_aux_loss
+        aux_loss = inv_loss +  orth_loss + rew_aux_loss
 
         source_is_offline = minibatch.extras.get("source_is_offline", None)
         # compute l2 error for logging
@@ -648,11 +657,19 @@ def make_learner_fn(
                 )
             action_size_target = d * hparams.ent_target_mult
 
-        # ∇θρ̂ₖ = 0.
-        rho = jax.lax.stop_gradient(minibatch.extras["sr_dice_ratio"].reshape(-1))
-        actor_weights = make_aux_weights(minibatch.done, minibatch.truncated, hparams.mask_truncated, rho.dtype)
+        # SR-DICE actor coupling is disabled for this ablation.
+        # Keep the old ratio-weighted actor objective here for reference, but do not let ρ̂ₖ enter actor, temperature, or KL-lagrangian updates.
+        #
+        # Old code:
+        #   # ∇θρ̂ₖ = 0.
+        #   rho = jax.lax.stop_gradient(minibatch.extras["sr_dice_ratio"].reshape(-1))
+        #   actor_weights = make_aux_weights(minibatch.done, minibatch.truncated, hparams.mask_truncated, rho.dtype)
+        #   loss = sr_dice_expectation(per_state_loss, actor_weights, rho)
+        #   target_entropy_loss = temperature * jax.lax.stop_gradient(sr_dice_expectation(target_entropy, actor_weights, rho))
+        #   weighted_kl = sr_dice_expectation(kl, actor_weights, rho)
+        actor_weights = make_aux_weights(minibatch.done, minibatch.truncated, hparams.mask_truncated, actor_loss.dtype)
 
-        lagrangian = lagrangian = actor_model.lagrangian()
+        lagrangian = actor_model.lagrangian()
         if hparams.actor_kl_clip_mode == "full":
             per_state_loss = actor_loss + kl * jax.lax.stop_gradient(lagrangian) * hparams.reduce_kl
         elif hparams.actor_kl_clip_mode == "clipped":
@@ -662,12 +679,13 @@ def make_learner_fn(
         else:
             raise ValueError(f"Unknown actor loss mode: {hparams.actor_kl_clip_mode}")
 
-        # ℒπ,k^SR-DICE(θ) = E_{(s,aᵇ)∼μₖ, ε∼p(ε)}[sg[ρ̂ₖ(s,aᵇ)]ℓREPPO,π,k(s, ε; θ)].
-        loss = sr_dice_expectation(per_state_loss, actor_weights, rho)
+        loss = jnp.sum(actor_weights * per_state_loss.reshape(-1))
         target_entropy = action_size_target + entropy
-        target_entropy_loss = temperature * jax.lax.stop_gradient(sr_dice_expectation(target_entropy, actor_weights, rho))
+        target_entropy_loss = temperature * jax.lax.stop_gradient(
+            jnp.sum(actor_weights * target_entropy.reshape(-1))
+        )
 
-        weighted_kl = sr_dice_expectation(kl, actor_weights, rho)
+        weighted_kl = jnp.sum(actor_weights * kl.reshape(-1))
         lagrangian_loss = -lagrangian * jax.lax.stop_gradient(weighted_kl - hparams.kl_bound)
 
         if hparams.update_entropy_lagrangian:
@@ -687,8 +705,8 @@ def make_learner_fn(
             entropy_loss=target_entropy_loss,
             **{
                 "actor_diag/kl": weighted_kl,
-                "actor_diag/entropy": sr_dice_expectation(entropy, actor_weights, rho),
-                "actor_diag/actor_loss": sr_dice_expectation(actor_loss, actor_weights, rho),
+                "actor_diag/entropy": jnp.sum(actor_weights * entropy.reshape(-1)),
+                "actor_diag/actor_loss": jnp.sum(actor_weights * actor_loss.reshape(-1)),
                 "actor_diag/real_action_log_prob": real_action_log_prob,
             },
         )
@@ -756,10 +774,32 @@ def make_learner_fn(
             actor_train_state, grad_norm, actor_metrics = update_actor(None)
         return train_state.replace(actor=actor_train_state), {**actor_metrics, "actor_diag/grad_norm": grad_norm}
 
+    # Train/log SR-DICE from replay minibatches, like a separate critic-style estimator.
+    # Both DICE components are persistent linear layers:
+    #   sr_dice_successor: ψ(s,a) = φ(s,a)S
+    #   sr_dice_nu:       ρ(s,a) = φ(s,a)^Tν
+    # The actor still does not consume sr_dice_ratio.
+    def dice_update(train_state: REPPOTrainState, minibatch: Transition, initial_obs: jax.Array):
+        dice_key = minibatch.extras["dice_key"]
+
+        def dice_loss_fn(dice_params):
+            _, dice_metrics = fit_sr_dice_ratio(dice_key, dice_params, train_state, minibatch, initial_obs, hparams, action_space, discrete_actions)
+            return dice_metrics["sr_dice/total_dice_loss"], dice_metrics
+
+        (loss, dice_metrics), dice_grads = jax.value_and_grad(dice_loss_fn, has_aux=True)(train_state.params)
+        dice_grads = jax.tree.map(lambda x: jnp.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0), dice_grads)
+        grad_norm = jax.tree.reduce(operator.add, jax.tree.map(lambda x: jnp.linalg.norm(x), dice_grads))
+        train_state = train_state.apply_gradients(grads=dice_grads)
+        dice_metrics = {
+            **dice_metrics,
+            "sr_dice/grad_norm": grad_norm,
+        }
+        return train_state, dice_metrics
+
     def run_epoch(
         key: jax.Array, train_state: REPPOTrainState, batch: Transition, update_fn
     ) -> tuple[REPPOTrainState, dict[str, jax.Array]]:
-        key, shuffle_key, act_key, kl_key = jax.random.split(key, 4)
+        key, shuffle_key, act_key, kl_key, dice_key = jax.random.split(key, 5)
 
         batch_size = hparams.num_steps * hparams.num_envs
         mini_batch_size = batch_size // hparams.num_mini_batches
@@ -785,6 +825,7 @@ def make_learner_fn(
                 **minibatches.extras,
                 "action_key": jax.random.split(act_key, hparams.num_mini_batches),
                 "kl_key": jax.random.split(kl_key, hparams.num_mini_batches),
+                "dice_key": jax.random.split(dice_key, hparams.num_mini_batches),
             }
         )
 
@@ -1005,9 +1046,22 @@ def make_learner_fn(
         )
         critic_metrics = jax.tree.map(lambda x: x[-1], critic_metrics)
 
-        # freeze φψₖ, F̂ₖ, ψₖ^{πₖ}, and ρ̂ₖ before policy improvement.
-        sr_dice_ratio, sr_dice_metrics = fit_sr_dice_ratio(sr_dice_key, train_state, batch, initial_obs, hparams, action_space, discrete_actions)
-        batch = batch.replace(extras={**batch.extras, "sr_dice_ratio": sr_dice_ratio})
+        # Train SR-DICE on replay minibatches with π_k fixed through actor_target.
+        # This is amortized training: ν is updated from the buffer and carried across learner calls.
+        train_state, dice_metrics = jax.lax.scan(
+            lambda state, epoch_key: run_epoch(
+                epoch_key,
+                state,
+                batch,
+                lambda s, mb: dice_update(s, mb, initial_obs),
+            ),
+            train_state,
+            jax.random.split(sr_dice_key, 1),
+        )
+        dice_metrics = jax.tree.map(lambda x: x[-1], dice_metrics)
+
+        # Old actor-coupled code:
+        # batch = batch.replace(extras={**batch.extras, "sr_dice_ratio": sr_dice_ratio})
 
         # Policy Improvement Logging - Evaluate πₖ and πₖ₊₁ with the same frozen post-critic Q
         _n_pv = 8 * d if hparams.scale_samples_with_action_d else 8
@@ -1056,6 +1110,6 @@ def make_learner_fn(
                 "actor_diag/policy_log_prob_online_replay": policy_log_prob_online,
                 "actor_diag/policy_improvement_offline": policy_improvement_offline,
             })
-        return train_state, {**critic_metrics, **actor_metrics, **sr_dice_metrics, **base_metrics}, per_env_td_error
+        return train_state, {**critic_metrics, **actor_metrics, **dice_metrics, **base_metrics}, per_env_td_error
 
     return jax.jit(learner_fn)
