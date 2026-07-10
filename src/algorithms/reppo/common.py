@@ -61,6 +61,10 @@ class REPPOTrainState(TrainState):
     target_critic: nnx.TrainState
     actor_target: nnx.TrainState
     normalization_state: PyTreeNode | None = None
+    # Per-parameter Adam optimizer states for the SR-DICE / representation
+    # parameters (sr_dice_nu, sr_dice_successor, feature_dynamics_F,
+    # batch_norm_phi_scale, batch_norm_phi_bias).
+    dice_opt_state: dict | None = None
 
 class OfflineReplayBuffer:
     def __init__(
