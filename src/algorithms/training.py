@@ -21,8 +21,28 @@ import jax.numpy as jnp
 
 from src.algorithms.reppo.common import OfflineReplayBuffer
 from src.common import Transition
-from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
 
+def to_jax(x):
+    if isinstance(x, np.ndarray):
+        return jnp.array(x)
+    elif isinstance(x, jax.Array):
+        return x
+    elif isinstance(x, torch.Tensor):
+        return jnp.asarray(x.detach().cpu().numpy()) # jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(x.contiguous()))
+    elif isinstance(x, dict) or isinstance(x, list):
+        return jax.tree.map(to_jax, x)
+    else:
+        return jnp.array(x)
+
+def to_torch(x):
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x)
+    elif isinstance(x, torch.Tensor):
+        return x
+    elif isinstance(x, jax.Array):
+        return torch.from_numpy(np.array(x))
+    else:
+        raise ValueError(f"Cannot convert type {type(x)} to torch.Tensor")
 
 def _update_initial_obs_pool(initial_obs_pool: jax.Array, reset_obs: jax.Array, episode_ended: jax.Array) -> jax.Array:
     """Replace pool entries only with post-auto-reset observations."""
@@ -33,6 +53,51 @@ def _update_initial_obs_pool(initial_obs_pool: jax.Array, reset_obs: jax.Array, 
 
 def _sample_initial_obs(key: Key, initial_obs_pool: jax.Array) -> jax.Array:
     return jnp.take(initial_obs_pool, jax.random.permutation(key, initial_obs_pool.shape[0]), axis=0)
+
+
+def _contains_humanoid_bench(*objects) -> bool:
+    """Best-effort check for HumanoidBench runner/config context.
+
+    Hydra does not pass the config name into this training helper directly, so
+    check the runner callables/env objects and, when available, Hydra runtime
+    metadata. This keeps ManiSkill unchanged while automatically grouping CPU
+    HumanoidBench collection blocks.
+    """
+    token = "humanoid_bench"
+
+    def object_strings(obj):
+        if obj is None:
+            return
+        if isinstance(obj, (tuple, list)):
+            for item in obj:
+                yield from object_strings(item)
+            return
+        for attr in ("__module__", "__qualname__", "__name__"):
+            value = getattr(obj, attr, None)
+            if value is not None:
+                yield str(value)
+        func = getattr(obj, "func", None)
+        if func is not None:
+            yield from object_strings(func)
+        yield type(obj).__module__
+        yield type(obj).__name__
+        yield repr(obj)
+
+    for obj in objects:
+        for value in object_strings(obj):
+            if token in value.lower():
+                return True
+
+    try:
+        from hydra.core.hydra_config import HydraConfig
+
+        if HydraConfig.initialized():
+            if token in str(HydraConfig.get()).lower():
+                return True
+    except Exception:
+        pass
+
+    return False
 
 def make_scan_train_fn(
     env: gymnasium.Env | tuple[gymnasium.Env, gymnasium.Env],
@@ -371,13 +436,14 @@ def make_loop_train_fn(
     per_beta: float = 0.4,
     num_epochs: int = 4,
     learning_starts: int = 1,
+    num_collection_blocks: int = 1,
 ):
     from src.runners.gymnasium_runner import (
         make_eval_fn as make_gymnasium_eval_fn,
         make_rollout_fn as make_gymnasium_rollout_fn,
     )
 
-    train_log_interval = 125 # max(
+    train_log_interval = 1000 # 125 for maniskill # max(
     #     1, int((total_time_steps / (num_steps * num_envs)) // num_eval) // 4
     # )
 
@@ -392,6 +458,14 @@ def make_loop_train_fn(
     if eval_fn is None:
         eval_fn = make_gymnasium_eval_fn(eval_env, max_episode_steps)
 
+    if _contains_humanoid_bench(env, eval_env, rollout_fn, eval_fn):
+        if num_collection_blocks != 8:
+            logging.info(
+                "HumanoidBench runner/config detected; overriding num_collection_blocks from %d to 8.",
+                num_collection_blocks,
+            )
+        num_collection_blocks = 8
+
     if data_type not in ("random", "PER"):
         raise ValueError(
             "Flashbax replay supports data_type='random' or data_type='PER'. "
@@ -405,16 +479,16 @@ def make_loop_train_fn(
     if data_type == "random":
         buffer_fn = fbx.make_item_buffer(
             max_length=max_buffer_size,
-            min_length=num_envs,
-            sample_batch_size=num_envs,
+            min_length=num_envs*num_collection_blocks,
+            sample_batch_size=num_envs*num_collection_blocks,
             add_sequences=True,
             add_batches=True,
         )
     else:
         buffer_fn = fbx.make_prioritised_item_buffer(
             max_length=max_buffer_size,
-            min_length=num_envs,
-            sample_batch_size=num_envs,
+            min_length=num_envs*num_collection_blocks,
+            sample_batch_size=num_envs*num_collection_blocks,
             add_sequences=True,
             add_batches=True,
             priority_exponent=per_alpha,
@@ -431,14 +505,18 @@ def make_loop_train_fn(
         # Initialize the policy, environment and map that across the number of random seeds
         num_train_steps = total_time_steps // (num_steps * num_envs)
         num_iterations = num_eval
-        train_steps_per_iteration = num_train_steps // num_iterations
+        train_steps_per_iteration = max(
+            1, num_train_steps // (num_iterations * num_collection_blocks)
+        )
         key, init_key = jax.random.split(key)
         state = init_fn(init_key)
         obs, _ = env.reset()
         state = state.replace(last_obs=to_jax(obs), last_env_state=None)
         initial_obs_pool = to_jax(obs)
         logging.info(f"Starting training for {num_iterations} iterations.")
-        logging.info(f"Train steps per iteration: {train_steps_per_iteration}.")
+        logging.info(f"Collection blocks per update: {num_collection_blocks}.")
+        logging.info(f"Train update blocks per iteration: {train_steps_per_iteration}.")
+        logging.info(f"Env transitions per update block: {num_collection_blocks * num_steps * num_envs}.")
         logging.info(f"Total time steps: {total_time_steps}.")
 
         buffer_memory_gb = 0.0
@@ -475,33 +553,34 @@ def make_loop_train_fn(
 
         for iter_idx in range(num_iterations):
             for _ in range(train_steps_per_iteration):
-                key, rollout_key = jax.random.split(key)
-                policy = policy_fn(state, False)
-                rollout_transitions, state = rollout_fn(
-                    key=rollout_key, train_state=state, policy=policy
-                )
-                episode_ended = jnp.logical_or(rollout_transitions.done[-1].astype(bool), rollout_transitions.truncated[-1].astype(bool))
-                initial_obs_pool = _update_initial_obs_pool(initial_obs_pool, state.last_obs, episode_ended)
-
-                replay_transitions = Transition(
-                    obs=rollout_transitions.obs,
-                    next_obs=rollout_transitions.next_obs,
-                    action=rollout_transitions.action,
-                    reward=rollout_transitions.reward,
-                    done=rollout_transitions.done,
-                    truncated=rollout_transitions.truncated,
-                    extras={
-                        "behavior_log_prob": rollout_transitions.extras[
-                            "behavior_log_prob"
-                        ],
-                    },
-                )
-                if buffer_state is None:
-                    buffer_state = buffer_fn.init(
-                        jax.tree.map(lambda x: x[0, 0], replay_transitions)
+                for _ in range(num_collection_blocks):
+                    key, rollout_key = jax.random.split(key)
+                    policy = policy_fn(state, False)
+                    rollout_transitions, state = rollout_fn(
+                        key=rollout_key, train_state=state, policy=policy
                     )
+                    episode_ended = jnp.logical_or(rollout_transitions.done[-1].astype(bool), rollout_transitions.truncated[-1].astype(bool))
+                    initial_obs_pool = _update_initial_obs_pool(initial_obs_pool, state.last_obs, episode_ended)
 
-                buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
+                    replay_transitions = Transition(
+                        obs=rollout_transitions.obs,
+                        next_obs=rollout_transitions.next_obs,
+                        action=rollout_transitions.action,
+                        reward=rollout_transitions.reward,
+                        done=rollout_transitions.done,
+                        truncated=rollout_transitions.truncated,
+                        extras={
+                            "behavior_log_prob": rollout_transitions.extras[
+                                "behavior_log_prob"
+                            ],
+                        },
+                    )
+                    if buffer_state is None:
+                        buffer_state = buffer_fn.init(
+                            jax.tree.map(lambda x: x[0, 0], replay_transitions)
+                        )
+
+                    buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
 
                 for _ in range(num_epochs):
                     key, learn_key, sample_key, initial_key = jax.random.split(key, 4)

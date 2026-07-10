@@ -5,7 +5,28 @@ import torch
 import gymnasium
 
 from src.common import EvalFn, Key, Policy, RolloutFn, TrainState, Transition
-from src.env_utils.torch_wrappers.maniskill_wrapper import to_jax
+
+def to_jax(x):
+    if isinstance(x, np.ndarray):
+        return jnp.array(x)
+    elif isinstance(x, jax.Array):
+        return x
+    elif isinstance(x, torch.Tensor):
+        return jnp.asarray(x.detach().cpu().numpy()) # jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(x.contiguous()))
+    elif isinstance(x, dict) or isinstance(x, list):
+        return jax.tree.map(to_jax, x)
+    else:
+        return jnp.array(x)
+
+def to_torch(x):
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x)
+    elif isinstance(x, torch.Tensor):
+        return x
+    elif isinstance(x, jax.Array):
+        return torch.from_numpy(np.array(x))
+    else:
+        raise ValueError(f"Cannot convert type {type(x)} to torch.Tensor")
 
 def make_rollout_fn(
     env: gymnasium.Env,
