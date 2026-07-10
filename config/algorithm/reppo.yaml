@@ -88,7 +88,17 @@ ent_start: 0.01
 ent_target_mult: 0.5
 update_entropy_lagrangian: true
 ## auxiliary loss settings
-aux_loss_mult: 1.0
+aux_loss_mult: 1.0                # global scale on the summed auxiliary losses
+# per-loss multipliers (set to 0.0 to switch a term off)
+td_loss_mult: 1.0                 # value/TD (critic) loss
+inv_loss_mult: 1.0                # BatchNorm/F invariance loss
+gershgorin_loss_mult: 1.0         # Gershgorin spectral-stability loss
+rew_aux_loss_mult: 1.0            # reward-prediction auxiliary loss
+## SR-DICE / representation optimization (Adam)
+normalize_sr_dice_ratio: true     # self-normalize ρ in the actor policy-improvement term
+sr_dice_lr: 1.0e-3                 # lr for ν (ratio) and S (successor features)
+batch_norm_phi_lr: 1.0e-3         # lr for the φ BatchNorm affine parameters
+feature_dynamics_lr: 1.0e-3       # lr for the feature-dynamics matrix F
 gradient_estimator: "pathwise_q" # "score_based_gae", "score_based_q", "pathwise_q"
 scale_samples_with_action_d: False
 fixed_actor_std: False

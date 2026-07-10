@@ -321,6 +321,24 @@ def make_policy_fn(
     return policy_fn
 
 
+def make_dice_optimizers(hparams) -> dict[str, optax.GradientTransformation]:
+    """Adam optimizers for the SR-DICE / representation parameters.
+
+    Defined once so make_init_fn (optimizer-state init) and make_learner_fn
+    (parameter updates) build identical transforms. Each parameter gets its own
+    Adam state so their moment estimates and step counts do not interfere.
+    """
+    sr_dice_lr = float(getattr(hparams, "sr_dice_lr", 1e-3))
+    batch_norm_phi_lr = float(getattr(hparams, "batch_norm_phi_lr", sr_dice_lr))
+    feature_dynamics_lr = float(getattr(hparams, "feature_dynamics_lr", sr_dice_lr))
+    return {
+        "sr_dice_nu": optax.adam(sr_dice_lr),
+        "sr_dice_successor": optax.adam(sr_dice_lr),
+        "feature_dynamics_F": optax.adam(feature_dynamics_lr),
+        "batch_norm_phi_scale": optax.adam(batch_norm_phi_lr),
+        "batch_norm_phi_bias": optax.adam(batch_norm_phi_lr),
+    }
+
 def make_init_fn(
     cfg: DictConfig,
     observation_space: Space,
@@ -403,18 +421,25 @@ def make_init_fn(
         batch_norm_phi_scale = jnp.ones((sr_dice_feature_dim,), dtype=jnp.float32)
         batch_norm_phi_bias = jnp.zeros((sr_dice_feature_dim,), dtype=jnp.float32)
 
-        dice_optim = optax.adam(learning_rate=float(getattr(hparams, "sr_dice_lr", 1e-3)))
+        dice_params = {
+            "sr_dice_nu": sr_dice_nu,
+            "sr_dice_successor": sr_dice_successor,
+            "feature_dynamics_F": feature_dynamics,
+            "batch_norm_phi_scale": batch_norm_phi_scale,
+            "batch_norm_phi_bias": batch_norm_phi_bias,
+        }
+        dice_optimizers = make_dice_optimizers(hparams)
+        dice_opt_state = {
+            name: dice_optimizers[name].init(dice_params[name]) for name in dice_params
+        }
 
         return REPPOTrainState.create(
             graphdef=nnx.graphdef(actor),
-            params={
-                "sr_dice_nu": sr_dice_nu,
-                "sr_dice_successor": sr_dice_successor,
-                "feature_dynamics_F": feature_dynamics,
-                "batch_norm_phi_scale": batch_norm_phi_scale,
-                "batch_norm_phi_bias": batch_norm_phi_bias,
-            },
-            tx=dice_optim,
+            params=dice_params,
+            # The top-level train-state optimizer is unused: DICE/representation
+            # params are updated by their own per-parameter Adam optimizers.
+            tx=optax.set_to_zero(),
+            dice_opt_state=dice_opt_state,
             actor=nnx.TrainState.create(
                 graphdef=nnx.graphdef(actor), params=nnx.state(actor), tx=actor_tx
             ),
@@ -514,7 +539,15 @@ def make_learner_fn(
         value = critic_output["value"]
         aux_rew_loss = optax.squared_error(pred_rew.reshape(-1), minibatch.reward.reshape(-1))
         rew_aux_loss = jnp.sum(batch_weights * aux_rew_loss)
-        aux_loss = inv_loss + gershgorin_loss_value + rew_aux_loss
+        # Per-loss multipliers so each auxiliary term can be tuned or switched
+        # off independently (set the multiplier to 0.0 to disable a term).
+        inv_loss_mult = float(getattr(hparams, "inv_loss_mult", 1.0))
+        rew_aux_loss_mult = float(getattr(hparams, "rew_aux_loss_mult", 1.0))
+        aux_loss = (
+            inv_loss_mult * inv_loss
+            + gershgorin_loss_mult * gershgorin_loss_value
+            + rew_aux_loss_mult * rew_aux_loss
+        )
 
         source_is_offline = minibatch.extras.get("source_is_offline", None)
         # compute l2 error for logging
@@ -559,7 +592,10 @@ def make_learner_fn(
         td_loss = jnp.mean(
             per_scale * mask * critic_update_loss
         )
-        loss = td_loss + hparams.aux_loss_mult * aux_loss
+        # `td_loss_mult` scales the value/TD loss; `aux_loss_mult` scales the
+        # (already per-term weighted) auxiliary losses as a whole.
+        td_loss_mult = float(getattr(hparams, "td_loss_mult", 1.0))
+        loss = td_loss_mult * td_loss + hparams.aux_loss_mult * aux_loss
         unmasked_critic_total_loss = jnp.mean(critic_update_loss) + hparams.aux_loss_mult * aux_loss
         # Unified critic diagnostics (overall means). The per-source `_offline`
         # split is only added when the batch actually mixes sources (expert path).
@@ -690,6 +726,12 @@ def make_learner_fn(
         # ρ̂ is detached: actor gradients do not update DICE and DICE gradients do not update actor.
         rho = jax.lax.stop_gradient(minibatch.extras["sr_dice_ratio"].reshape(-1))
         rho = jnp.clip(rho, a_min=1e-5, a_max=None)
+        # Self-normalize ρ so the effective actor step size does not scale with
+        # E_D[ρ] (the SR-DICE solution has an uncalibrated magnitude). After this
+        # the weights average to 1, so the policy-improvement gradient magnitude
+        # is decoupled from the absolute scale of the fitted ratio.
+        if getattr(hparams, "normalize_sr_dice_ratio", True):
+            rho = rho / (jnp.mean(rho) + 1e-8)
         dice_actor_loss = jnp.mean(rho * actor_loss.reshape(-1))
 
         # Keep KL/entropy unchanged
@@ -777,10 +819,17 @@ def make_learner_fn(
         )
         return train_state.replace(target_critic=train_state.target_critic.replace(params=target_params))
 
-    def replace_dice_param(state, name, grad, lr):
-        new_params = {**state.params}
-        new_params[name] = state.params[name] - lr * grad
-        return state.replace(params=new_params)
+    dice_optimizers = make_dice_optimizers(hparams)
+
+    def apply_dice_update(state, name, grad):
+        """Adam update for a single SR-DICE / representation parameter."""
+        optimizer = dice_optimizers[name]
+        opt_state = state.dice_opt_state[name]
+        updates, new_opt_state = optimizer.update(grad, opt_state, state.params[name])
+        new_param = optax.apply_updates(state.params[name], updates)
+        new_params = {**state.params, name: new_param}
+        new_dice_opt_state = {**state.dice_opt_state, name: new_opt_state}
+        return state.replace(params=new_params, dice_opt_state=new_dice_opt_state)
 
     def critic_update(train_state: REPPOTrainState, minibatch: Transition):
         critic_grad_fn = jax.value_and_grad(critic_loss_fn, argnums=(0, 1, 2, 3), has_aux=True)
@@ -800,12 +849,9 @@ def make_learner_fn(
         critic_train_state = train_state.critic.apply_gradients(critic_grads)
         train_state = train_state.replace(critic=critic_train_state)
 
-        batch_norm_phi_lr = float(getattr(hparams, "batch_norm_phi_lr", getattr(hparams, "sr_dice_lr", 1e-3)))
-        train_state = replace_dice_param(train_state, "batch_norm_phi_scale", bn_scale_grad, batch_norm_phi_lr)
-        train_state = replace_dice_param(train_state, "batch_norm_phi_bias", bn_bias_grad, batch_norm_phi_lr)
-
-        feature_dynamics_lr = float(getattr(hparams, "feature_dynamics_lr", getattr(hparams, "sr_dice_lr", 1e-3)))
-        train_state = replace_dice_param(train_state, "feature_dynamics_F", feature_dynamics_grad, feature_dynamics_lr)
+        train_state = apply_dice_update(train_state, "batch_norm_phi_scale", bn_scale_grad)
+        train_state = apply_dice_update(train_state, "batch_norm_phi_bias", bn_bias_grad)
+        train_state = apply_dice_update(train_state, "feature_dynamics_F", feature_dynamics_grad)
 
         return polyak_update_target_critic(train_state), output[1]
 
@@ -834,7 +880,6 @@ def make_learner_fn(
     #   sr_dice_nu:       ρ(s,a) = φ_bn(s,a)^Tν
     def dice_update(train_state: REPPOTrainState, minibatch: Transition, initial_obs: jax.Array):
         dice_key = minibatch.extras["dice_key"]
-        dice_lr = float(getattr(hparams, "sr_dice_lr", 1e-3))
 
         # 1) Successor-feature update: update S only.
         def successor_loss_fn(successor_matrix):
@@ -857,7 +902,7 @@ def make_learner_fn(
         )
         successor_grad = jnp.nan_to_num(successor_grad, nan=0.0, posinf=1.0, neginf=-1.0)
         successor_grad_norm = jnp.linalg.norm(successor_grad)
-        train_state = replace_dice_param(train_state, "sr_dice_successor", successor_grad, dice_lr)
+        train_state = apply_dice_update(train_state, "sr_dice_successor", successor_grad)
 
         # 2) Ratio update: update ν only. S is fixed for this step.
         def ratio_loss_fn(nu):
@@ -880,7 +925,7 @@ def make_learner_fn(
         )
         ratio_grad = jnp.nan_to_num(ratio_grad, nan=0.0, posinf=1.0, neginf=-1.0)
         ratio_grad_norm = jnp.linalg.norm(ratio_grad)
-        train_state = replace_dice_param(train_state, "sr_dice_nu", ratio_grad, dice_lr)
+        train_state = apply_dice_update(train_state, "sr_dice_nu", ratio_grad)
 
         dice_metrics = {
             **ratio_metrics,
