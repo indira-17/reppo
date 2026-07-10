@@ -732,7 +732,14 @@ def make_learner_fn(
         # is decoupled from the absolute scale of the fitted ratio.
         if getattr(hparams, "normalize_sr_dice_ratio", True):
             rho = rho / (jnp.mean(rho) + 1e-8)
-        dice_actor_loss = jnp.mean(rho * actor_loss.reshape(-1))
+        # Ablation switch: when off, use the unweighted (plain REPPO/SAC)
+        # policy-improvement objective. This isolates whether the SR-DICE
+        # reweighting is what regresses training; DICE is still trained and
+        # logged either way.
+        if getattr(hparams, "use_sr_dice_ratio", True):
+            dice_actor_loss = jnp.mean(rho * actor_loss.reshape(-1))
+        else:
+            dice_actor_loss = jnp.mean(actor_loss.reshape(-1))
 
         # Keep KL/entropy unchanged
         kl_mean = kl.reshape(-1).mean()
