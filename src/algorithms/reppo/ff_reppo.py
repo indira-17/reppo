@@ -128,21 +128,22 @@ def fit_sr_dice_ratio(
     phi, next_phi = jnp.split(joint_phi, 2, axis=0)
 
     nu = dice_params["sr_dice_nu"]
-    successor_matrix = dice_params["sr_dice_successor"]
 
-    # Trainable successor features: ψ(s,a) = φ(s,a)S.
-    psi = phi @ successor_matrix
-    next_psi_target = jax.lax.stop_gradient(next_phi @ successor_matrix)
-    bootstrap = (1.0 - done.reshape(-1)) * (1.0 - truncated.reshape(-1))
-    successor_target = phi + hparams.gamma * bootstrap[:, None] * next_psi_target
-    successor_residual = psi - successor_target
-    successor_loss = jnp.sum(valid_weights * 0.5 * jnp.sum(jnp.square(successor_residual), axis=-1))
+    # Direct-solve successor features (row form): ψ(s,a)ᵀ = φ_bn(s,a)ᵀ(I − γF)⁻¹.
+    # Exact linear solve using the Gershgorin-stabilized feature dynamics F, so ψ
+    # inherits F's stability instead of a separately bootstrapped successor matrix.
+    feature_dynamics = jax.lax.stop_gradient(dice_params["feature_dynamics_F"])
+    feature_dim = phi.shape[-1]
+    identity = jnp.eye(feature_dim, dtype=phi.dtype)
+    successor_right_transform = jnp.linalg.solve(
+        identity - hparams.gamma * feature_dynamics, identity
+    )
 
     # For independently sampled s₀ ∼ d₀, draw a₀ ∼ πₖ(·|s₀) and evaluate ψ(s₀,a₀).
     start_action = sample_actor_action(actor_ref, initial_obs, start_action_key, discrete_actions)
     start_phi_raw = jax.lax.stop_gradient(critic_ref(initial_obs, start_action)["embed"])
     start_phi = batch_norm_phi(start_phi_raw, bn_scale, bn_bias)
-    successor_start_phi = start_phi @ successor_matrix
+    successor_start_phi = start_phi @ successor_right_transform
     successor_start_mean = successor_start_phi.mean(axis=0)
 
     # Original SR-DICE least-squares ratio: ρ(s,a) = φ(s,a)^Tν.
@@ -157,9 +158,8 @@ def fit_sr_dice_ratio(
     gram = phi.T @ (weight_column * phi)
 
     metrics = {
-        "sr_dice/total_dice_loss": ratio_loss + successor_loss,
+        "sr_dice/total_dice_loss": ratio_loss,
         "sr_dice/ratio_loss": ratio_loss,
-        "sr_dice/successor_loss": successor_loss,
         "sr_dice/rho_mean": rho.mean(),
     }
     return rho.reshape(batch.done.shape), metrics
@@ -731,7 +731,14 @@ def make_learner_fn(
         # Self-normalize ρ so the effective actor step size does not scale with E_D[ρ].
         if getattr(hparams, "normalize_sr_dice_ratio", True):
             rho = rho / (jnp.mean(rho) + 1e-8)
-        dice_actor_loss = jnp.mean(rho * actor_loss.reshape(-1))
+        # Ablation switch: when off, use the unweighted (plain REPPO/SAC)
+        # policy-improvement objective. This isolates whether the SR-DICE
+        # reweighting is what regresses training; DICE is still trained and
+        # logged either way.
+        if getattr(hparams, "use_sr_dice_ratio", True):
+            dice_actor_loss = jnp.mean(rho * actor_loss.reshape(-1))
+        else:
+            dice_actor_loss = jnp.mean(actor_loss.reshape(-1))
 
         # Keep KL/entropy unchanged
         kl_mean = kl.reshape(-1).mean()
@@ -874,36 +881,13 @@ def make_learner_fn(
         return train_state.replace(actor=actor_train_state), {**actor_metrics, "actor_diag/grad_norm": grad_norm}
 
     # Train/log SR-DICE from replay minibatches, like a separate critic-style estimator.
-    # Both DICE components are persistent linear layers:
-    #   sr_dice_successor: ψ(s,a) = φ_bn(s,a)S
-    #   sr_dice_nu:       ρ(s,a) = φ_bn(s,a)^Tν
+    # ρ(s,a) = φ_bn(s,a)^Tν is the only persistent DICE parameter; the successor
+    # features ψ are solved directly from F inside fit_sr_dice_ratio.
     def dice_update(train_state: REPPOTrainState, minibatch: Transition, initial_obs: jax.Array):
         dice_key = minibatch.extras["dice_key"]
 
-        # 1) Successor-feature update: update S only.
-        def successor_loss_fn(successor_matrix):
-            dice_params = {
-                **train_state.params,
-                "sr_dice_nu": jax.lax.stop_gradient(train_state.params["sr_dice_nu"]),
-                "sr_dice_successor": successor_matrix,
-                "feature_dynamics_F": jax.lax.stop_gradient(train_state.params["feature_dynamics_F"]),
-                "batch_norm_phi_scale": jax.lax.stop_gradient(train_state.params["batch_norm_phi_scale"]),
-                "batch_norm_phi_bias": jax.lax.stop_gradient(train_state.params["batch_norm_phi_bias"]),
-            }
-            _, dice_metrics = fit_sr_dice_ratio(
-                dice_key, dice_params, train_state, minibatch,
-                initial_obs, hparams, action_space, discrete_actions
-            )
-            return dice_metrics["sr_dice/successor_loss"], dice_metrics
-
-        (successor_loss, successor_metrics), successor_grad = jax.value_and_grad(successor_loss_fn, has_aux=True)(
-            train_state.params["sr_dice_successor"]
-        )
-        successor_grad = jnp.nan_to_num(successor_grad, nan=0.0, posinf=1.0, neginf=-1.0)
-        successor_grad_norm = jnp.linalg.norm(successor_grad)
-        train_state = apply_dice_update(train_state, "sr_dice_successor", successor_grad)
-
-        # 2) Ratio update: update ν only. S is fixed for this step.
+        # Ratio update: update ν only. Successor features ψ are solved directly from
+        # the (Gershgorin-stabilized) F, so there is no successor-matrix TD step.
         def ratio_loss_fn(nu):
             dice_params = {
                 **train_state.params,
@@ -928,10 +912,9 @@ def make_learner_fn(
 
         dice_metrics = {
             **ratio_metrics,
-            "sr_dice/successor_loss": successor_loss,
             "sr_dice/ratio_loss": ratio_loss,
-            "sr_dice/total_dice_loss": successor_loss + ratio_loss,
-            "sr_dice/grad_norm": successor_grad_norm + ratio_grad_norm,
+            "sr_dice/total_dice_loss": ratio_loss,
+            "sr_dice/grad_norm": ratio_grad_norm,
         }
         return train_state, dice_metrics
 
