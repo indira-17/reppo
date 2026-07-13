@@ -103,6 +103,11 @@ def compute_successor_start_mean(
         (identity - hparams.gamma * feature_dynamics).T + solve_ridge * identity,
         start_phi_mean,
     )
+    # Augment with the constant feature: ψ of a constant 1 is Σ_t γ^t = 1/(1−γ).
+    # This extra component makes (1−γ)·E[ψ₀] contribute exactly 1 to the anchor, which
+    # normalizes E_D[ρ]→1 for the constant-augmented ratio (see fit_sr_dice_ratio).
+    const_successor = jnp.array([1.0 / (1.0 - hparams.gamma)], dtype=successor_start_mean.dtype)
+    successor_start_mean = jnp.concatenate([successor_start_mean, const_successor])
     return jax.lax.stop_gradient(successor_start_mean)
 
 def fit_sr_dice_ratio(
@@ -163,18 +168,19 @@ def fit_sr_dice_ratio(
 
     nu = dice_params["sr_dice_nu"]
 
-    # ρ(s,a) = φ_bn(s,a)^Tν. E_{d₀}[ψ₀] is precomputed once per learner step and
-    # passed in (hoisted out of the ν-update loop).
-    rho = phi @ nu
-    successor_start_mean = jax.lax.stop_gradient(successor_start_mean)
+    # Augment the (BN-centered) features with a constant: φ̃ = [φ_bn, 1], ρ = φ̃ᵀν.
+    # BN removes the mean from φ_bn, so a linear ρ over φ_bn alone is forced to mean ≈ 0;
+    # the constant restores the mean-1 direction a density ratio needs. Its successor
+    # feature (appended to successor_start_mean) makes the anchor normalize E_D[ρ]→1.
+    phi_aug = jnp.concatenate([phi, jnp.ones((phi.shape[0], 1), dtype=phi.dtype)], axis=1)
 
-    # GenDICE-style normalization: the penalty (E_D[ρ] − 1)² pins the ratio's mean
-    # to 1 inside the objective, so ν cannot collapse to the trivial ρ ≈ 0 solution.
-    norm_mult = float(getattr(hparams, "sr_dice_norm_mult", 0.0))
+    # ρ(s,a) = φ̃(s,a)^Tν. E_{d₀}[ψ̃₀] is precomputed once per learner step and
+    # passed in (hoisted out of the ν-update loop).
+    rho = phi_aug @ nu
+    successor_start_mean = jax.lax.stop_gradient(successor_start_mean)
     ratio_loss = (
         0.5 * jnp.sum(valid_weights * jnp.square(rho))
         - (1.0 - hparams.gamma) * jnp.dot(nu, successor_start_mean)
-        + norm_mult * (jnp.sum(valid_weights * rho) - 1.0) ** 2
     )
     gram = phi.T @ (weight_column * phi)
 
@@ -436,7 +442,8 @@ def make_init_fn(
         else:
             dummy_action = jnp.zeros((1,) + action_space.shape, dtype=jnp.float32)
         sr_dice_feature_dim = critic(dummy_obs, dummy_action)["embed"].shape[-1]
-        sr_dice_nu = jnp.zeros((sr_dice_feature_dim,), dtype=jnp.float32)
+        # +1 for the constant-augmented feature: ρ = [φ_bn, 1]^Tν (last entry is the intercept).
+        sr_dice_nu = jnp.zeros((sr_dice_feature_dim + 1,), dtype=jnp.float32)
         sr_dice_successor = jnp.eye(sr_dice_feature_dim, dtype=jnp.float32)
         feature_dynamics = jnp.eye(sr_dice_feature_dim, dtype=jnp.float32)
         batch_norm_phi_scale = jnp.ones((sr_dice_feature_dim,), dtype=jnp.float32)
