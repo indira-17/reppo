@@ -184,10 +184,17 @@ def fit_sr_dice_ratio(
     )
     gram = phi.T @ (weight_column * phi)
 
+    # Diagnostics (logging only): spread of ρ and effective sample size of the
+    # (clipped, non-negative) importance weights: ESS = (Σρ)² / Σρ² ∈ [1, N].
+    rho_flat = rho.reshape(-1)
+    rho_ess_w = jnp.clip(rho_flat, a_min=1e-5)
+    rho_ess = (jnp.sum(rho_ess_w) ** 2) / (jnp.sum(jnp.square(rho_ess_w)) + 1e-8)
     metrics = {
         "sr_dice/total_dice_loss": ratio_loss,
         "sr_dice/ratio_loss": ratio_loss,
         "sr_dice/rho_mean": rho.mean(),
+        "sr_dice/rho_std": rho_flat.std(),
+        "sr_dice/rho_ess": rho_ess,
     }
     return rho.reshape(batch.done.shape), metrics
 
@@ -561,6 +568,17 @@ def make_learner_fn(
             gamma=hparams.gamma,
             eps=gershgorin_eps,
         )
+        # Diagnostics (logging only): conditioning of G = E[φ_bn φ_bnᵀ] (λ_max/λ_min)
+        # and spectral radius of γF (power iteration; GPU-safe estimate of γ·max|eig(F)|).
+        gram_eigs = jnp.linalg.eigvalsh(jax.lax.stop_gradient(gram))
+        gram_cond = gram_eigs[-1] / jnp.clip(gram_eigs[0], a_min=1e-8)
+        F_sg = jax.lax.stop_gradient(feature_dynamics)
+        pi_v = jnp.ones((F_sg.shape[-1],), dtype=F_sg.dtype)
+        pi_v = pi_v / (jnp.linalg.norm(pi_v) + 1e-8)
+        for _ in range(15):
+            pi_v = F_sg @ pi_v
+            pi_v = pi_v / (jnp.linalg.norm(pi_v) + 1e-8)
+        gamma_F_specrad = hparams.gamma * jnp.linalg.norm(F_sg @ pi_v)
         pred_rew = critic_output["pred_rew"]
         value = critic_output["value"]
         aux_rew_loss = optax.squared_error(pred_rew.reshape(-1), minibatch.reward.reshape(-1))
@@ -650,6 +668,7 @@ def make_learner_fn(
             abs_batch_action=jnp.abs(minibatch.action).mean(),
             **inv_metrics,
             **gershgorin_metrics,
+            **{"sr_dice/gram_cond": gram_cond, "sr_dice/gamma_F_specrad": gamma_F_specrad},
             **critic_diag,
         )
 

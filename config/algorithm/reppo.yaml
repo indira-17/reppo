@@ -91,8 +91,8 @@ update_entropy_lagrangian: true
 aux_loss_mult: 1.0                # global scale on the summed auxiliary losses
 # per-loss multipliers (set to 0.0 to switch a term off)
 td_loss_mult: 1.0                 # value/TD (critic) loss
-inv_loss_mult: 1.0                # BatchNorm/F invariance loss
-gershgorin_loss_mult: 1.0         # Gershgorin spectral-stability loss
+inv_loss_mult: 0.0                # BatchNorm/F invariance loss (off for this diagnostic run)
+gershgorin_loss_mult: 0.0         # Gershgorin spectral-stability loss (off for this diagnostic run)
 rew_aux_loss_mult: 1.0            # reward-prediction auxiliary loss
 ## SR-DICE / representation optimization (Adam)
 use_sr_dice_ratio: true           # if false, actor uses the plain (unweighted) objective — isolates the SR-DICE reweighting
