@@ -72,6 +72,16 @@ def gershgorin_loss(gram: jax.Array, feature_dynamics: jax.Array, gamma: float, 
         "sr_dice/gershgorin_loss": loss,
     }
 
+def orthonormality_loss(features: jax.Array, weights: jax.Array) -> jax.Array:
+    """Orthonormality loss on the (live) encoder features φ: L = ½‖ΦᵀΞΦ − I‖²_F with
+    Ξ = diag(weights). Gradients flow into φ, pushing the feature Gram toward identity —
+    conditions G = E[φφᵀ] and prevents representation collapse.
+    """
+    feature_dim = features.shape[-1]
+    identity = jnp.eye(feature_dim, dtype=features.dtype)
+    gram = features.T @ (weights[:, None] * features)
+    return 0.5 * jnp.sum(jnp.square(gram - identity))
+
 def compute_successor_start_mean(
     key: jax.Array,
     dice_params: dict[str, jax.Array],
@@ -635,7 +645,11 @@ def make_learner_fn(
             per_scale * mask * critic_update_loss
         )
         td_loss_mult = float(getattr(hparams, "td_loss_mult", 1.0))
-        loss = td_loss_mult * td_loss + hparams.aux_loss_mult * aux_loss
+        # Orthonormality on the LIVE encoder features (curr_emb_raw): gradients flow
+        # into φ, conditioning G = ΦᵀΞΦ toward identity to prevent representation collapse.
+        orth_loss_mult = float(getattr(hparams, "orth_loss_mult", 0.0))
+        orth_loss = orthonormality_loss(curr_emb_raw, batch_weights)
+        loss = td_loss_mult * td_loss + hparams.aux_loss_mult * aux_loss + orth_loss_mult * orth_loss
         unmasked_critic_total_loss = jnp.mean(critic_update_loss) + hparams.aux_loss_mult * aux_loss
         # Unified critic diagnostics (overall means). The per-source `_offline`
         # split is only added when the batch actually mixes sources (expert path).
@@ -668,7 +682,7 @@ def make_learner_fn(
             abs_batch_action=jnp.abs(minibatch.action).mean(),
             **inv_metrics,
             **gershgorin_metrics,
-            **{"sr_dice/gram_cond": gram_cond, "sr_dice/gamma_F_specrad": gamma_F_specrad},
+            **{"sr_dice/gram_cond": gram_cond, "sr_dice/gamma_F_specrad": gamma_F_specrad, "sr_dice/orth_loss": orth_loss},
             **critic_diag,
         )
 
