@@ -72,6 +72,39 @@ def gershgorin_loss(gram: jax.Array, feature_dynamics: jax.Array, gamma: float, 
         "sr_dice/gershgorin_loss": loss,
     }
 
+def compute_successor_start_mean(
+    key: jax.Array,
+    dice_params: dict[str, jax.Array],
+    train_state: REPPOTrainState,
+    initial_obs: jax.Array,
+    hparams,
+    discrete_actions: bool,
+):
+    """E_{d₀}[ψ₀] via a single ridged linear solve (hoisted out of the ν-update loop).
+
+    ψ₀ᵀ = φ_bn(s₀,a₀)ᵀ(I − γF)⁻¹; since the linear map commutes with the mean we
+    average φ₀ first and solve ONE system instead of forming the full inverse:
+        ((I − γF)ᵀ + εI) x = mean(φ_bn(s₀,a₀)).
+    The ridge εI keeps the solve well-conditioned when F nears the 1/γ boundary.
+    """
+    actor_ref = nnx.merge(train_state.actor.graphdef, train_state.actor_target.params)
+    critic_ref = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
+    actor_ref.eval()
+    critic_ref.eval()
+    bn_scale = jax.lax.stop_gradient(dice_params["batch_norm_phi_scale"])
+    bn_bias = jax.lax.stop_gradient(dice_params["batch_norm_phi_bias"])
+    feature_dynamics = jax.lax.stop_gradient(dice_params["feature_dynamics_F"])
+    start_action = sample_actor_action(actor_ref, initial_obs, key, discrete_actions)
+    start_phi_raw = jax.lax.stop_gradient(critic_ref(initial_obs, start_action)["embed"])
+    start_phi_mean = batch_norm_phi(start_phi_raw, bn_scale, bn_bias).mean(axis=0)
+    identity = jnp.eye(start_phi_mean.shape[-1], dtype=start_phi_mean.dtype)
+    solve_ridge = float(getattr(hparams, "sr_dice_solve_ridge", 1e-5))
+    successor_start_mean = jnp.linalg.solve(
+        (identity - hparams.gamma * feature_dynamics).T + solve_ridge * identity,
+        start_phi_mean,
+    )
+    return jax.lax.stop_gradient(successor_start_mean)
+
 def fit_sr_dice_ratio(
     key: jax.Array,
     dice_params: dict[str, jax.Array],
@@ -81,6 +114,7 @@ def fit_sr_dice_ratio(
     hparams,
     action_space: Space,
     discrete_actions: bool,
+    successor_start_mean: jax.Array,
 ):
     """Trainable SR-DICE components on batch-normalized critic features.
 
@@ -88,7 +122,7 @@ def fit_sr_dice_ratio(
     ρ(s,a) = φ_bn(s,a)^T ν, where ν is a persistent linear ratio head.
     Actor and critic features are fixed for this DICE update; only S and ν are updated.
     """
-    key, next_action_key, start_action_key = jax.random.split(key, 3)
+    key, next_action_key = jax.random.split(key, 2)
     actor_ref = nnx.merge(train_state.actor.graphdef, train_state.actor_target.params)
     critic_ref = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
     actor_ref.eval()
@@ -129,31 +163,18 @@ def fit_sr_dice_ratio(
 
     nu = dice_params["sr_dice_nu"]
 
-    # Direct-solve successor features (row form): ψ(s,a)ᵀ = φ_bn(s,a)ᵀ(I − γF)⁻¹.
-    # Exact linear solve using the Gershgorin-stabilized feature dynamics F, so ψ
-    # inherits F's stability instead of a separately bootstrapped successor matrix.
-    feature_dynamics = jax.lax.stop_gradient(dice_params["feature_dynamics_F"])
-    feature_dim = phi.shape[-1]
-    identity = jnp.eye(feature_dim, dtype=phi.dtype)
-    successor_right_transform = jnp.linalg.solve(
-        identity - hparams.gamma * feature_dynamics, identity
-    )
-
-    # For independently sampled s₀ ∼ d₀, draw a₀ ∼ πₖ(·|s₀) and evaluate ψ(s₀,a₀).
-    start_action = sample_actor_action(actor_ref, initial_obs, start_action_key, discrete_actions)
-    start_phi_raw = jax.lax.stop_gradient(critic_ref(initial_obs, start_action)["embed"])
-    start_phi = batch_norm_phi(start_phi_raw, bn_scale, bn_bias)
-    successor_start_phi = start_phi @ successor_right_transform
-    successor_start_mean = successor_start_phi.mean(axis=0)
-
-    # Original SR-DICE least-squares ratio: ρ(s,a) = φ(s,a)^Tν.
+    # ρ(s,a) = φ_bn(s,a)^Tν. E_{d₀}[ψ₀] is precomputed once per learner step and
+    # passed in (hoisted out of the ν-update loop).
     rho = phi @ nu
-
-    # Ratio update must not move the successor-feature matrix.
     successor_start_mean = jax.lax.stop_gradient(successor_start_mean)
+
+    # GenDICE-style normalization: the penalty (E_D[ρ] − 1)² pins the ratio's mean
+    # to 1 inside the objective, so ν cannot collapse to the trivial ρ ≈ 0 solution.
+    norm_mult = float(getattr(hparams, "sr_dice_norm_mult", 0.0))
     ratio_loss = (
         0.5 * jnp.sum(valid_weights * jnp.square(rho))
         - (1.0 - hparams.gamma) * jnp.dot(nu, successor_start_mean)
+        + norm_mult * (jnp.sum(valid_weights * rho) - 1.0) ** 2
     )
     gram = phi.T @ (weight_column * phi)
 
@@ -728,9 +749,8 @@ def make_learner_fn(
         # ρ̂ is detached: actor gradients do not update DICE and DICE gradients do not update actor.
         rho = jax.lax.stop_gradient(minibatch.extras["sr_dice_ratio"].reshape(-1))
         rho = jnp.clip(rho, a_min=1e-5, a_max=None)
-        # Self-normalize ρ so the effective actor step size does not scale with E_D[ρ].
-        if getattr(hparams, "normalize_sr_dice_ratio", True):
-            rho = rho / (jnp.mean(rho) + 1e-8)
+        # ρ is already a normalized ratio (E_D[ρ]=1 is enforced in the DICE objective),
+        # so no post-hoc self-normalization is applied here.
         # Ablation switch: when off, use the unweighted (plain REPPO/SAC)
         # policy-improvement objective. This isolates whether the SR-DICE
         # reweighting is what regresses training; DICE is still trained and
@@ -883,7 +903,7 @@ def make_learner_fn(
     # Train/log SR-DICE from replay minibatches, like a separate critic-style estimator.
     # ρ(s,a) = φ_bn(s,a)^Tν is the only persistent DICE parameter; the successor
     # features ψ are solved directly from F inside fit_sr_dice_ratio.
-    def dice_update(train_state: REPPOTrainState, minibatch: Transition, initial_obs: jax.Array):
+    def dice_update(train_state: REPPOTrainState, minibatch: Transition, initial_obs: jax.Array, successor_start_mean: jax.Array):
         dice_key = minibatch.extras["dice_key"]
 
         # Ratio update: update ν only. Successor features ψ are solved directly from
@@ -899,7 +919,7 @@ def make_learner_fn(
             }
             _, dice_metrics = fit_sr_dice_ratio(
                 dice_key, dice_params, train_state, minibatch,
-                initial_obs, hparams, action_space, discrete_actions
+                initial_obs, hparams, action_space, discrete_actions, successor_start_mean
             )
             return dice_metrics["sr_dice/ratio_loss"], dice_metrics
 
@@ -1158,7 +1178,7 @@ def make_learner_fn(
             policy_log_prob_online = policy_log_prob_mean
 
         per_env_td_error = jnp.abs(batch.extras["action_value"] - batch.extras["target_values"]).mean(axis=0)
-        key, critic_key, sr_dice_key, ratio_key, pv_before_key, actor_key, pv_after_key = jax.random.split(key, 7)
+        key, critic_key, sr_dice_key, ratio_key, ssm_key, pv_before_key, actor_key, pv_after_key = jax.random.split(key, 8)
 
         # Critic/representation phase: πₖ is fixed and θ is not updated.
         train_state, critic_metrics = jax.lax.scan(
@@ -1168,6 +1188,12 @@ def make_learner_fn(
         )
         critic_metrics = jax.tree.map(lambda x: x[-1], critic_metrics)
 
+        # F is now fixed for the rest of this step (dice_update only touches ν), so
+        # compute E_{d₀}[ψ₀] once here and reuse it in every ν update and the final ratio.
+        successor_start_mean = compute_successor_start_mean(
+            ssm_key, train_state.params, train_state, initial_obs, hparams, discrete_actions
+        )
+
         # Train SR-DICE on replay minibatches with π_k fixed through actor_target.
         # This is amortized training: ν is updated from the buffer and carried across learner calls.
         train_state, dice_metrics = jax.lax.scan(
@@ -1175,7 +1201,7 @@ def make_learner_fn(
                 epoch_key,
                 state,
                 batch,
-                lambda s, mb: dice_update(s, mb, initial_obs),
+                lambda s, mb: dice_update(s, mb, initial_obs, successor_start_mean),
             ),
             train_state,
             jax.random.split(sr_dice_key, 1),
@@ -1183,7 +1209,7 @@ def make_learner_fn(
         dice_metrics = jax.tree.map(lambda x: x[-1], dice_metrics)
 
         # Compute the latest fitted ratio once, detach it, and pass it to the actor phase.
-        sr_dice_ratio, _ = fit_sr_dice_ratio(ratio_key, train_state.params, train_state, batch, initial_obs, hparams, action_space, discrete_actions)
+        sr_dice_ratio, _ = fit_sr_dice_ratio(ratio_key, train_state.params, train_state, batch, initial_obs, hparams, action_space, discrete_actions, successor_start_mean)
         batch = batch.replace(
             extras={
                 **batch.extras,
