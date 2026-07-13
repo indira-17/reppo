@@ -96,7 +96,8 @@ gershgorin_loss_mult: 1.0         # Gershgorin spectral-stability loss
 rew_aux_loss_mult: 1.0            # reward-prediction auxiliary loss
 ## SR-DICE / representation optimization (Adam)
 use_sr_dice_ratio: true           # if false, actor uses the plain (unweighted) objective — isolates the SR-DICE reweighting
-normalize_sr_dice_ratio: true     # self-normalize ρ in the actor policy-improvement term
+sr_dice_norm_mult: 1.0            # GenDICE-style penalty weight enforcing E_D[ρ]=1 (0 = off)
+sr_dice_solve_ridge: 1.0e-5       # ridge εI on the (I−γF) successor solve for conditioning
 sr_dice_lr: 1.0e-3                 # lr for ν (ratio) and S (successor features)
 batch_norm_phi_lr: 1.0e-3         # lr for the φ BatchNorm affine parameters
 feature_dynamics_lr: 1.0e-3       # lr for the feature-dynamics matrix F
