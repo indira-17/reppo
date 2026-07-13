@@ -537,19 +537,12 @@ def make_learner_fn(
         value = critic_output["value"]
         aux_rew_loss = optax.squared_error(pred_rew.reshape(-1), minibatch.reward.reshape(-1))
         rew_aux_loss = jnp.sum(batch_weights * aux_rew_loss)
-        # Soft S–F coupling: L = ||(I - γF)·sg(S) - I||_F^2.
-        # Ties F to the TD-fit successor S ≈ (I - γF)^{-1} so F is also shaped by the. discounted (multi-horizon) successor structure, not just the 1-step invariance loss.
-        couple_sf_loss_mult = float(getattr(hparams, "couple_sf_loss_mult", 0.0))
-        successor_matrix = jax.lax.stop_gradient(train_state.params["sr_dice_successor"])
-        fd_identity = jnp.eye(feature_dynamics.shape[-1], dtype=feature_dynamics.dtype)
-        couple_sf_loss = jnp.sum(jnp.square((fd_identity - hparams.gamma * feature_dynamics) @ successor_matrix - fd_identity))
         inv_loss_mult = float(getattr(hparams, "inv_loss_mult", 1.0))
         rew_aux_loss_mult = float(getattr(hparams, "rew_aux_loss_mult", 1.0))
         aux_loss = (
             inv_loss_mult * inv_loss
             + gershgorin_loss_mult * gershgorin_loss_value
             + rew_aux_loss_mult * rew_aux_loss
-            + couple_sf_loss_mult * couple_sf_loss
         )
 
         source_is_offline = minibatch.extras.get("source_is_offline", None)
@@ -630,7 +623,6 @@ def make_learner_fn(
             **inv_metrics,
             **gershgorin_metrics,
             **critic_diag,
-            **{"sr_dice/couple_sf_loss": couple_sf_loss}
         )
 
     def actor_loss(
