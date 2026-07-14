@@ -24,19 +24,6 @@ from src.algorithms import utils
 
 logging.basicConfig(level=logging.INFO)
 
-def batch_norm_phi_stats(features: jax.Array):
-    mean = features.mean(axis=0, keepdims=True)
-    var = jnp.mean(jnp.square(features - mean), axis=0, keepdims=True)
-    return mean, var
-
-def apply_batch_norm_phi(features: jax.Array, mean: jax.Array, var: jax.Array, scale: jax.Array, bias: jax.Array, eps: float = 1e-5) -> jax.Array:
-    return ((features - mean) / jnp.sqrt(var + eps)) * scale + bias
-
-def batch_norm_phi(features: jax.Array, scale: jax.Array, bias: jax.Array, eps: float = 1e-5) -> jax.Array:
-    """Trainable batch normalization for critic features φ."""
-    mean, var = batch_norm_phi_stats(features)
-    return apply_batch_norm_phi(features, mean, var, scale, bias, eps)
-
 def clip_action_for_critic(action: jax.Array, action_space: Space) -> jax.Array:
     return action.clip(-0.999, 0.999) if isinstance(action_space, Box) else action
 
@@ -142,7 +129,7 @@ def invariance_aux_loss(
 
         L_inv = 1/2 E_{ξ_k}[||f_φ(s,a) - sg(φ(s',a'))||²].
 
-    The prediction and target inputs are batch-normalized with the same trainable
+    The prediction and target inputs use the same saved normalization state and
     affine parameters used by Gershgorin, successor features, and SR-DICE.
     """
     target = jax.lax.stop_gradient(next_features_target)
@@ -287,20 +274,11 @@ def make_policy_fn(
 
 
 def make_dice_optimizers(hparams) -> dict[str, optax.GradientTransformation]:
-    """Adam optimizers for the SR-DICE / representation parameters.
-
-    Defined once so make_init_fn (optimizer-state init) and make_learner_fn
-    (parameter updates) build identical transforms. Each parameter gets its own
-    Adam state so their moment estimates and step counts do not interfere.
-    """
     sr_dice_lr = float(getattr(hparams, "sr_dice_lr", 1e-3))
-    batch_norm_phi_lr = float(getattr(hparams, "batch_norm_phi_lr", sr_dice_lr))
-    return {
-        "sr_dice_nu": optax.adam(sr_dice_lr),
-        "sr_dice_successor": optax.adam(sr_dice_lr),
-        "batch_norm_phi_scale": optax.adam(batch_norm_phi_lr),
-        "batch_norm_phi_bias": optax.adam(batch_norm_phi_lr),
-    }
+    optimizers = {"sr_dice_nu": optax.adam(sr_dice_lr), "sr_dice_successor": optax.adam(sr_dice_lr)}
+    if bool(getattr(hparams, "train_batch_norm_phi", False)):
+        optimizers["batch_norm_phi"] = optax.adam(float(getattr(hparams, "batch_norm_phi_lr", sr_dice_lr)))
+    return optimizers
 
 def make_init_fn(
     cfg: DictConfig,
@@ -377,25 +355,20 @@ def make_init_fn(
             dummy_action = jnp.zeros((1,), dtype=jnp.int32)
         else:
             dummy_action = jnp.zeros((1,) + action_space.shape, dtype=jnp.float32)
+        
         sr_dice_feature_dim = critic(dummy_obs, dummy_action)["embed"].shape[-1]
         sr_dice_nu = jnp.zeros((sr_dice_feature_dim,), dtype=jnp.float32)
         sr_dice_successor = jnp.eye(sr_dice_feature_dim, dtype=jnp.float32)
-        batch_norm_phi_scale = jnp.ones((sr_dice_feature_dim,), dtype=jnp.float32)
-        batch_norm_phi_bias = jnp.zeros((sr_dice_feature_dim,), dtype=jnp.float32)
-
-        dice_params = {
-            "sr_dice_nu": sr_dice_nu,
-            "sr_dice_successor": sr_dice_successor,
-            "batch_norm_phi_scale": batch_norm_phi_scale,
-            "batch_norm_phi_bias": batch_norm_phi_bias,
-        }
+       
+        batch_norm_phi = nnx.BatchNorm(sr_dice_feature_dim, rngs=rngs)
+        batch_norm_phi_graphdef, batch_norm_phi_params, batch_norm_phi_stats = nnx.split(batch_norm_phi, nnx.Param, nnx.BatchStat)
+        
+        dice_params = {"sr_dice_nu": sr_dice_nu, "sr_dice_successor": sr_dice_successor, "batch_norm_phi": batch_norm_phi_params, "batch_norm_phi_stats": batch_norm_phi_stats}
         dice_optimizers = make_dice_optimizers(hparams)
-        dice_opt_state = {
-            name: dice_optimizers[name].init(dice_params[name]) for name in dice_params
-        }
+        dice_opt_state = {name: optimizer.init(dice_params[name]) for name, optimizer in dice_optimizers.items()}
 
         return REPPOTrainState.create(
-            graphdef=nnx.graphdef(actor),
+            graphdef=batch_norm_phi_graphdef,
             params=dice_params,
             tx=optax.set_to_zero(),
             dice_opt_state=dice_opt_state,
@@ -432,13 +405,7 @@ def make_learner_fn(
     discrete_actions = isinstance(action_space, Discrete)
     d = action_space.shape[-1] if not discrete_actions else action_space.n
 
-    def critic_loss_fn(
-        params: nnx.Param,
-        batch_norm_phi_scale: jax.Array,
-        batch_norm_phi_bias: jax.Array,
-        train_state: REPPOTrainState,
-        minibatch: Transition,
-    ):
+    def critic_loss_fn(params: nnx.Param, batch_norm_phi_params, batch_norm_phi_stats, train_state: REPPOTrainState, minibatch: Transition):
         critic_model = nnx.merge(train_state.critic.graphdef, params)
         critic_model.train()
 
@@ -480,12 +447,14 @@ def make_learner_fn(
         invariance_weights = sample_weights * continuation
         invariance_weights = invariance_weights / jnp.maximum(invariance_weights.sum(), 1.0)
 
-        # Current, next, and predicted features all use one shared normalized φ-space.
-        joint_emb_raw = jnp.concatenate([curr_emb_raw, next_emb_raw], axis=0)
-        phi_mean, phi_var = batch_norm_phi_stats(joint_emb_raw)
-        joint_emb = apply_batch_norm_phi(joint_emb_raw, phi_mean, phi_var, batch_norm_phi_scale, batch_norm_phi_bias)
-        curr_emb, next_emb = jnp.split(joint_emb, 2, axis=0)
-        pred_emb = apply_batch_norm_phi(critic_output["pred_features"], phi_mean, phi_var, batch_norm_phi_scale, batch_norm_phi_bias)
+        batch_norm_phi = nnx.merge(train_state.graphdef, batch_norm_phi_params, batch_norm_phi_stats)
+        batch_norm_phi.train()
+        
+        joint_emb = batch_norm_phi(jnp.concatenate([curr_emb_raw, next_emb_raw, critic_output["pred_features"]], axis=0))
+        curr_emb, next_emb, pred_emb = jnp.split(joint_emb, [batch_size, 2 * batch_size], axis=0)
+        
+        batch_norm_phi_stats = nnx.state(batch_norm_phi, nnx.BatchStat)
+        
         inv_loss, inv_metrics = invariance_aux_loss(pred_emb, next_emb, invariance_weights)
 
         gershgorin_eps = float(getattr(hparams, "gershgorin_eps", 1e-5))
@@ -566,7 +535,7 @@ def make_learner_fn(
         }
 
 
-        return loss, {
+        return loss, ({
             "critic_update_loss": critic_update_loss,
             "masked_critic_total_loss": loss,
             "unmasked_critic_total_loss": unmasked_critic_total_loss,
@@ -577,7 +546,7 @@ def make_learner_fn(
             **inv_metrics,
             **gershgorin_metrics,
             **critic_diag,
-        }
+        }, batch_norm_phi_stats)
 
     def actor_loss(
         params: nnx.Param, train_state: REPPOTrainState, minibatch: Transition
@@ -775,7 +744,7 @@ def make_learner_fn(
 
     dice_optimizers = make_dice_optimizers(hparams)
 
-    def apply_bn_update(state, name, grad):
+    def apply_dice_update(state, name, grad):
         """Adam update for a single SR-DICE / representation parameter."""
         optimizer = dice_optimizers[name]
         opt_state = state.dice_opt_state[name]
@@ -785,22 +754,24 @@ def make_learner_fn(
         new_dice_opt_state = {**state.dice_opt_state, name: new_opt_state}
         return state.replace(params=new_params, dice_opt_state=new_dice_opt_state)
 
+    train_batch_norm_phi = bool(getattr(hparams, "train_batch_norm_phi", False))
+
     def critic_update(train_state: REPPOTrainState, minibatch: Transition):
-        critic_grad_fn = jax.value_and_grad(critic_loss_fn, argnums=(0, 1, 2), has_aux=True)
-        output, (critic_grads, bn_scale_grad, bn_bias_grad) = critic_grad_fn(
-            train_state.critic.params,
-            train_state.params["batch_norm_phi_scale"],
-            train_state.params["batch_norm_phi_bias"],
-            train_state,
-            minibatch,
-        )
+        if train_batch_norm_phi:
+            critic_grad_fn = jax.value_and_grad(critic_loss_fn, argnums=(0, 1), has_aux=True)
+            output, (critic_grads, batch_norm_phi_grads) = critic_grad_fn(train_state.critic.params, train_state.params["batch_norm_phi"], train_state.params["batch_norm_phi_stats"], train_state, minibatch)
+            batch_norm_phi_grads = jax.tree.map(lambda x: jnp.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0), batch_norm_phi_grads)
+        else:
+            critic_grad_fn = jax.value_and_grad(critic_loss_fn, argnums=0, has_aux=True)
+            output, critic_grads = critic_grad_fn(train_state.critic.params, jax.tree.map(jax.lax.stop_gradient, train_state.params["batch_norm_phi"]), train_state.params["batch_norm_phi_stats"], train_state, minibatch)
+        critic_metrics, batch_norm_phi_stats = output[1]
         critic_grads = jax.tree.map(lambda x: jnp.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0), critic_grads)
-        bn_scale_grad = jnp.nan_to_num(bn_scale_grad, nan=0.0, posinf=1.0, neginf=-1.0)
-        bn_bias_grad = jnp.nan_to_num(bn_bias_grad, nan=0.0, posinf=1.0, neginf=-1.0)
         train_state = train_state.replace(critic=train_state.critic.apply_gradients(critic_grads))
-        train_state = apply_bn_update(train_state, "batch_norm_phi_scale", bn_scale_grad)
-        train_state = apply_bn_update(train_state, "batch_norm_phi_bias", bn_bias_grad)
-        return train_state, output[1]
+       
+        if train_batch_norm_phi:
+            train_state = apply_dice_update(train_state, "batch_norm_phi", batch_norm_phi_grads)
+        train_state = train_state.replace(params={**train_state.params, "batch_norm_phi_stats": batch_norm_phi_stats})
+        return train_state, critic_metrics
 
     def actor_update(train_state: REPPOTrainState, minibatch: Transition):
         def update_actor(_):
@@ -859,21 +830,16 @@ def make_learner_fn(
         all_action = jnp.concatenate([behavior_action, next_action, start_action], axis=0)
         all_phi_raw = jax.lax.stop_gradient(critic_ref(all_obs, all_action)["embed"])
         
+        batch_norm_phi = nnx.merge(train_state.graphdef, train_state.params["batch_norm_phi"], train_state.params["batch_norm_phi_stats"])
+        batch_norm_phi.train()
+        all_phi = batch_norm_phi(all_phi_raw)
         batch_size = obs.shape[0]
-        curr_phi_raw, next_phi_raw, start_phi_raw = jnp.split(all_phi_raw, [batch_size, 2 * batch_size], axis=0)
-        phi_mean, phi_var = batch_norm_phi_stats(jnp.concatenate([curr_phi_raw, next_phi_raw], axis=0))
-        
-        bn_scale = jax.lax.stop_gradient(train_state.params["batch_norm_phi_scale"])
-        bn_bias = jax.lax.stop_gradient(train_state.params["batch_norm_phi_bias"])
-        
-        curr_phi = apply_batch_norm_phi(curr_phi_raw, phi_mean, phi_var, bn_scale, bn_bias)
-        next_phi = apply_batch_norm_phi(next_phi_raw, phi_mean, phi_var, bn_scale, bn_bias)
-        start_phi = apply_batch_norm_phi(start_phi_raw, phi_mean, phi_var, bn_scale, bn_bias)
+        curr_phi, next_phi, start_phi = jnp.split(all_phi, [batch_size, 2 * batch_size], axis=0)
         curr_phi = curr_phi.reshape((*batch.done.shape, curr_phi.shape[-1]))
         next_phi = next_phi.reshape((*batch.done.shape, next_phi.shape[-1]))
-        
         batch = batch.replace(extras={**batch.extras, "sr_dice_phi": curr_phi, "sr_dice_next_phi": next_phi})
-        return batch, start_phi
+        train_state = train_state.replace(params={**train_state.params, "batch_norm_phi_stats": nnx.state(batch_norm_phi, nnx.BatchStat)})
+        return train_state, batch, start_phi
 
     def successor_update(train_state: REPPOTrainState, minibatch: Transition):
         """Update only S_k from cached fixed post-critic features."""
@@ -889,7 +855,7 @@ def make_learner_fn(
 
         (successor_loss, successor_metrics), successor_grad = jax.value_and_grad(successor_loss_fn, has_aux=True)(train_state.params["sr_dice_successor"])
         successor_grad = jnp.nan_to_num(successor_grad, nan=0.0, posinf=1.0, neginf=-1.0)
-        train_state = apply_bn_update(train_state, "sr_dice_successor", successor_grad)
+        train_state = apply_dice_update(train_state, "sr_dice_successor", successor_grad)
         return train_state, {"sr_dice/successor_loss": successor_loss}
 
     def ratio_update(train_state: REPPOTrainState, minibatch: Transition, successor_start_mean: jax.Array):
@@ -901,7 +867,7 @@ def make_learner_fn(
 
         (ratio_loss, ratio_metrics), ratio_grad = jax.value_and_grad(ratio_loss_fn, has_aux=True)(train_state.params["sr_dice_nu"])
         ratio_grad = jnp.nan_to_num(ratio_grad, nan=0.0, posinf=1.0, neginf=-1.0)
-        train_state = apply_bn_update(train_state, "sr_dice_nu", ratio_grad)
+        train_state = apply_dice_update(train_state, "sr_dice_nu", ratio_grad)
         return train_state, {
             "sr_dice/ratio_loss": ratio_loss,
             "sr_dice/rho_mean": ratio_metrics["sr_dice/rho_mean"],
@@ -1144,8 +1110,14 @@ def make_learner_fn(
     def learner_fn(
         key: Key, train_state: REPPOTrainState, batch: Transition
     ) -> tuple[REPPOTrainState, dict[str, jax.Array]]:
-        # SR-DICE is always fitted and logged. `use_sr_dice_ratio` controls only
-        # whether the detached fitted ratio weights the actor objective.
+        # Snapshot the live actor here so this epoch is the local update pi_k -> pi_{k+1}, with KL measured against pi_k.
+        train_state = train_state.replace(
+            actor_target=train_state.actor_target.replace(
+                params=train_state.actor.params
+            )
+        )
+
+        # SR-DICE is always fitted and logged. `use_sr_dice_ratio` controls only whether the detached fitted ratio weights the actor objective.
         if "initial_obs" not in batch.extras:
             raise KeyError("SR-DICE diagnostics require a separately sampled batch.extras['initial_obs'] with s₀ ∼ d₀.")
         initial_obs = batch.extras.get("initial_obs", None)
@@ -1184,7 +1156,9 @@ def make_learner_fn(
         train_state = polyak_update_target_critic(train_state)
 
         # Cache the final fixed φ_k once; S_k, ν_k, and ρ reuse these tensors without network forwards.
-        batch, start_phi = cache_sr_dice_features(cache_key, train_state, batch, initial_obs)
+        train_state, batch, start_phi = cache_sr_dice_features(
+            cache_key, train_state, batch, initial_obs
+        )
 
         # Fit the separate successor-feature matrix S_k by semi-gradient TD.
         train_state, successor_metrics = jax.lax.scan(

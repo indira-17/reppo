@@ -583,7 +583,6 @@ def make_loop_train_fn(
 
                     buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
 
-                state = state.replace(actor_target=state.actor_target.replace(params=state.actor.params))
                 for _ in range(num_epochs):
                     key, learn_key, sample_key, initial_key = jax.random.split(key, 4)
                     # initial_obs is sampled only from the post-auto-reset state pool, so s₀ ∼ d₀.

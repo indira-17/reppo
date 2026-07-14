@@ -91,10 +91,10 @@ update_entropy_lagrangian: true
 aux_loss_mult: 1.0                # global scale on the summed auxiliary losses
 # per-loss multipliers (set to 0.0 to switch a term off)
 td_loss_mult: 1.0                 # value/TD (critic) loss
-inv_loss_mult: 1.0                # BatchNorm/F invariance loss (off for this diagnostic run)
-gershgorin_loss_mult: 0.5         # Gershgorin spectral-stability loss (off for this diagnostic run)
+inv_loss_mult: 0.0                # BatchNorm/F invariance loss (off for this diagnostic run)
+gershgorin_loss_mult: 0.0         # Gershgorin spectral-stability loss (off for this diagnostic run)
 rew_aux_loss_mult: 1.0            # reward-prediction auxiliary loss
-orth_loss_mult: 1.0               # orthonormality ‖ΦᵀΞΦ−I‖² on live encoder φ (conditions G / anti-collapse)
+orth_loss_mult: 0.0              # orthonormality ‖ΦᵀΞΦ−I‖² on live encoder φ (conditions G / anti-collapse)
 ## SR-DICE / representation optimization (Adam)
 use_sr_dice_ratio: false          # off for this experiment; ρ still computed/logged
 sr_dice_solve_ridge: 1.0e-5       # ridge εI on the (I−γF) successor solve for conditioning
