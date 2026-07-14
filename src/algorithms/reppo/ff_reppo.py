@@ -800,7 +800,6 @@ def make_learner_fn(
                 "actor_diag/actor_loss": zero,
                 "actor_diag/sr_dice_ratio_mean": jax.lax.stop_gradient(minibatch.extras["sr_dice_ratio"].mean()),
                 "actor_diag/real_action_log_prob": zero,
-                "actor_diag/replay_action_log_prob": zero,
             }
             return train_state.actor, zero, actor_metrics
 

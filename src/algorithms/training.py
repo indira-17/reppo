@@ -304,6 +304,7 @@ def make_scan_train_fn(
 
             return (state, buffer_state), update_metrics
 
+        state = state.replace(actor_target=state.actor_target.replace(params=state.actor.params))
         (state, buffer_state), epoch_metrics = jax.lax.scan(
             replay_epoch,
             (state, buffer_state),
