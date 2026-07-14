@@ -61,7 +61,7 @@ def gershgorin_loss(
     off_diag_radius = jnp.sum(jnp.abs(td_matrix), axis=-1) - jnp.abs(diag)
     margin = diag - off_diag_radius
     violation = jax.nn.relu(eps - margin)
-    loss = jnp.sum(violation)
+    loss = jnp.sum(violation) / td_matrix.size
 
     return loss, td_matrix, {
         "sr_dice/gershgorin_loss": loss,
@@ -689,8 +689,7 @@ def make_learner_fn(
 
         loss = jnp.squeeze(loss)
 
-        replay_action_log_prob = old_pi.log_prob(clip_action_for_critic(minibatch.action, action_space)).mean()
-        real_action_log_prob = -entropy_mean
+        real_action_log_prob = old_pi.log_prob(clip_action_for_critic(minibatch.action, action_space)).mean()
         
         return loss, dict(
             temp=temperature,
@@ -704,7 +703,6 @@ def make_learner_fn(
                 "actor_diag/actor_loss": dice_actor_loss,
                 "actor_diag/sr_dice_ratio_mean": rho.mean(),
                 "actor_diag/real_action_log_prob": real_action_log_prob,
-                "actor_diag/replay_action_log_prob": replay_action_log_prob,
             },
         )
 
@@ -1114,11 +1112,6 @@ def make_learner_fn(
         key: Key, train_state: REPPOTrainState, batch: Transition
     ) -> tuple[REPPOTrainState, dict[str, jax.Array]]:
         # Snapshot the live actor here so this epoch is the local update pi_k -> pi_{k+1}, with KL measured against pi_k.
-        train_state = train_state.replace(
-            actor_target=train_state.actor_target.replace(
-                params=train_state.actor.params
-            )
-        )
 
         # SR-DICE is always fitted and logged. `use_sr_dice_ratio` controls only whether the detached fitted ratio weights the actor objective.
         if "initial_obs" not in batch.extras:
