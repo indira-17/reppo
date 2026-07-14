@@ -179,7 +179,7 @@ def make_scan_train_fn(
             device="gpu",
         )
 
-    # One collection step, followed by one staged learner call; learner_fn owns the critic and actor epoch scans.
+    # One collection step, then num_epochs replay updates against one fixed actor_target.
     def train_step_replay(carry: tuple, key: Key) -> tuple:
         state, buffer_state, initial_obs_pool = carry
         key, rollout_key, update_key = jax.random.split(key, 3)
@@ -304,10 +304,11 @@ def make_scan_train_fn(
 
             return (state, buffer_state), update_metrics
 
+        state = state.replace(actor_target=state.actor_target.replace(params=state.actor.params))
         (state, buffer_state), epoch_metrics = jax.lax.scan(
             replay_epoch,
             (state, buffer_state),
-            jax.random.split(update_key, 1),
+            jax.random.split(update_key, num_epochs),
         )
         update_metrics = jax.tree.map(lambda x: x[-1], epoch_metrics)
         state = state.replace(iteration=state.iteration + 1)
@@ -582,6 +583,7 @@ def make_loop_train_fn(
 
                     buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
 
+                state = state.replace(actor_target=state.actor_target.replace(params=state.actor.params))
                 for _ in range(num_epochs):
                     key, learn_key, sample_key, initial_key = jax.random.split(key, 4)
                     # initial_obs is sampled only from the post-auto-reset state pool, so s₀ ∼ d₀.
@@ -636,8 +638,11 @@ def make_loop_train_fn(
                 # `iteration` counts collection/update blocks, matching the scan path.
                 state = state.replace(iteration=state.iteration + 1)
 
-                online_transitions_used += 0
-                offline_transitions_used += num_envs
+                # This Flashbax path trains on online environment data stored
+                # in replay. Count newly collected environment transitions, not
+                # replay samples reused by the learner.
+                online_transitions_used += num_collection_blocks * num_steps * num_envs
+                offline_transitions_used += 0
                 num_samples = online_transitions_used + offline_transitions_used
 
                 if step % train_log_interval == 0:
