@@ -448,11 +448,14 @@ def make_learner_fn(
         invariance_weights = invariance_weights / jnp.maximum(invariance_weights.sum(), 1.0)
 
         batch_norm_phi = nnx.merge(train_state.graphdef, batch_norm_phi_params, batch_norm_phi_stats)
-        batch_norm_phi.train()
-        
+        # Normalize with the saved (running) statistics, never the batch statistics.
+        batch_norm_phi.eval()
         joint_emb = batch_norm_phi(jnp.concatenate([curr_emb_raw, next_emb_raw, critic_output["pred_features"]], axis=0))
         curr_emb, next_emb, pred_emb = jnp.split(joint_emb, [batch_size, 2 * batch_size], axis=0)
         
+        # Update the saved statistics from current/next features only (output discarded).
+        batch_norm_phi.train()
+        batch_norm_phi(jax.lax.stop_gradient(jnp.concatenate([curr_emb_raw, next_emb_raw], axis=0)))
         batch_norm_phi_stats = nnx.state(batch_norm_phi, nnx.BatchStat)
         
         inv_loss, inv_metrics = invariance_aux_loss(pred_emb, next_emb, invariance_weights)
@@ -831,14 +834,14 @@ def make_learner_fn(
         all_phi_raw = jax.lax.stop_gradient(critic_ref(all_obs, all_action)["embed"])
         
         batch_norm_phi = nnx.merge(train_state.graphdef, train_state.params["batch_norm_phi"], train_state.params["batch_norm_phi_stats"])
-        batch_norm_phi.train()
+        # Apply the saved statistics only; they are updated once per critic step in critic_loss_fn.
+        batch_norm_phi.eval()
         all_phi = batch_norm_phi(all_phi_raw)
         batch_size = obs.shape[0]
         curr_phi, next_phi, start_phi = jnp.split(all_phi, [batch_size, 2 * batch_size], axis=0)
         curr_phi = curr_phi.reshape((*batch.done.shape, curr_phi.shape[-1]))
         next_phi = next_phi.reshape((*batch.done.shape, next_phi.shape[-1]))
         batch = batch.replace(extras={**batch.extras, "sr_dice_phi": curr_phi, "sr_dice_next_phi": next_phi})
-        train_state = train_state.replace(params={**train_state.params, "batch_norm_phi_stats": nnx.state(batch_norm_phi, nnx.BatchStat)})
         return train_state, batch, start_phi
 
     def successor_update(train_state: REPPOTrainState, minibatch: Transition):
@@ -1150,7 +1153,7 @@ def make_learner_fn(
                 epoch_key, state, batch, critic_update
             ),
             train_state,
-            jax.random.split(critic_key, 1),
+            jax.random.split(critic_key, int(getattr(hparams, "num_critic_epochs", 2))),
         )
         critic_metrics = jax.tree.map(lambda x: x[-1], critic_metrics)
         train_state = polyak_update_target_critic(train_state)

@@ -35,6 +35,7 @@ bc_ent_target_mult: ${algorithm.ent_target_mult}
 optimizer:
   _target_: optax.adam
   learning_rate: 3e-4
+actor_lr_start: 3e-5  # actor-only lr; keeps per-step KL well inside kl_bound (critic stays at optimizer.learning_rate)
 anneal_lr: false
 max_grad_norm: 0.5
 polyak: 0.005 # maybe ablate ?
@@ -49,6 +50,7 @@ num_steps: 1
 num_mini_batches: 1
 num_envs: 1024
 num_epochs: 4
+num_critic_epochs: 2  # critic epochs per learner call: critic UTD = num_epochs * num_critic_epochs = 8, actor stays at num_epochs
 
 # exploration settings (currently not touched)
 exploration_noise_max: 1.0
@@ -99,7 +101,8 @@ orth_loss_mult: 0.0              # orthonormality ‖ΦᵀΞΦ−I‖² on live 
 use_sr_dice_ratio: false          # off for this experiment; ρ still computed/logged
 sr_dice_solve_ridge: 1.0e-5       # ridge εI on the (I−γF) successor solve for conditioning
 sr_dice_lr: 1.0e-3                 # lr for ν (ratio) and S (successor features)
-batch_norm_phi_lr: 1.0e-3         # lr for the φ BatchNorm affine parameters
+train_batch_norm_phi: false       # φ BatchNorm affine params frozen by default; set true to re-enable training them
+batch_norm_phi_lr: 1.0e-3         # lr for the φ BatchNorm affine parameters (only used if train_batch_norm_phi)
 feature_dynamics_lr: 1.0e-3       # lr for the feature-dynamics matrix F
 gradient_estimator: "pathwise_q" # "score_based_gae", "score_based_q", "pathwise_q"
 scale_samples_with_action_d: False
