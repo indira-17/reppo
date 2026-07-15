@@ -70,6 +70,15 @@ def gershgorin_loss(
     }
 
 
+def batch_orthonormality_loss(features: jax.Array, weights: jax.Array):
+    """Learn phi so that Phi^T Xi Phi is close to the identity under the empirical replay distribution."""
+    weights = jax.lax.stop_gradient(weights)
+    feature_dim = features.shape[-1]
+    identity = jnp.eye(feature_dim, dtype=features.dtype)
+    gram = features.T @ (weights[:, None] * features)
+    loss = 0.5 * jnp.sum(jnp.square(gram - identity)) / gram.size
+    return loss, gram, {"sr_dice/orth_loss": loss, "sr_dice/orth_error": jnp.linalg.norm(gram - identity, ord="fro") / jnp.sqrt(gram.size)}
+
 def compute_successor_start_mean(dice_params: dict[str, jax.Array], start_phi: jax.Array):
     """Compute E_{d₀,π}[ψ(s₀,a₀)] from cached live-policy features."""
     successor = jax.lax.stop_gradient(dice_params["sr_dice_successor"])
@@ -459,27 +468,11 @@ def make_learner_fn(
         batch_norm_phi_stats = nnx.state(batch_norm_phi, nnx.BatchStat)
         
         inv_loss, inv_metrics = invariance_aux_loss(pred_emb, next_emb, invariance_weights)
+        orth_loss_value, _, orth_metrics = batch_orthonormality_loss(curr_emb, sample_weights)
 
         gershgorin_eps = float(getattr(hparams, "gershgorin_eps", 1e-5))
-        gershgorin_loss_mult = float(
-            getattr(hparams, "gershgorin_loss_mult", 1.0)
-        )
-        if gershgorin_loss_mult != 0.0:
-            gershgorin_loss_value, _, gershgorin_metrics = gershgorin_loss(
-                curr_emb,
-                next_emb,
-                sample_weights,
-                continuation,
-                gamma=hparams.gamma,
-                eps=gershgorin_eps,
-            )
-        else:
-            gershgorin_loss_value = jnp.array(0.0, dtype=curr_emb.dtype)
-            gershgorin_metrics = {
-                "sr_dice/gershgorin_loss": gershgorin_loss_value,
-                "sr_dice/gershgorin_margin_min": jnp.array(0.0, dtype=curr_emb.dtype),
-                "sr_dice/gershgorin_margin_mean": jnp.array(0.0, dtype=curr_emb.dtype),
-            }
+        gershgorin_loss_mult = float(getattr(hparams, "gershgorin_loss_mult", 1.0))
+        gershgorin_loss_value, _, gershgorin_metrics = gershgorin_loss(curr_emb, next_emb, sample_weights, continuation, gamma=hparams.gamma, eps=gershgorin_eps)
 
         pred_rew = critic_output["pred_rew"]
         value = critic_output["value"]
@@ -488,12 +481,9 @@ def make_learner_fn(
         )
         rew_aux_loss = jnp.sum(sample_weights * aux_rew_loss)
         inv_loss_mult = float(getattr(hparams, "inv_loss_mult", 1.0))
+        orth_loss_mult = float(getattr(hparams, "orth_loss_mult", 0.0))
         rew_aux_loss_mult = float(getattr(hparams, "rew_aux_loss_mult", 1.0))
-        aux_loss = (
-            inv_loss_mult * inv_loss
-            + gershgorin_loss_mult * gershgorin_loss_value
-            + rew_aux_loss_mult * rew_aux_loss
-        )
+        aux_loss = inv_loss_mult * inv_loss + gershgorin_loss_mult * gershgorin_loss_value + orth_loss_mult * orth_loss_value + rew_aux_loss_mult * rew_aux_loss
 
         critic_loss_arr = optax.squared_error(value, target_values)
         critic_loss = jnp.mean(critic_loss_arr)
@@ -545,9 +535,11 @@ def make_learner_fn(
             "aux_loss": aux_loss,
             "rew_aux_loss": rew_aux_loss,
             "gershgorin_loss": gershgorin_loss_value,
+            "orth_loss": orth_loss_value,
             "abs_batch_action": jnp.abs(minibatch.action).mean(),
             **inv_metrics,
             **gershgorin_metrics,
+            **orth_metrics,
             **critic_diag,
         }, batch_norm_phi_stats)
 
