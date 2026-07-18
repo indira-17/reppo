@@ -21,6 +21,7 @@ per_alpha: 0.6  # PER priority exponent (0 = uniform, 1 = fully prioritized)
 per_beta: 0.4   # PER IS weight exponent (0 = no correction, 1 = full correction)
 use_retrace: false
 bc_pretrain_seeds: [0] # [0, 1, 2, 3, 4]
+use_one_step_target: false
 
 # phased replay schedule
 critic_offline_warmup_iters: 0
@@ -38,7 +39,7 @@ optimizer:
 actor_lr_start: 3e-4  # actor-only lr; keeps per-step KL well inside kl_bound (critic stays at optimizer.learning_rate)
 anneal_lr: false
 max_grad_norm: 0.5
-polyak: 0.005 # maybe ablate ?
+polyak: 1 # maybe ablate ?
 
 # problem discount settings (need tuning)
 gamma: 0.99
@@ -46,11 +47,10 @@ lmbda: 0.95
 lmbda_min: 0.95 # irrelevant if no exploration noise is added
 
 # batch settings (need tuning for MJX humanoid)
-num_steps: 1
-num_mini_batches: 1
+num_steps: 4
 num_envs: 1024
-num_epochs: 4
-num_critic_epochs: 2  # critic epochs per learner call: critic UTD = num_epochs * num_critic_epochs = 8, actor stays at num_epochs
+num_epochs: 8
+num_mini_batches: 1 # critic epochs per learner call: critic UTD = num_epochs * num_critic_epochs = 8, actor stays at num_epochs
 
 # exploration settings (currently not touched)
 exploration_noise_max: 1.0
@@ -93,10 +93,10 @@ update_entropy_lagrangian: true
 aux_loss_mult: 1.0                # global scale on the summed auxiliary losses
 # per-loss multipliers (set to 0.0 to switch a term off)
 td_loss_mult: 1.0                 # value/TD (critic) loss
-inv_loss_mult: 1.0               # BatchNorm/F invariance loss (off for this diagnostic run)
+inv_loss_mult: 0.0               # BatchNorm/F invariance loss (off for this diagnostic run)
 gershgorin_loss_mult: 0.0         # Gershgorin spectral-stability loss (off for this diagnostic run)
 rew_aux_loss_mult: 1.0            # reward-prediction auxiliary loss
-orth_loss_mult: 1.0              # orthonormality ‖ΦᵀΞΦ−I‖² on live encoder φ (conditions G / anti-collapse)
+orth_loss_mult: 0.0              # orthonormality ‖ΦᵀΞΦ−I‖² on live encoder φ (conditions G / anti-collapse)
 ## SR-DICE / representation optimization (Adam)
 use_sr_dice_ratio: false          # off for this experiment; ρ still computed/logged
 sr_dice_solve_ridge: 1.0e-5       # ridge εI on the (I−γF) successor solve for conditioning
