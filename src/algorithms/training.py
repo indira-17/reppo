@@ -51,8 +51,9 @@ def _update_initial_obs_pool(initial_obs_pool: jax.Array, reset_obs: jax.Array, 
     )
     return jnp.where(mask, reset_obs, initial_obs_pool)
 
-def _sample_initial_obs(key: Key, initial_obs_pool: jax.Array) -> jax.Array:
-    return jnp.take(initial_obs_pool, jax.random.permutation(key, initial_obs_pool.shape[0]), axis=0)
+def _sample_initial_obs(key: Key, initial_obs_pool: jax.Array, sample_size: int) -> jax.Array:
+    indices = jax.random.randint(key, shape=(sample_size,), minval=0, maxval=initial_obs_pool.shape[0])
+    return jnp.take(initial_obs_pool, indices, axis=0)
 
 
 def _contains_humanoid_bench(*objects) -> bool:
@@ -127,6 +128,7 @@ def make_scan_train_fn(
     per_beta: float = 0.4,
     num_epochs: int = 4,
     learning_starts: int = 1,
+    num_collection_blocks: int = 1,
 ) -> TrainFn:
     from src.runners.gymnax_runner import (
         make_eval_fn as make_gymnax_eval_fn,
@@ -155,46 +157,51 @@ def make_scan_train_fn(
             "Flashbax replay supports data_type='random' or data_type='PER'. "
             "The expert replay path is separate from this SAC-style buffer path."
         )
-    if num_steps != 1:
-        raise ValueError(
-            "Flashbax item replay here is one-step only; set algorithm.num_steps=1."
-        )
 
+    replay_batch_size = num_steps * num_envs
+    # Each buffer item is one complete [num_steps, ...] trajectory segment, so
+    # sampling returns whole time-ordered trajectories for the n-step lambda
+    # targets (matching the upstream segment ring buffer).
+    num_segments_cap = max(max_buffer_size // num_steps, num_envs)
     if data_type == "random":
         buffer_fn = fbx.make_item_buffer(
-            max_length=max_buffer_size,
+            max_length=num_segments_cap,
             min_length=num_envs,
             sample_batch_size=num_envs,
-            add_sequences=True,
+            add_sequences=False,
             add_batches=True,
         )
     else:
         buffer_fn = fbx.make_prioritised_item_buffer(
-            max_length=max_buffer_size,
+            max_length=num_segments_cap,
             min_length=num_envs,
             sample_batch_size=num_envs,
-            add_sequences=True,
+            add_sequences=False,
             add_batches=True,
             priority_exponent=per_alpha,
             device="gpu",
         )
 
-    # One collection step, then num_epochs replay updates against one fixed actor_target.
+    # One collection step -> one fixed Flashbax replay batch -> learner_fn once. learner_fn owns the num_epochs scan.
     def train_step_replay(carry: tuple, key: Key) -> tuple:
         state, buffer_state, initial_obs_pool = carry
-        key, rollout_key, update_key = jax.random.split(key, 3)
+        key, rollout_key, learn_key, sample_key, initial_key = jax.random.split(
+            key, 5
+        )
 
         policy = policy_fn(state, False)
         rollout_transitions, state = rollout_fn(
             key=rollout_key, train_state=state, policy=policy
         )
 
-        # In the auto-reset Gymnasium/HumanoidBench runners, `transition.next_obs`
-        # is the terminal observation, whereas `state.last_obs` is the post-reset
-        # observation carried into the next action selection. Hence, for every
-        # completed episode, `state.last_obs[j]` is a genuine s_0 ~ d_0 sample.
-        episode_ended = jnp.logical_or(rollout_transitions.done[-1].astype(bool), rollout_transitions.truncated[-1].astype(bool))
-        initial_obs_pool = _update_initial_obs_pool(initial_obs_pool, state.last_obs, episode_ended)
+        # In the auto-reset Gymnasium/HumanoidBench runners, transition.next_obs is the terminal observation while state.last_obs is the post-reset s_0.
+        episode_ended = jnp.logical_or(
+            rollout_transitions.done[-1].astype(bool),
+            rollout_transitions.truncated[-1].astype(bool),
+        )
+        initial_obs_pool = _update_initial_obs_pool(
+            initial_obs_pool, state.last_obs, episode_ended
+        )
 
         replay_transitions = Transition(
             obs=rollout_transitions.obs,
@@ -204,118 +211,133 @@ def make_scan_train_fn(
             done=rollout_transitions.done,
             truncated=rollout_transitions.truncated,
             extras={
-                "behavior_log_prob": rollout_transitions.extras["behavior_log_prob"],
+                "behavior_log_prob": rollout_transitions.extras[
+                    "behavior_log_prob"
+                ],
             },
         )
         buffer_state = buffer_fn.add(
             buffer_state,
-            jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions),
+            jax.tree.map(
+                lambda x: jnp.swapaxes(x, 0, 1), replay_transitions
+            ),
         )
 
-        def replay_epoch(carry, epoch_key):
-            state, buffer_state = carry
-            learn_key, sample_key, initial_key = jax.random.split(epoch_key, 3)
-            # initial_obs is sampled only from the post-auto-reset state pool, so s₀ ∼ d₀.
-            initial_obs = _sample_initial_obs(initial_key, initial_obs_pool)
+        # Sample num_envs complete [num_steps] trajectory segments. The same
+        # batch is reused by learner_fn for all REPPO epochs.
+        initial_obs = _sample_initial_obs(
+            initial_key, initial_obs_pool, replay_batch_size
+        )
 
-            if data_type == "PER":
-                def _sample_from_buffer(_):
-                    sampled = buffer_fn.sample(buffer_state, sample_key)
-                    num_valid = jnp.where(
-                        buffer_state.is_full,
-                        max_buffer_size,
-                        buffer_state.current_index,
-                    )
-                    is_weight = (jnp.maximum(num_valid, 1) * jnp.maximum(sampled.probabilities, 1e-8)) ** (-per_beta)
-                    is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
-                    transitions = Transition(
-                        obs=sampled.experience.obs[None],
-                        next_obs=sampled.experience.next_obs[None],
-                        action=sampled.experience.action[None],
-                        reward=sampled.experience.reward[None],
-                        done=sampled.experience.done[None],
-                        truncated=sampled.experience.truncated[None],
-                        extras={
-                            "behavior_log_prob": sampled.experience.extras["behavior_log_prob"][None],
-                            "initial_obs": initial_obs,
-                            "is_weight": is_weight[None],
-                        },
-                    )
-                    return transitions, sampled.indices, jnp.array(True)
-
-                def _use_fresh_rollout(_):
-                    transitions = replay_transitions.replace(
-                        extras={
-                            **replay_transitions.extras,
-                            "initial_obs": initial_obs,
-                            "is_weight": jnp.ones((1, num_envs), dtype=jnp.float32),
-                        }
-                    )
-                    return (
-                        transitions,
-                        jnp.zeros((num_envs,), dtype=jnp.int32),
-                        jnp.array(False),
-                    )
-
-                transitions, sampled_indices, used_replay = jax.lax.cond(
-                    buffer_fn.can_sample(buffer_state),
-                    _sample_from_buffer,
-                    _use_fresh_rollout,
-                    operand=None,
+        if data_type == "PER":
+            def _sample_from_buffer(_):
+                sampled = buffer_fn.sample(buffer_state, sample_key)
+                num_valid = jnp.where(
+                    buffer_state.is_full,
+                    num_segments_cap,
+                    buffer_state.current_index,
                 )
-            else:
-                def _sample_from_buffer(_):
-                    sampled = buffer_fn.sample(buffer_state, sample_key)
-                    return Transition(
-                        obs=sampled.experience.obs[None],
-                        next_obs=sampled.experience.next_obs[None],
-                        action=sampled.experience.action[None],
-                        reward=sampled.experience.reward[None],
-                        done=sampled.experience.done[None],
-                        truncated=sampled.experience.truncated[None],
-                        extras={
-                            "behavior_log_prob": sampled.experience.extras["behavior_log_prob"][None],
-                            "initial_obs": initial_obs,
-                        },
-                    )
+                is_weight = (
+                    jnp.maximum(num_valid, 1)
+                    * jnp.maximum(sampled.probabilities, 1e-8)
+                ) ** (-per_beta)
+                is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
+                transitions = Transition(
+                    obs=jnp.swapaxes(sampled.experience.obs, 0, 1),
+                    next_obs=jnp.swapaxes(sampled.experience.next_obs, 0, 1),
+                    action=jnp.swapaxes(sampled.experience.action, 0, 1),
+                    reward=jnp.swapaxes(sampled.experience.reward, 0, 1),
+                    done=jnp.swapaxes(sampled.experience.done, 0, 1),
+                    truncated=jnp.swapaxes(sampled.experience.truncated, 0, 1),
+                    extras={
+                        "behavior_log_prob": jnp.swapaxes(
+                            sampled.experience.extras["behavior_log_prob"], 0, 1
+                        ),
+                        "initial_obs": initial_obs[None],
+                        "is_weight": jnp.broadcast_to(
+                            is_weight[None], (num_steps, num_envs)
+                        ),
+                    },
+                )
+                return transitions, sampled.indices, jnp.array(True)
 
-                transitions = jax.lax.cond(
-                    buffer_fn.can_sample(buffer_state),
-                    _sample_from_buffer,
-                    lambda _: replay_transitions.replace(extras={**replay_transitions.extras, "initial_obs": initial_obs}),
-                    operand=None,
+            def _use_fresh_rollout(_):
+                transitions = replay_transitions.replace(
+                    extras={
+                        **replay_transitions.extras,
+                        "initial_obs": initial_obs[None],
+                        "is_weight": jnp.ones(
+                            (num_steps, num_envs), dtype=jnp.float32
+                        ),
+                    }
+                )
+                return (
+                    transitions,
+                    jnp.zeros((num_envs,), dtype=jnp.int32),
+                    jnp.array(False),
                 )
 
-            state, update_metrics, per_env_td_error = learner_fn(
-                key=learn_key, train_state=state, batch=transitions
+            transitions, sampled_indices, used_replay = jax.lax.cond(
+                buffer_fn.can_sample(buffer_state),
+                _sample_from_buffer,
+                _use_fresh_rollout,
+                operand=None,
+            )
+        else:
+            def _sample_from_buffer(_):
+                sampled = buffer_fn.sample(buffer_state, sample_key)
+                return Transition(
+                    obs=jnp.swapaxes(sampled.experience.obs, 0, 1),
+                    next_obs=jnp.swapaxes(sampled.experience.next_obs, 0, 1),
+                    action=jnp.swapaxes(sampled.experience.action, 0, 1),
+                    reward=jnp.swapaxes(sampled.experience.reward, 0, 1),
+                    done=jnp.swapaxes(sampled.experience.done, 0, 1),
+                    truncated=jnp.swapaxes(sampled.experience.truncated, 0, 1),
+                    extras={
+                        "behavior_log_prob": jnp.swapaxes(
+                            sampled.experience.extras["behavior_log_prob"], 0, 1
+                        ),
+                        "initial_obs": initial_obs[None],
+                    },
+                )
+
+            transitions = jax.lax.cond(
+                buffer_fn.can_sample(buffer_state),
+                _sample_from_buffer,
+                lambda _: replay_transitions.replace(
+                    extras={
+                        **replay_transitions.extras,
+                        "initial_obs": initial_obs[None],
+                    }
+                ),
+                operand=None,
             )
 
-            if data_type == "PER":
-                buffer_state = jax.lax.cond(
-                    used_replay,
-                    lambda b: buffer_fn.set_priorities(
-                        b,
-                        sampled_indices,
-                        jnp.abs(per_env_td_error).reshape(-1) + 1e-6,
-                    ),
-                    lambda b: b,
-                    buffer_state,
-                )
-
-            return (state, buffer_state), update_metrics
-
-        (state, buffer_state), epoch_metrics = jax.lax.scan(
-            replay_epoch,
-            (state, buffer_state),
-            jax.random.split(update_key, num_epochs),
+        # actor_target snapshot + num_epochs now live inside learner_fn, matching the old working REPPO flow. Do not resample between epochs here.
+        state, update_metrics, per_env_td_error = learner_fn(
+            key=learn_key, train_state=state, batch=transitions
         )
-        update_metrics = jax.tree.map(lambda x: x[-1], epoch_metrics)
+
+        if data_type == "PER":
+            buffer_state = jax.lax.cond(
+                used_replay,
+                lambda b: buffer_fn.set_priorities(
+                    b,
+                    sampled_indices,
+                    jnp.abs(per_env_td_error).reshape(-1) + 1e-6,
+                ),
+                lambda b: b,
+                buffer_state,
+            )
+
         state = state.replace(iteration=state.iteration + 1)
 
         namespaced = {k: v for k, v in update_metrics.items() if "/" in k}
         plain = {k: v for k, v in update_metrics.items() if "/" not in k}
         jax.debug.callback(
-            log_callback, state, {**utils.prefix_dict("train", plain), **namespaced}
+            log_callback,
+            state,
+            {**utils.prefix_dict("train", plain), **namespaced},
         )
         return (state, buffer_state, initial_obs_pool), update_metrics
 
@@ -394,7 +416,7 @@ def make_scan_train_fn(
                 "behavior_log_prob": rt_template.extras["behavior_log_prob"],
             },
         )
-        seed_buf = buffer_fn.init(jax.tree.map(lambda x: x[0, 0], rt_template))
+        seed_buf = buffer_fn.init(jax.tree.map(lambda x: x[:, 0], rt_template))
         scan_buf_init = (
             jax.tree.map(lambda x: jnp.broadcast_to(x, (num_seeds,) + x.shape), seed_buf),
             train_state.last_obs,
@@ -443,9 +465,9 @@ def make_loop_train_fn(
         make_rollout_fn as make_gymnasium_rollout_fn,
     )
 
-    train_log_interval = 1000 # 125 for maniskill # max(
-    #     1, int((total_time_steps / (num_steps * num_envs)) // num_eval) // 4
-    # )
+    train_log_interval = max(
+        1, int((total_time_steps / (num_steps * num_envs)) // num_eval) // 4
+    )
 
     if isinstance(env, tuple):
         env, eval_env = env
@@ -458,38 +480,32 @@ def make_loop_train_fn(
     if eval_fn is None:
         eval_fn = make_gymnasium_eval_fn(eval_env, max_episode_steps)
 
-    if _contains_humanoid_bench(env, eval_env, rollout_fn, eval_fn):
-        if num_collection_blocks != 8:
-            logging.info(
-                "HumanoidBench runner/config detected; overriding num_collection_blocks from %d to 8.",
-                num_collection_blocks,
-            )
-        num_collection_blocks = 8
-
     if data_type not in ("random", "PER"):
         raise ValueError(
             "Flashbax replay supports data_type='random' or data_type='PER'. "
             "The expert replay path is separate from this SAC-style buffer path."
         )
-    if num_steps != 1:
-        raise ValueError(
-            "Flashbax item replay here is one-step only; set algorithm.num_steps=1."
-        )
 
+    replay_batch_size = num_steps * num_envs * num_collection_blocks
+    # Each buffer item is one complete [num_steps, ...] trajectory segment, so
+    # sampling returns whole time-ordered trajectories for the n-step lambda
+    # targets (matching the upstream segment ring buffer).
+    sample_num_segments = num_envs * num_collection_blocks
+    num_segments_cap = max(max_buffer_size // num_steps, sample_num_segments)
     if data_type == "random":
         buffer_fn = fbx.make_item_buffer(
-            max_length=max_buffer_size,
-            min_length=num_envs*num_collection_blocks,
-            sample_batch_size=num_envs*num_collection_blocks,
-            add_sequences=True,
+            max_length=num_segments_cap,
+            min_length=sample_num_segments,
+            sample_batch_size=sample_num_segments,
+            add_sequences=False,
             add_batches=True,
         )
     else:
         buffer_fn = fbx.make_prioritised_item_buffer(
-            max_length=max_buffer_size,
-            min_length=num_envs*num_collection_blocks,
-            sample_batch_size=num_envs*num_collection_blocks,
-            add_sequences=True,
+            max_length=num_segments_cap,
+            min_length=sample_num_segments,
+            sample_batch_size=sample_num_segments,
+            add_sequences=False,
             add_batches=True,
             priority_exponent=per_alpha,
             device="gpu",
@@ -547,7 +563,7 @@ def make_loop_train_fn(
                 },
             )
             if buffer_state is None:
-                buffer_state = buffer_fn.init(jax.tree.map(lambda x: x[0, 0], replay_transitions))
+                buffer_state = buffer_fn.init(jax.tree.map(lambda x: x[:, 0], replay_transitions))
             
             buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
 
@@ -577,65 +593,70 @@ def make_loop_train_fn(
                     )
                     if buffer_state is None:
                         buffer_state = buffer_fn.init(
-                            jax.tree.map(lambda x: x[0, 0], replay_transitions)
+                            jax.tree.map(lambda x: x[:, 0], replay_transitions)
                         )
 
                     buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
 
-                state = state.replace(actor_target=state.actor_target.replace(
-                        params=state.actor.params
-                    )
+                # Sample complete [num_steps] trajectory segments for this update block. learner_fn snapshots actor_target and owns the num_epochs scan.
+                key, learn_key, sample_key, initial_key = jax.random.split(key, 4)
+                initial_obs = _sample_initial_obs(
+                    initial_key, initial_obs_pool, replay_batch_size
                 )
-                for _ in range(num_epochs):
-                    key, learn_key, sample_key, initial_key = jax.random.split(key, 4)
-                    # initial_obs is sampled only from the post-auto-reset state pool, so s₀ ∼ d₀.
-                    initial_obs = _sample_initial_obs(initial_key, initial_obs_pool)
 
-                    if bool(buffer_fn.can_sample(buffer_state)):
-                        sampled = buffer_sample(buffer_state, sample_key)
-                        transitions = Transition(
-                            obs=sampled.experience.obs[None],
-                            next_obs=sampled.experience.next_obs[None],
-                            action=sampled.experience.action[None],
-                            reward=sampled.experience.reward[None],
-                            done=sampled.experience.done[None],
-                            truncated=sampled.experience.truncated[None],
-                            extras={
-                                "behavior_log_prob": sampled.experience.extras["behavior_log_prob"][None],
-                                "initial_obs": initial_obs,
-                            },
-                        )
-                        used_replay = True
-                        if data_type == "PER":
-                            num_valid = (
-                                max_buffer_size
-                                if bool(buffer_state.is_full)
-                                else int(buffer_state.current_index)
-                            )
-                            is_weight = ( max(num_valid, 1) * jnp.maximum(sampled.probabilities, 1e-8)) ** (-per_beta)
-                            is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
-                            transitions = transitions.replace(
-                                extras={
-                                    **transitions.extras,
-                                    "is_weight": is_weight[None],
-                                }
-                            )
-                            sampled_indices = sampled.indices
-                    else:
-                        transitions = replay_transitions.replace(extras={**replay_transitions.extras, "initial_obs": initial_obs})
-                        used_replay = False
-
-                    # One sampled N-transition batch is handled by learner_fn: target construction, shuffle, critic/actor minibatches and target-critic Polyak updates.
-                    state, train_metrics, per_env_td_error = learner_fn(
-                        key=learn_key, train_state=state, batch=transitions
+                if bool(buffer_fn.can_sample(buffer_state)):
+                    sampled = buffer_sample(buffer_state, sample_key)
+                    transitions = Transition(
+                        obs=jnp.swapaxes(sampled.experience.obs, 0, 1),
+                        next_obs=jnp.swapaxes(sampled.experience.next_obs, 0, 1),
+                        action=jnp.swapaxes(sampled.experience.action, 0, 1),
+                        reward=jnp.swapaxes(sampled.experience.reward, 0, 1),
+                        done=jnp.swapaxes(sampled.experience.done, 0, 1),
+                        truncated=jnp.swapaxes(sampled.experience.truncated, 0, 1),
+                        extras={
+                            "behavior_log_prob": jnp.swapaxes(
+                                sampled.experience.extras["behavior_log_prob"], 0, 1
+                            ),
+                            "initial_obs": initial_obs[None],
+                        },
                     )
-
-                    if data_type == "PER" and used_replay:
-                        buffer_state = buffer_set_priorities(
-                            buffer_state,
-                            sampled_indices,
-                            jnp.abs(per_env_td_error).reshape(-1) + 1e-6,
+                    used_replay = True
+                    if data_type == "PER":
+                        num_valid = (
+                            num_segments_cap
+                            if bool(buffer_state.is_full)
+                            else int(buffer_state.current_index)
                         )
+                        is_weight = (max(num_valid, 1) * jnp.maximum(sampled.probabilities, 1e-8)) ** (-per_beta)
+                        is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
+                        transitions = transitions.replace(
+                            extras={
+                                **transitions.extras,
+                                "is_weight": jnp.broadcast_to(
+                                    is_weight[None], (num_steps, sample_num_segments)
+                                ),
+                            }
+                        )
+                        sampled_indices = sampled.indices
+                else:
+                    transitions = replay_transitions.replace(
+                        extras={
+                            **replay_transitions.extras,
+                            "initial_obs": initial_obs[None],
+                        }
+                    )
+                    used_replay = False
+
+                state, train_metrics, per_env_td_error = learner_fn(
+                    key=learn_key, train_state=state, batch=transitions
+                )
+
+                if data_type == "PER" and used_replay:
+                    buffer_state = buffer_set_priorities(
+                        buffer_state,
+                        sampled_indices,
+                        jnp.abs(per_env_td_error).reshape(-1) + 1e-6,
+                    )
 
                 # `iteration` counts collection/update blocks, matching the scan path.
                 state = state.replace(iteration=state.iteration + 1)
@@ -677,8 +698,8 @@ def make_loop_train_fn(
                 "sys/replay_buffer_memory_gb": buffer_memory_gb,
                 "sys/perf_per_gb":            eval_return / buffer_memory_gb if buffer_memory_gb > 0 else 0.0,
                 "sys/perf_per_grad_update":   eval_return / max(grad_updates, 1.0),
-                "sys/perf_per_offline_transaction": eval_return / max(offline_transitions_used, 1),
-                "sys/perf_per_online_transaction": eval_return / max(online_transitions_used, 1),
+                "sys/perf_per_offline_transition": eval_return / max(offline_transitions_used, 1),
+                "sys/perf_per_online_transition": eval_return / max(online_transitions_used, 1),
             })
             log_callback(state, log_metrics_eval)
 
