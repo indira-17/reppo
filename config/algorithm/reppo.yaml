@@ -46,11 +46,18 @@ lmbda: 0.95
 lmbda_min: 0.95 # irrelevant if no exploration noise is added
 
 # batch settings (need tuning for MJX humanoid)
-num_steps: 1
-num_mini_batches: 1
+# Upstream-replication schedule: the KL trust region (kl_bound) is calibrated
+# for num_epochs * num_mini_batches = 512 actor updates per actor_target
+# snapshot. If you raise num_steps, keep num_epochs * num_mini_batches ~ 512.
+num_steps: 128
+num_mini_batches: 128
 num_envs: 1024
 num_epochs: 4
 num_critic_epochs: 2  # critic epochs per learner call: critic UTD = num_epochs * num_critic_epochs = 8, actor stays at num_epochs
+
+# value target: false = TD(lambda) over [num_steps, num_envs] trajectory
+# segments (upstream behavior); true = one-step TD(0) target.
+use_one_step_target: false
 
 # exploration settings (currently not touched)
 exploration_noise_max: 1.0
