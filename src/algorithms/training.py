@@ -127,8 +127,10 @@ def make_scan_train_fn(
     per_alpha: float = 0.6,
     per_beta: float = 0.4,
     num_epochs: int = 4,
-    learning_starts: int = 1,
+    prefill_buffer: int = 2,
     num_collection_blocks: int = 1,
+    recent_replay_mass: float = 0.9, # how much mass to put on the data points from the below windoe
+    recent_replay_updates: int = 4, # how many last policy cycle updates
 ) -> TrainFn:
     from src.runners.gymnax_runner import (
         make_eval_fn as make_gymnax_eval_fn,
@@ -158,22 +160,21 @@ def make_scan_train_fn(
             "The expert replay path is separate from this SAC-style buffer path."
         )
 
-    # Each buffer item is one complete [num_steps, ...] trajectory segment, so sampling returns whole time-ordered trajectories for the n-step lambda
-    # targets (matching the upstream segment ring buffer).
-    num_segments_cap = max(max_buffer_size // num_steps, num_envs)
+    # Each buffer item is one transition; sample a full IID TD(0) training batch.
+    replay_batch_size = num_steps * num_envs
     if data_type == "random":
         buffer_fn = fbx.make_item_buffer(
-            max_length=num_segments_cap,
-            min_length=num_envs,
-            sample_batch_size=num_envs,
+            max_length=max_buffer_size,
+            min_length=replay_batch_size,
+            sample_batch_size=replay_batch_size,
             add_sequences=False,
             add_batches=True,
         )
     else:
         buffer_fn = fbx.make_prioritised_item_buffer(
-            max_length=num_segments_cap,
-            min_length=num_envs,
-            sample_batch_size=num_envs,
+            max_length=max_buffer_size,
+            min_length=replay_batch_size,
+            sample_batch_size=replay_batch_size,
             add_sequences=False,
             add_batches=True,
             priority_exponent=per_alpha,
@@ -214,15 +215,17 @@ def make_scan_train_fn(
                 ],
             },
         )
+        flat_replay_transitions = jax.tree.map(
+            lambda x: x.reshape((num_steps * num_envs, *x.shape[2:])),
+            replay_transitions,
+        )
         buffer_state = buffer_fn.add(
             buffer_state,
-            jax.tree.map(
-                lambda x: jnp.swapaxes(x, 0, 1), replay_transitions
-            ),
+            flat_replay_transitions,
         )
 
-        # Sample num_envs complete [num_steps] trajectory segments. The same
-        # batch is reused by learner_fn for all REPPO epochs.
+        # Sample IID transitions and reshape them to the learner's existing
+        # [num_steps, num_envs, ...] batch layout.
         # Keep learner-facing Transition leaves time-aligned: do not attach
         # non-temporal initial-state samples to Transition.extras.
         if data_type == "PER":
@@ -230,7 +233,7 @@ def make_scan_train_fn(
                 sampled = buffer_fn.sample(buffer_state, sample_key)
                 num_valid = jnp.where(
                     buffer_state.is_full,
-                    num_segments_cap,
+                    max_buffer_size,
                     buffer_state.current_index,
                 )
                 is_weight = (
@@ -238,21 +241,15 @@ def make_scan_train_fn(
                     * jnp.maximum(sampled.probabilities, 1e-8)
                 ) ** (-per_beta)
                 is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
-                transitions = Transition(
-                    obs=jnp.swapaxes(sampled.experience.obs, 0, 1),
-                    next_obs=jnp.swapaxes(sampled.experience.next_obs, 0, 1),
-                    action=jnp.swapaxes(sampled.experience.action, 0, 1),
-                    reward=jnp.swapaxes(sampled.experience.reward, 0, 1),
-                    done=jnp.swapaxes(sampled.experience.done, 0, 1),
-                    truncated=jnp.swapaxes(sampled.experience.truncated, 0, 1),
+                transitions = jax.tree.map(
+                    lambda x: x.reshape((num_steps, num_envs, *x.shape[1:])),
+                    sampled.experience,
+                )
+                transitions = transitions.replace(
                     extras={
-                        "behavior_log_prob": jnp.swapaxes(
-                            sampled.experience.extras["behavior_log_prob"], 0, 1
-                        ),
-                        "is_weight": jnp.broadcast_to(
-                            is_weight[None], (num_steps, num_envs)
-                        ),
-                    },
+                        **transitions.extras,
+                        "is_weight": is_weight.reshape((num_steps, num_envs)),
+                    }
                 )
                 return transitions, sampled.indices, jnp.array(True)
 
@@ -267,7 +264,7 @@ def make_scan_train_fn(
                 )
                 return (
                     transitions,
-                    jnp.zeros((num_envs,), dtype=jnp.int32),
+                    jnp.zeros((replay_batch_size,), dtype=jnp.int32),
                     jnp.array(False),
                 )
 
@@ -280,18 +277,9 @@ def make_scan_train_fn(
         else:
             def _sample_from_buffer(_):
                 sampled = buffer_fn.sample(buffer_state, sample_key)
-                return Transition(
-                    obs=jnp.swapaxes(sampled.experience.obs, 0, 1),
-                    next_obs=jnp.swapaxes(sampled.experience.next_obs, 0, 1),
-                    action=jnp.swapaxes(sampled.experience.action, 0, 1),
-                    reward=jnp.swapaxes(sampled.experience.reward, 0, 1),
-                    done=jnp.swapaxes(sampled.experience.done, 0, 1),
-                    truncated=jnp.swapaxes(sampled.experience.truncated, 0, 1),
-                    extras={
-                        "behavior_log_prob": jnp.swapaxes(
-                            sampled.experience.extras["behavior_log_prob"], 0, 1
-                        ),
-                    },
+                return jax.tree.map(
+                    lambda x: x.reshape((num_steps, num_envs, *x.shape[1:])),
+                    sampled.experience,
                 )
 
             transitions = jax.lax.cond(
@@ -408,7 +396,7 @@ def make_scan_train_fn(
                 "behavior_log_prob": rt_template.extras["behavior_log_prob"],
             },
         )
-        seed_buf = buffer_fn.init(jax.tree.map(lambda x: x[:, 0], rt_template))
+        seed_buf = buffer_fn.init(jax.tree.map(lambda x: x[0, 0], rt_template))
         scan_buf_init = (
             jax.tree.map(lambda x: jnp.broadcast_to(x, (num_seeds,) + x.shape), seed_buf),
             train_state.last_obs,
@@ -446,11 +434,13 @@ def make_loop_train_fn(
     critic_offline_warmup_iters: int = 0,
     data_type: str = "expert",
     max_buffer_size: int = 1_000_000,
+    replay_batch_size: int = 16000,
     per_alpha: float = 0.6,
     per_beta: float = 0.4,
     num_epochs: int = 4,
-    learning_starts: int = 1,
+    prefill_buffer: int = 1,
     num_collection_blocks: int = 1,
+    num_replay_updates: int = 32,
 ):
     from src.runners.gymnasium_runner import (
         make_eval_fn as make_gymnasium_eval_fn,
@@ -478,24 +468,20 @@ def make_loop_train_fn(
             "The expert replay path is separate from this SAC-style buffer path."
         )
 
-    # Each buffer item is one complete [num_steps, ...] trajectory segment, so
-    # sampling returns whole time-ordered trajectories for the n-step lambda
-    # targets (matching the upstream segment ring buffer).
-    sample_num_segments = num_envs * num_collection_blocks
-    num_segments_cap = max(max_buffer_size // num_steps, sample_num_segments)
+    # Each buffer item is one transition; sample a full IID TD(0) training batch.
     if data_type == "random":
         buffer_fn = fbx.make_item_buffer(
-            max_length=num_segments_cap,
-            min_length=sample_num_segments,
-            sample_batch_size=sample_num_segments,
+            max_length=max_buffer_size,
+            min_length=replay_batch_size,
+            sample_batch_size=replay_batch_size,
             add_sequences=False,
             add_batches=True,
         )
     else:
         buffer_fn = fbx.make_prioritised_item_buffer(
-            max_length=num_segments_cap,
-            min_length=sample_num_segments,
-            sample_batch_size=sample_num_segments,
+            max_length=max_buffer_size,
+            min_length=replay_batch_size,
+            sample_batch_size=replay_batch_size,
             add_sequences=False,
             add_batches=True,
             priority_exponent=per_alpha,
@@ -525,6 +511,8 @@ def make_loop_train_fn(
         logging.info(f"Train update blocks per iteration: {train_steps_per_iteration}.")
         logging.info(f"Env transitions per update block: {num_collection_blocks * num_steps * num_envs}.")
         logging.info(f"Total time steps: {total_time_steps}.")
+        if data_type == "random":
+            logging.info("Replay sampling: uniform IID from Flashbax replay buffer.")
 
         buffer_memory_gb = 0.0
         buffer_state = None
@@ -534,7 +522,7 @@ def make_loop_train_fn(
         offline_transitions_used = 0
         prefill_stds = [] # [0.6, 0.8, 1.0, 1.2]
 
-        for _ in range(learning_starts):
+        for _ in range(prefill_buffer):
             key, rollout_key = jax.random.split(key)
             policy = policy_fn(state, False)
             rollout_transitions, state = rollout_fn(
@@ -554,9 +542,13 @@ def make_loop_train_fn(
                 },
             )
             if buffer_state is None:
-                buffer_state = buffer_fn.init(jax.tree.map(lambda x: x[:, 0], replay_transitions))
+                buffer_state = buffer_fn.init(jax.tree.map(lambda x: x[0, 0], replay_transitions))
             
-            buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
+            flat_replay_transitions = jax.tree.map(
+                lambda x: x.reshape((num_steps * num_envs, *x.shape[2:])),
+                replay_transitions,
+            )
+            buffer_state = buffer_add(buffer_state, flat_replay_transitions)
 
         for iter_idx in range(num_iterations):
             for _ in range(train_steps_per_iteration):
@@ -584,78 +576,76 @@ def make_loop_train_fn(
                     )
                     if buffer_state is None:
                         buffer_state = buffer_fn.init(
-                            jax.tree.map(lambda x: x[:, 0], replay_transitions)
+                            jax.tree.map(lambda x: x[0, 0], replay_transitions)
                         )
 
-                    buffer_state = buffer_add(buffer_state, jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), replay_transitions))
-
-                # Sample complete [num_steps] trajectory segments for this update block. learner_fn snapshots actor_target and owns the num_epochs scan.
-                # Keep learner-facing Transition leaves time-aligned: do not attach
-                # non-temporal initial-state samples to Transition.extras.
-                key, learn_key, sample_key = jax.random.split(key, 3)
-
-                if bool(buffer_fn.can_sample(buffer_state)):
-                    sampled = buffer_sample(buffer_state, sample_key)
-                    transitions = Transition(
-                        obs=jnp.swapaxes(sampled.experience.obs, 0, 1),
-                        next_obs=jnp.swapaxes(sampled.experience.next_obs, 0, 1),
-                        action=jnp.swapaxes(sampled.experience.action, 0, 1),
-                        reward=jnp.swapaxes(sampled.experience.reward, 0, 1),
-                        done=jnp.swapaxes(sampled.experience.done, 0, 1),
-                        truncated=jnp.swapaxes(sampled.experience.truncated, 0, 1),
-                        extras={
-                            "behavior_log_prob": jnp.swapaxes(
-                                sampled.experience.extras["behavior_log_prob"], 0, 1
-                            ),
-                            },
+                    flat_replay_transitions = jax.tree.map(
+                        lambda x: x.reshape((num_steps * num_envs, *x.shape[2:])),
+                        replay_transitions,
                     )
-                    used_replay = True
-                    if data_type == "PER":
-                        num_valid = num_segments_cap if bool(buffer_state.is_full) else int(buffer_state.current_index)
-                        is_weight = (max(num_valid, 1) * jnp.maximum(sampled.probabilities, 1e-8)) ** (-per_beta)
-                        is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
-                        transitions = transitions.replace(
-                            extras={
-                                **transitions.extras,
-                                "is_weight": jnp.broadcast_to(
-                                    is_weight[None], (num_steps, sample_num_segments)
-                                ),
-                            }
+                    buffer_state = buffer_add(buffer_state, flat_replay_transitions)
+
+                # Resample a fresh replay batch for every learner update.
+                for _ in range(num_replay_updates):
+                    key, learn_key, sample_key = jax.random.split(key, 3)
+
+                    if bool(buffer_fn.can_sample(buffer_state)):
+                        if data_type == "PER":
+                            sampled = buffer_sample(buffer_state, sample_key)
+                            sampled_experience = sampled.experience
+                            sampled_indices = sampled.indices
+                        else:
+                            sampled = buffer_sample(buffer_state, sample_key)
+                            sampled_experience = sampled.experience
+
+                        transitions = jax.tree.map(
+                            lambda x: x.reshape((1, replay_batch_size, *x.shape[1:])),
+                            sampled_experience,
                         )
-                        sampled_indices = sampled.indices
-                else:
-                    transitions = replay_transitions.replace(
-                        extras={
-                            **replay_transitions.extras,
-                            }
+                        used_replay = True
+                        if data_type == "PER":
+                            num_valid = max_buffer_size if bool(buffer_state.is_full) else int(buffer_state.current_index)
+                            is_weight = (max(num_valid, 1) * jnp.maximum(sampled.probabilities, 1e-8)) ** (-per_beta)
+                            is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
+                            transitions = transitions.replace(
+                                extras={
+                                    **transitions.extras,
+                                    "is_weight": is_weight.reshape((1, replay_batch_size)),
+                                }
+                            )
+                    else:
+                        transitions = replay_transitions.replace(extras={**replay_transitions.extras})
+                        used_replay = False
+
+                    # The actor_target is updated to the current actor params before each learner_fn call.
+                    state = state.replace(
+                        actor_target=state.actor_target.replace(params=state.actor.params)
                     )
-                    used_replay = False
 
-                state, train_metrics, per_env_td_error = learner_fn(
-                    key=learn_key, train_state=state, batch=transitions
-                )
-
-                if data_type == "PER" and used_replay:
-                    buffer_state = buffer_set_priorities(
-                        buffer_state,
-                        sampled_indices,
-                        jnp.abs(per_env_td_error).reshape(-1) + 1e-6,
+                    state, train_metrics, per_env_td_error = learner_fn(
+                        key=learn_key, train_state=state, batch=transitions
                     )
 
-                # `iteration` counts collection/update blocks, matching the scan path.
-                state = state.replace(iteration=state.iteration + 1)
+                    if data_type == "PER" and used_replay:
+                        buffer_state = buffer_set_priorities(
+                            buffer_state,
+                            sampled_indices,
+                            jnp.abs(per_env_td_error).reshape(-1) + 1e-6,
+                        )
+
+                    state = state.replace(iteration=state.iteration + 1)
+
+                    if step % train_log_interval == 0:
+                        log_metrics = train_metrics
+                        namespaced = {k: v for k, v in log_metrics.items() if "/" in k}
+                        plain = {k: v for k, v in log_metrics.items() if "/" not in k}
+                        log_callback(state, {**utils.prefix_dict("train", plain), **namespaced})
+
+                    step += 1
 
                 online_transitions_used += num_collection_blocks * num_steps * num_envs
                 offline_transitions_used += 0
                 num_samples = online_transitions_used + offline_transitions_used
-
-                if step % train_log_interval == 0:
-                    log_metrics = train_metrics
-                    namespaced = {k: v for k, v in log_metrics.items() if "/" in k}
-                    plain = {k: v for k, v in log_metrics.items() if "/" not in k}
-                    log_callback(state, {**utils.prefix_dict("train", plain), **namespaced})
-
-                step += 1
 
             policy = policy_fn(state, not stochastic_eval)
             key, eval_key = jax.random.split(key)
