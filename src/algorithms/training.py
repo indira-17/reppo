@@ -129,8 +129,6 @@ def make_scan_train_fn(
     num_epochs: int = 4,
     prefill_buffer: int = 2,
     num_collection_blocks: int = 1,
-    recent_replay_mass: float = 0.9, # how much mass to put on the data points from the below windoe
-    recent_replay_updates: int = 4, # how many last policy cycle updates
 ) -> TrainFn:
     from src.runners.gymnax_runner import (
         make_eval_fn as make_gymnax_eval_fn,
@@ -434,12 +432,12 @@ def make_loop_train_fn(
     critic_offline_warmup_iters: int = 0,
     data_type: str = "expert",
     max_buffer_size: int = 1_000_000,
-    replay_batch_size: int = 16000,
+    replay_batch_size: int = 32768,
     per_alpha: float = 0.6,
     per_beta: float = 0.4,
     num_epochs: int = 4,
     prefill_buffer: int = 1,
-    num_collection_blocks: int = 1,
+    num_collection_blocks: int = 1, # for gershgorin with batch size 1k and the same UTD and optimisation frequency
     num_replay_updates: int = 32,
 ):
     from src.runners.gymnasium_runner import (

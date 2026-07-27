@@ -25,6 +25,17 @@ import distrax
 
 logging.basicConfig(level=logging.INFO)
 
+def batch_orthonormality_loss(features: jax.Array, weights: jax.Array):
+    weights = jax.lax.stop_gradient(weights)
+    feature_dim = features.shape[-1]
+    identity = jnp.eye(feature_dim, dtype=features.dtype)
+    gram = features.T @ (weights[:, None] * features)
+    loss = 0.5 * jnp.sum(jnp.square(gram - identity)) / gram.size
+    return loss, gram, {
+        "gram_min_eigenval": jnp.min(jnp.linalg.eig(jax.lax.stop_gradient(gram))[0]),
+        "gram_max_eigenval": jnp.max(jnp.linalg.eig(jax.lax.stop_gradient(gram))[0]),
+    }
+
 def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights: jax.Array, continuation: jax.Array, gamma: float, eps: float = 1e-5):
     """Gershgorin loss on the empirical TD iteration matrix.
 
@@ -33,8 +44,8 @@ def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights:
         A_B = Φ_Bᵀ Ξ_B (Φ_B - γ P^πΦ_B)
             ≈ φ(s,a)ᵀ Ξ_B [φ(s,a) - γφ(s',a')].
 
-    Gradients flow through both current and policy-next features, so this loss
-    shapes Φ directly. No learned feature-dynamics matrix is used here.
+    Gradients flow through the current features only; policy-next features are
+    treated as a fixed semi-gradient target.
     """
     weights = jax.lax.stop_gradient(weights)
     continuation = jax.lax.stop_gradient(continuation).reshape(-1, 1)
@@ -47,24 +58,15 @@ def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights:
     violation = jax.nn.relu(eps - margin)
     loss = jnp.sum(violation) / td_matrix.size
 
+    # Compute the minimum real eigenvalue for logging
+    min_real_eigenval = jnp.min(jnp.real(jnp.linalg.eig(jax.lax.stop_gradient(td_matrix))[0]))
+
     return loss, td_matrix, {
-        "sr_dice/gershgorin_loss": loss,
-        "sr_dice/gershgorin_margin_min": margin.min(),
-        "sr_dice/gershgorin_margin_mean": margin.mean(),
+        "gershgorin_margin_min": margin.min(),
+        "gershgorin_margin_mean": margin.mean(),
+        "min_real_eigen_value": min_real_eigenval,
     }
 
-
-def batch_orthonormality_loss(features: jax.Array, weights: jax.Array):
-    """Learn phi so that Phi^T Xi Phi is close to the identity under the empirical replay distribution."""
-    weights = jax.lax.stop_gradient(weights)
-    feature_dim = features.shape[-1]
-    identity = jnp.eye(feature_dim, dtype=features.dtype)
-    gram = features.T @ (weights[:, None] * features)
-    loss = 0.5 * jnp.sum(jnp.square(gram - identity)) / gram.size
-    return loss, gram, {
-        "sr_dice/orth_loss": loss,
-        "sr_dice/orth_error": jnp.linalg.norm(gram - identity, ord="fro") / jnp.sqrt(gram.size),
-    }
 
 def compute_successor_start_mean(dice_params: dict[str, jax.Array], start_phi: jax.Array):
     """Compute E_{d₀,π}[ψ(s₀,a₀)] from cached live-policy features."""
@@ -348,7 +350,18 @@ def make_learner_fn(
     ):
         critic_model = nnx.merge(train_state.critic.graphdef, params)
         critic_model.train()
+
+        # The critic embed is the single canonical raw Phi used by Q, invariance, and Gershgorin.
         critic_output = critic_model(minibatch.obs, minibatch.action)
+        next_output = critic_model(
+            minibatch.next_obs,
+            minibatch.extras["next_actions"],
+        )
+        curr_features = critic_output["embed"]
+        next_features = next_output["embed"]
+        value = critic_output["value"]
+        pred_features = critic_output["pred_features"]
+        pred_rew = critic_output["pred_rew"]
 
         target_values = minibatch.extras["target_values"]
 
@@ -359,23 +372,35 @@ def make_learner_fn(
             critic_pred = critic_output["logits"]
             critic_update_loss = optax.softmax_cross_entropy(critic_pred, target_cat)
         else:
-            critic_pred = critic_output["value"]
             critic_update_loss = optax.squared_error(
-                critic_pred.reshape(-1, 1),
+                value.reshape(-1, 1),
                 target_values.reshape(-1, 1),
             )
 
-        # Invariance loss: original REPPO self-prediction auxiliary.
-        pred = critic_output["pred_features"]
-        pred_rew = critic_output["pred_rew"]
-        value = critic_output["value"]
-        invariance_loss = optax.squared_error(pred, minibatch.extras["next_emb"])
-        aux_rew_loss = optax.squared_error(pred_rew, minibatch.reward.reshape(-1, 1))
-        invariance_loss = jnp.mean(
-            (1 - minibatch.done.reshape(-1, 1))
-            * jnp.concatenate([invariance_loss, aux_rew_loss], axis=-1),
-            axis=-1,
+        # Invariance is defined in the same raw Phi space used by Q and Gershgorin.
+        # The policy-next feature remains a semi-gradient target.
+        done_mask = 1.0 - minibatch.done.reshape(-1, 1).astype(pred_features.dtype)
+        invariance_error = optax.squared_error(
+            pred_features,
+            minibatch.extras["next_emb"],
         )
+        reward_error = optax.squared_error(
+            pred_rew,
+            minibatch.reward.reshape(-1, 1),
+        )
+        # Preserve the exact old concatenated-loss weighting while keeping invariance and reward prediction separate for ablations.
+        feature_dim = pred_features.shape[-1]
+        inv_loss_mult = (float(getattr(hparams, "inv_loss_mult", 1.0)) * feature_dim / (feature_dim + 1))
+        rew_aux_loss_mult = (float(getattr(hparams, "rew_aux_loss_mult", 0.0)) / (feature_dim + 1))
+
+        invariance_loss = jnp.mean(done_mask * invariance_error, axis=-1)
+        aux_rew_loss = jnp.mean(done_mask * reward_error, axis=-1)
+
+        # total_aux_loss = jnp.mean(
+        #     (1 - minibatch.done.reshape(-1, 1))
+        #     * jnp.concatenate([invariance_loss, aux_rew_loss], axis=-1),
+        #     axis=-1,
+        # )
 
         # compute l2 error for logging
         critic_loss_arr = optax.squared_error(
@@ -408,11 +433,9 @@ def make_learner_fn(
         is_w = minibatch.extras.get("is_weight", None)
         per_scale = is_w.reshape(-1) if (data_type == 'PER' and is_w is not None) else 1.0
 
-        orth_loss = jnp.array(0.0, dtype=value.dtype)
         gershgorin_loss_value = jnp.array(0.0, dtype=value.dtype)
+        orth_loss_value = jnp.array(0.0, dtype=value.dtype)
         if bool(getattr(hparams, "use_added_loss", False)):
-            curr_features = critic_output["embed"]
-            next_features = minibatch.extras["next_emb"]
             sample_weights = jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype)
             if hparams.mask_truncated:
                 sample_weights = sample_weights * (
@@ -425,14 +448,15 @@ def make_learner_fn(
                 1.0 - minibatch.done.reshape(-1).astype(curr_features.dtype),
             )
 
-            orth_loss, _, _ = batch_orthonormality_loss(curr_features, sample_weights)
-            gershgorin_loss_value, _, _ = gershgorin_loss(curr_features, next_features, sample_weights, continuation, gamma=hparams.gamma, eps=float(getattr(hparams, "gershgorin_eps", 1e-5)))
+            gershgorin_loss_value, _, gershgorin_metrics = gershgorin_loss(curr_features, next_features, sample_weights, continuation, gamma=hparams.gamma, eps=float(getattr(hparams, "gershgorin_eps", 1e-5)))
+            orth_loss_value, _, orth_metrics = batch_orthonormality_loss(curr_features, sample_weights)
 
         critic_objective = (
             critic_update_loss
-            + hparams.aux_loss_mult * invariance_loss
-            + float(getattr(hparams, "orth_loss_mult", 0.0)) * orth_loss
+            + inv_loss_mult * invariance_loss
+            + rew_aux_loss_mult * aux_rew_loss
             + float(getattr(hparams, "gershgorin_loss_mult", 0.0)) * gershgorin_loss_value
+            + float(getattr(hparams, "orth_loss_mult", 0.0)) * orth_loss_value
         )
         unmasked_critic_total_loss = jnp.mean(critic_objective)
         loss = jnp.mean(per_scale * mask * critic_objective)
@@ -450,10 +474,12 @@ def make_learner_fn(
             masked_critic_total_loss=loss,
             unmasked_critic_total_loss=unmasked_critic_total_loss,
             invariance_loss=invariance_loss,
-            orth_loss=orth_loss,
             gershgorin_loss=gershgorin_loss_value,
+            orth_loss=orth_loss_value,
             rew_aux_loss=aux_rew_loss,
             abs_batch_action=jnp.abs(minibatch.action).mean(),
+            **gershgorin_metrics,
+            **orth_metrics,
             **critic_diag,
         )
 
@@ -469,7 +495,7 @@ def make_learner_fn(
             train_state.actor.graphdef, train_state.actor_target.params
         )
 
-        # set up models for training with batch norm
+        # set up models for training
         actor_model.train()
         critic_target_model.eval()
         actor_target_model.eval()
@@ -521,14 +547,11 @@ def make_learner_fn(
                 )
                 obs = jnp.repeat(minibatch.obs[None, ...], pred_action.shape[0], axis=0)
                 critic_pred = critic_target_model(obs, pred_action)
-                value = critic_pred["value"].sum(axis=0, keepdims=True)
-                value = (value - critic_pred["value"]) / (
-                    critic_pred["value"].shape[0] - 1
-                )
-                adv = critic_pred["value"] - value
-                actor_loss = -jnp.mean(
-                    log_prob * jax.lax.stop_gradient(adv) - alpha * log_prob, axis=0
-                )
+                q_values = critic_pred["value"]
+                value = q_values.sum(axis=0, keepdims=True)
+                value = (value - q_values) / (q_values.shape[0] - 1)
+                adv = q_values - value
+                actor_loss = -jnp.mean(log_prob * jax.lax.stop_gradient(adv) - alpha * log_prob, axis=0)
                 entropy = -log_prob.mean(axis=0)
 
             elif hparams.gradient_estimator == "pathwise_q":
@@ -636,10 +659,11 @@ def make_learner_fn(
                 critic_train_state = train_state.critic.apply_gradients(grads)
                 critic_metrics = output[1]
                 return critic_train_state, critic_metrics
-            
-            # Always update the critic
+
             critic_train_state, critic_metrics = update_critic(None)
-            train_state = train_state.replace(critic=critic_train_state)
+            train_state = train_state.replace(
+                critic=critic_train_state,
+            )
 
             # Update the one-step TD target critic after every critic optimizer step.
             polyak = float(getattr(hparams, "polyak", 0.005))
@@ -684,6 +708,7 @@ def make_learner_fn(
         else:
             critic_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
             output, grads = critic_grad_fn(train_state.critic.params, train_state, batch)
+            critic_metrics = output[1]
             critic_train_state = train_state.critic.apply_gradients(grads)
             train_state = train_state.replace(
                 critic=critic_train_state,
@@ -699,8 +724,6 @@ def make_learner_fn(
             train_state = train_state.replace(
                 target_critic=train_state.target_critic.replace(params=target_critic_params)
             )
-
-            critic_metrics = output[1]
 
             actor_grad_fn = jax.value_and_grad(actor_loss, has_aux=True)
             output, grads = actor_grad_fn(train_state.actor.params, train_state, batch)
@@ -726,15 +749,6 @@ def make_learner_fn(
     def run_epoch(
         key: jax.Array, train_state: REPPOTrainState, batch: Transition
     ) -> tuple[REPPOTrainState, dict[str, jax.Array]]:
-        if getattr(hparams, "use_one_step_td", True):
-            key, target_key = jax.random.split(key)
-            extras = compute_extras(key=target_key, train_state=train_state, batch=batch)
-            batch.extras.update(extras)
-            (
-                batch.extras["target_values"],
-                batch.extras["target_advs"],
-                _,
-            ) = nstep_lambda(batch=batch)
 
         # Shuffle data and split into mini-batches
         key, shuffle_key, act_key, kl_key = jax.random.split(key, 4)
@@ -834,20 +848,28 @@ def make_learner_fn(
         key, act1_key, act2_key, act3_key = jax.random.split(key, 4)
 
         actor_model = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
-        critic_model = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
+        critic_model = nnx.merge(
+            train_state.critic.graphdef,
+            train_state.critic.params,
+        )
         target_critic_model = nnx.merge(
-            train_state.target_critic.graphdef, train_state.target_critic.params
+            train_state.target_critic.graphdef,
+            train_state.target_critic.params,
         )
         actor_model.eval()
         critic_model.eval()
         target_critic_model.eval()
 
-        actions, log_probs = actor_model(batch.next_obs).sample_and_log_prob(
-            seed=act1_key
-        )
-        critic_output = critic_model(batch.next_obs, actions)
+        next_pi = actor_model(batch.next_obs)
+        td_next_action, log_probs = next_pi.sample_and_log_prob(seed=act1_key)
+        if isinstance(action_space, Box):
+            td_next_action = td_next_action.clip(-0.999, 0.999)
+
+        critic_output = critic_model(batch.next_obs, td_next_action)
+        target_critic_output = target_critic_model(batch.next_obs, td_next_action)
+
         if getattr(hparams, "use_one_step_td", True):
-            value = target_critic_model(batch.next_obs, actions)["value"]
+            value = target_critic_output["value"]
         else:
             value = critic_output["value"]
         next_emb = critic_output["embed"]
@@ -862,8 +884,8 @@ def make_learner_fn(
         # Q(st, at)
         critic_action = batch.action.clip(-0.999, 0.999) if isinstance(action_space, Box) else batch.action
         action_value = critic_model(batch.obs, critic_action)["value"]
+
         # E[Q(st+1, .)]
-        next_pi = actor_model(batch.next_obs)
         next_actions = next_pi.sample(
             seed=act3_key, sample_shape=(num_samples,)
         )
@@ -892,6 +914,7 @@ def make_learner_fn(
             "policy_value": policy_value,
             "next_policy_value": next_policy_value,
             "next_emb": next_emb,
+            "next_actions": td_next_action,
             "log_prob": current_log_probs,
             "current_log_prob": current_log_probs,
         }
@@ -953,7 +976,10 @@ def make_learner_fn(
         # J(π_after): updated actor's expected value on the same states
         _n_pv = 8 * d if hparams.scale_samples_with_action_d else 8
         actor_after = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
-        critic_after = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
+        critic_after = nnx.merge(
+            train_state.critic.graphdef,
+            train_state.critic.params,
+        )
         actor_after.eval()
         critic_after.eval()
         action_after = actor_after(batch.obs).sample(seed=pv_after_key, sample_shape=(_n_pv,))
