@@ -353,12 +353,7 @@ def make_learner_fn(
 
         # The critic embed is the single canonical raw Phi used by Q, invariance, and Gershgorin.
         critic_output = critic_model(minibatch.obs, minibatch.action)
-        next_output = critic_model(
-            minibatch.next_obs,
-            minibatch.extras["next_actions"],
-        )
         curr_features = critic_output["embed"]
-        next_features = next_output["embed"]
         value = critic_output["value"]
         pred_features = critic_output["pred_features"]
         pred_rew = critic_output["pred_rew"]
@@ -436,6 +431,7 @@ def make_learner_fn(
         gershgorin_loss_value = jnp.array(0.0, dtype=value.dtype)
         orth_loss_value = jnp.array(0.0, dtype=value.dtype)
         if bool(getattr(hparams, "use_added_loss", False)):
+            next_features = jax.lax.stop_gradient(minibatch.extras["next_emb"])
             sample_weights = jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype)
             if hparams.mask_truncated:
                 sample_weights = sample_weights * (
@@ -455,9 +451,12 @@ def make_learner_fn(
             critic_update_loss
             + inv_loss_mult * invariance_loss
             + rew_aux_loss_mult * aux_rew_loss
-            + float(getattr(hparams, "gershgorin_loss_mult", 0.0)) * gershgorin_loss_value
-            + float(getattr(hparams, "orth_loss_mult", 0.0)) * orth_loss_value
         )
+        if float(getattr(hparams, "gershgorin_loss_mult", 0.0)) > 0.0:
+            critic_objective += float(getattr(hparams, "gershgorin_loss_mult", 0.0)) * gershgorin_loss_value
+        if float(getattr(hparams, "orth_loss_mult", 0.0)) > 0.0:
+            critic_objective += float(getattr(hparams, "orth_loss_mult", 0.0)) * orth_loss_value
+
         unmasked_critic_total_loss = jnp.mean(critic_objective)
         loss = jnp.mean(per_scale * mask * critic_objective)
         critic_diag = {
@@ -478,8 +477,8 @@ def make_learner_fn(
             orth_loss=orth_loss_value,
             rew_aux_loss=aux_rew_loss,
             abs_batch_action=jnp.abs(minibatch.action).mean(),
-            **gershgorin_metrics,
-            **orth_metrics,
+            **gershgorin_metrics if bool(getattr(hparams, "use_added_loss", False)) else {},
+            **orth_metrics if bool(getattr(hparams, "use_added_loss", False)) else {},
             **critic_diag,
         )
 
@@ -750,6 +749,20 @@ def make_learner_fn(
         key: jax.Array, train_state: REPPOTrainState, batch: Transition
     ) -> tuple[REPPOTrainState, dict[str, jax.Array]]:
 
+        if getattr(hparams, "use_one_step_td", True):
+            key, target_key = jax.random.split(key)
+            extras = compute_extras(
+                key=target_key,
+                train_state=train_state,
+                batch=batch,
+            )
+            batch.extras.update(extras)
+            (
+                batch.extras["target_values"],
+                batch.extras["target_advs"],
+                _,
+            ) = nstep_lambda(batch=batch)
+
         # Shuffle data and split into mini-batches
         key, shuffle_key, act_key, kl_key = jax.random.split(key, 4)
         batch_size = batch.obs.shape[0]
@@ -862,8 +875,6 @@ def make_learner_fn(
 
         next_pi = actor_model(batch.next_obs)
         td_next_action, log_probs = next_pi.sample_and_log_prob(seed=act1_key)
-        if isinstance(action_space, Box):
-            td_next_action = td_next_action.clip(-0.999, 0.999)
 
         critic_output = critic_model(batch.next_obs, td_next_action)
         target_critic_output = target_critic_model(batch.next_obs, td_next_action)

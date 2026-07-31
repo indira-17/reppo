@@ -432,7 +432,7 @@ def make_loop_train_fn(
     critic_offline_warmup_iters: int = 0,
     data_type: str = "expert",
     max_buffer_size: int = 1_000_000,
-    replay_batch_size: int = 32768,
+    replay_batch_size: int = 16384,
     per_alpha: float = 0.6,
     per_beta: float = 0.4,
     num_epochs: int = 4,

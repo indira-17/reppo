@@ -23,7 +23,7 @@ bc_pretrain_seeds: [0] # [0, 1, 2, 3, 4]
 
 max_buffer_size: 1_000_000  # standard SAC replay buffer size
 use_one_step_td: true
-use_added_loss: true
+use_added_loss: false
 
 # phased replay schedule
 critic_offline_warmup_iters: 0
@@ -94,7 +94,7 @@ update_entropy_lagrangian: true
 ## auxiliary loss settings              # global scale on the summed auxiliary losses
 # per-loss multipliers (set to 0.0 to switch a term off)
 td_loss_mult: 1.0                 # value/TD (critic) loss
-inv_loss_mult: 0.0               # BatchNorm/F invariance loss (off for this diagnostic run)
+inv_loss_mult: 1.0               # BatchNorm/F invariance loss (off for this diagnostic run)
 gershgorin_loss_mult: 0.0        # Gershgorin spectral-stability loss (off for this diagnostic run)
 rew_aux_loss_mult: 1.0            # reward-prediction auxiliary loss
 orth_loss_mult: 0.0              # orthonormality ‖ΦᵀΞΦ−I‖² on live encoder φ (conditions G / anti-collapse)
