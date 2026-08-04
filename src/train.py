@@ -23,6 +23,15 @@ def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     logging.info("\n" + OmegaConf.to_yaml(cfg))
 
+    seed = int(cfg.seed)
+
+    # Seed non-JAX libraries as well.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     demo_cfg = cfg.env.get("demo", {})
     demo_path = demo_cfg.get("demo_path", None)
     filter_success = cfg.env.get("filter_success", demo_cfg.get("filter_success", True))
@@ -33,19 +42,27 @@ def main(cfg: DictConfig):
     bc_indicator = cfg.algorithm.get("bc_indicator", False)
     data_type = cfg.algorithm.get("data_type", "online")
 
-    run_name = (
-        f"reppo-{cfg.env.name}-retrace"
-        if bc_indicator
-        else f"reppo-{cfg.env.name}-{data_type}"
+    base_run_name = (
+        f"bc-reppo-{cfg.env.name}-retrace"
+        if cfg.algorithm.bc_indicator
+        else f"reppo-{cfg.env.name}"
     )
 
-    run = wandb.init(
+    # All five Slurm array tasks receive the same group.
+    run_group = os.environ.get(
+        "WANDB_RUN_GROUP",
+        f"{base_run_name}-five-seed",
+    )
+
+    wandb.init(
         mode=cfg.logging.mode,
-        project="replay-buffer-study",
+        project=cfg.logging.project,
         entity=cfg.logging.entity,
         tags=cfg.tags,
-        config=OmegaConf.to_container(cfg),
-        name=run_name,
+        config=OmegaConf.to_container(cfg, resolve=True),
+        name=f"{run_name}-seed{cfg.seed}",
+        group=os.environ.get("WANDB_RUN_GROUP"),
+        job_type="train",
         save_code=True,
     )
 
