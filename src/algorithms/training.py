@@ -2,6 +2,7 @@ import logging
 import torch
 import gymnasium
 import numpy as np
+import wandb
 from gymnax.environments.environment import Environment
 import jax
 import flashbax as fbx
@@ -21,6 +22,34 @@ import jax.numpy as jnp
 
 from src.algorithms.reppo.common import OfflineReplayBuffer
 from src.common import Transition
+
+def _pearson_correlation(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.size < 2 or np.std(x) == 0.0 or np.std(y) == 0.0:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _rankdata(values):
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+
+    start = 0
+    while start < values.size:
+        end = start + 1
+        while end < values.size and values[order[end]] == values[order[start]]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+        start = end
+
+    return ranks
+
+def _spearman_correlation(x, y):
+    if len(x) < 2:
+        return None
+    return _pearson_correlation(_rankdata(x), _rankdata(y))
 
 def to_jax(x):
     if isinstance(x, np.ndarray):
@@ -519,6 +548,12 @@ def make_loop_train_fn(
         online_transitions_used = 0
         offline_transitions_used = 0
         prefill_stds = [] # [0.6, 0.8, 1.0, 1.2]
+        geometry_history = {
+            "feature_correlation": [],
+            "min_real_eigen_value": [],
+            "invariance_loss": [],
+            "eval_return": [],
+        }
 
         for _ in range(prefill_buffer):
             key, rollout_key = jax.random.split(key)
@@ -652,6 +687,81 @@ def make_loop_train_fn(
 
             eval_return = float(eval_metrics["episode_return"])
             grad_updates = float(train_metrics.get("sys/grad_updates", 1.0))
+
+            feature_correlation = float(np.asarray(jax.device_get(train_metrics["feature_correlation"]), dtype=np.float64).mean())
+            min_real_eigen_value = float(np.asarray(jax.device_get(train_metrics["min_real_eigen_value"]), dtype=np.float64).mean())
+            invariance_loss = float(np.asarray(jax.device_get(train_metrics["invariance_loss"]), dtype=np.float64).mean())
+
+            geometry_history["feature_correlation"].append(feature_correlation)
+            geometry_history["min_real_eigen_value"].append(min_real_eigen_value)
+            geometry_history["invariance_loss"].append(invariance_loss)
+            geometry_history["eval_return"].append(eval_return)
+
+            if wandb_run is not None:
+                feature_table = wandb.Table(
+                    data=list(
+                        zip(
+                            geometry_history["feature_correlation"],
+                            geometry_history["eval_return"],
+                        )
+                    ),
+                    columns=["Feature correlation", "Evaluation return"],
+                )
+                eigenvalue_table = wandb.Table(
+                    data=list(
+                        zip(
+                            geometry_history["min_real_eigen_value"],
+                            geometry_history["eval_return"],
+                        )
+                    ),
+                    columns=["Minimum real eigenvalue", "Evaluation return"],
+                )
+                invariance_table = wandb.Table(
+                    data=list(
+                        zip(
+                            geometry_history["invariance_loss"],
+                            geometry_history["eval_return"],
+                        )
+                    ),
+                    columns=["Invariance loss", "Evaluation return"],
+                )
+
+                geometry_logs = {
+                    "geometry/feature_correlation_vs_eval_return": wandb.plot.scatter(
+                        feature_table,
+                        "Feature correlation",
+                        "Evaluation return",
+                        title="Feature correlation vs evaluation return",
+                    ),
+                    "geometry/min_real_eigenvalue_vs_eval_return": wandb.plot.scatter(
+                        eigenvalue_table,
+                        "Minimum real eigenvalue",
+                        "Evaluation return",
+                        title="Minimum real eigenvalue vs evaluation return",
+                    ),
+                    "geometry/invariance_loss_vs_eval_return": wandb.plot.scatter(
+                        invariance_table,
+                        "Invariance loss",
+                        "Evaluation return",
+                        title="Invariance loss vs evaluation return",
+                    ),
+                }
+
+                for metric_name in ("feature_correlation", "min_real_eigen_value", "invariance_loss"):
+                    pearson = _pearson_correlation(geometry_history[metric_name], geometry_history["eval_return"])
+                    spearman = _spearman_correlation(geometry_history[metric_name], geometry_history["eval_return"])
+                    if pearson is not None:
+                        geometry_logs[f"geometry_correlation/{metric_name}_pearson"] = pearson
+                    if spearman is not None:
+                        geometry_logs[f"geometry_correlation/{metric_name}_spearman"] = spearman
+
+                # Leave the step open so the existing log_callback commits the
+                # evaluation metrics at the same state.time_steps value.
+                wandb_run.log(
+                    geometry_logs,
+                    step=int(np.asarray(jax.device_get(state.time_steps)).reshape(-1)[0]),
+                    commit=False,
+                )
 
             eval_metrics["num_samples"] = num_samples
 

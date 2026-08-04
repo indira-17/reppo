@@ -31,9 +31,25 @@ def batch_orthonormality_loss(features: jax.Array, weights: jax.Array):
     identity = jnp.eye(feature_dim, dtype=features.dtype)
     gram = features.T @ (weights[:, None] * features)
     loss = 0.5 * jnp.sum(jnp.square(gram - identity)) / gram.size
+
+    # Logging only: mean absolute off-diagonal entry of the normalized Gram matrix.
+    gram_metrics = jax.lax.stop_gradient(gram)
+    feature_scale = jnp.sqrt(jnp.clip(jnp.diag(gram_metrics), a_min=1e-8))
+    correlation = gram_metrics / (
+        feature_scale[:, None] * feature_scale[None, :] + 1e-8
+    )
+    off_diagonal_sum = (
+        jnp.sum(jnp.abs(correlation))
+        - jnp.sum(jnp.abs(jnp.diag(correlation)))
+    )
+    feature_correlation = off_diagonal_sum / max(
+        feature_dim * (feature_dim - 1), 1
+    )
+
     return loss, gram, {
-        "gram_min_eigenval": jnp.min(jnp.linalg.eig(jax.lax.stop_gradient(gram))[0]),
-        "gram_max_eigenval": jnp.max(jnp.linalg.eig(jax.lax.stop_gradient(gram))[0]),
+        "gram_min_eigenval": jnp.min(jnp.linalg.eig(gram_metrics)[0]),
+        "gram_max_eigenval": jnp.max(jnp.linalg.eig(gram_metrics)[0]),
+        "feature_correlation": feature_correlation,
     }
 
 def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights: jax.Array, continuation: jax.Array, gamma: float, eps: float = 1e-5):
@@ -56,7 +72,7 @@ def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights:
     off_diag_radius = jnp.sum(jnp.abs(td_matrix), axis=-1) - jnp.abs(diag)
     margin = diag - off_diag_radius
     violation = jax.nn.relu(eps - margin)
-    loss = jnp.sum(violation) / td_matrix.size
+    loss = jnp.mean(violation)
 
     # Compute the minimum real eigenvalue for logging
     min_real_eigenval = jnp.min(jnp.real(jnp.linalg.eig(jax.lax.stop_gradient(td_matrix))[0]))
@@ -431,7 +447,7 @@ def make_learner_fn(
         gershgorin_loss_value = jnp.array(0.0, dtype=value.dtype)
         orth_loss_value = jnp.array(0.0, dtype=value.dtype)
         if bool(getattr(hparams, "use_added_loss", False)):
-            next_features = jax.lax.stop_gradient(minibatch.extras["next_emb"])
+            next_features = minibatch.extras["next_emb"]
             sample_weights = jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype)
             if hparams.mask_truncated:
                 sample_weights = sample_weights * (
@@ -452,13 +468,27 @@ def make_learner_fn(
             + inv_loss_mult * invariance_loss
             + rew_aux_loss_mult * aux_rew_loss
         )
-        if float(getattr(hparams, "gershgorin_loss_mult", 0.0)) > 0.0:
-            critic_objective += float(getattr(hparams, "gershgorin_loss_mult", 0.0)) * gershgorin_loss_value
-        if float(getattr(hparams, "orth_loss_mult", 0.0)) > 0.0:
-            critic_objective += float(getattr(hparams, "orth_loss_mult", 0.0)) * orth_loss_value
 
         unmasked_critic_total_loss = jnp.mean(critic_objective)
         loss = jnp.mean(per_scale * mask * critic_objective)
+
+        # Gershgorin and orthonormality are batch-level matrix losses, so add them after reducing the per-sample critic objective.
+        if float(getattr(hparams, "gershgorin_loss_mult", 0.0)) > 0.0:
+            weighted_gershgorin_loss = (
+                float(getattr(hparams, "gershgorin_loss_mult", 0.0))
+                * gershgorin_loss_value
+            )
+            unmasked_critic_total_loss += weighted_gershgorin_loss
+            loss += weighted_gershgorin_loss
+
+        if float(getattr(hparams, "orth_loss_mult", 0.0)) > 0.0:
+            weighted_orth_loss = (
+                float(getattr(hparams, "orth_loss_mult", 0.0))
+                * orth_loss_value
+            )
+            unmasked_critic_total_loss += weighted_orth_loss
+            loss += weighted_orth_loss
+
         critic_diag = {
             "critic_diag/critic_loss": critic_loss,
             "critic_diag/mc_bias": mc_bias,
