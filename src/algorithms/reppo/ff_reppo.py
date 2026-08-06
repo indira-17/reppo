@@ -42,13 +42,15 @@ def batch_orthonormality_loss(features: jax.Array, weights: jax.Array):
         jnp.sum(jnp.abs(correlation))
         - jnp.sum(jnp.abs(jnp.diag(correlation)))
     )
-    feature_correlation = off_diagonal_sum / max(
-        feature_dim * (feature_dim - 1), 1
-    )
+    feature_correlation = off_diagonal_sum / max(feature_dim * (feature_dim - 1), 1)
+
+    gram_eigenvalues = jnp.linalg.eigvalsh(gram_metrics)
+    gram_min_eigenval = gram_eigenvalues[0]
+    gram_max_eigenval = gram_eigenvalues[-1]
 
     return loss, gram, {
-        "gram_min_eigenval": jnp.min(jnp.linalg.eig(gram_metrics)[0]),
-        "gram_max_eigenval": jnp.max(jnp.linalg.eig(gram_metrics)[0]),
+        "gram_min_eigenval": gram_min_eigenval,
+        "gram_max_eigenval": gram_max_eigenval,
         "feature_correlation": feature_correlation,
     }
 
@@ -72,7 +74,7 @@ def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights:
     off_diag_radius = jnp.sum(jnp.abs(td_matrix), axis=-1) - jnp.abs(diag)
     margin = diag - off_diag_radius
     violation = jax.nn.relu(eps - margin)
-    loss = jnp.mean(violation)
+    loss = jnp.sum(violation) / td_matrix.size
 
     # Compute the minimum real eigenvalue for logging
     min_real_eigenval = jnp.min(jnp.real(jnp.linalg.eig(jax.lax.stop_gradient(td_matrix))[0]))
@@ -80,7 +82,7 @@ def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights:
     return loss, td_matrix, {
         "gershgorin_margin_min": margin.min(),
         "gershgorin_margin_mean": margin.mean(),
-        "min_real_eigen_value": min_real_eigenval,
+        "Aphi_min_real_eigenval": min_real_eigenval,
     }
 
 
@@ -444,24 +446,45 @@ def make_learner_fn(
         is_w = minibatch.extras.get("is_weight", None)
         per_scale = is_w.reshape(-1) if (data_type == 'PER' and is_w is not None) else 1.0
 
-        gershgorin_loss_value = jnp.array(0.0, dtype=value.dtype)
-        orth_loss_value = jnp.array(0.0, dtype=value.dtype)
-        if bool(getattr(hparams, "use_added_loss", False)):
-            next_features = minibatch.extras["next_emb"]
-            sample_weights = jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype)
-            if hparams.mask_truncated:
-                sample_weights = sample_weights * (
-                    1.0 - minibatch.truncated.reshape(-1).astype(curr_features.dtype)
-                )
-            sample_weights = sample_weights / jnp.maximum(sample_weights.sum(), 1.0)
-            continuation = jnp.where(
-                minibatch.truncated.reshape(-1).astype(bool),
-                jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype),
-                1.0 - minibatch.done.reshape(-1).astype(curr_features.dtype),
+        # Always compute the requested feature diagnostics. Only use their losses when use_added_loss=True.
+        next_features = minibatch.extras["next_emb"]
+        sample_weights = jnp.ones_like(
+            minibatch.done.reshape(-1), dtype=curr_features.dtype
+        )
+        if hparams.mask_truncated:
+            sample_weights = sample_weights * (
+                1.0 - minibatch.truncated.reshape(-1).astype(curr_features.dtype)
             )
+        sample_weights = sample_weights / jnp.maximum(sample_weights.sum(), 1.0)
+        continuation = jnp.where(
+            minibatch.truncated.reshape(-1).astype(bool),
+            jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype),
+            1.0 - minibatch.done.reshape(-1).astype(curr_features.dtype),
+        )
 
-            gershgorin_loss_value, _, gershgorin_metrics = gershgorin_loss(curr_features, next_features, sample_weights, continuation, gamma=hparams.gamma, eps=float(getattr(hparams, "gershgorin_eps", 1e-5)))
-            orth_loss_value, _, orth_metrics = batch_orthonormality_loss(curr_features, sample_weights)
+        computed_gershgorin_loss, _, gershgorin_metrics = gershgorin_loss(
+            curr_features,
+            next_features,
+            sample_weights,
+            continuation,
+            gamma=hparams.gamma,
+            eps=float(getattr(hparams, "gershgorin_eps", 1e-5)),
+        )
+        computed_orth_loss, _, orth_metrics = batch_orthonormality_loss(
+            curr_features,
+            sample_weights,
+        )
+        use_added_loss = bool(getattr(hparams, "use_added_loss", False))
+        gershgorin_loss_value = jnp.where(
+            use_added_loss,
+            computed_gershgorin_loss,
+            jnp.array(0.0, dtype=value.dtype),
+        )
+        orth_loss_value = jnp.where(
+            use_added_loss,
+            computed_orth_loss,
+            jnp.array(0.0, dtype=value.dtype),
+        )
 
         critic_objective = (
             critic_update_loss
@@ -474,18 +497,12 @@ def make_learner_fn(
 
         # Gershgorin and orthonormality are batch-level matrix losses, so add them after reducing the per-sample critic objective.
         if float(getattr(hparams, "gershgorin_loss_mult", 0.0)) > 0.0:
-            weighted_gershgorin_loss = (
-                float(getattr(hparams, "gershgorin_loss_mult", 0.0))
-                * gershgorin_loss_value
-            )
+            weighted_gershgorin_loss = float(getattr(hparams, "gershgorin_loss_mult", 0.0)) * gershgorin_loss_value
             unmasked_critic_total_loss += weighted_gershgorin_loss
             loss += weighted_gershgorin_loss
 
         if float(getattr(hparams, "orth_loss_mult", 0.0)) > 0.0:
-            weighted_orth_loss = (
-                float(getattr(hparams, "orth_loss_mult", 0.0))
-                * orth_loss_value
-            )
+            weighted_orth_loss = float(getattr(hparams, "orth_loss_mult", 0.0)) * orth_loss_value
             unmasked_critic_total_loss += weighted_orth_loss
             loss += weighted_orth_loss
 
@@ -503,12 +520,12 @@ def make_learner_fn(
             masked_critic_total_loss=loss,
             unmasked_critic_total_loss=unmasked_critic_total_loss,
             invariance_loss=invariance_loss,
-            gershgorin_loss=gershgorin_loss_value,
-            orth_loss=orth_loss_value,
+            gershgorin_loss=computed_gershgorin_loss,
+            orth_loss=computed_orth_loss,
             rew_aux_loss=aux_rew_loss,
             abs_batch_action=jnp.abs(minibatch.action).mean(),
-            **gershgorin_metrics if bool(getattr(hparams, "use_added_loss", False)) else {},
-            **orth_metrics if bool(getattr(hparams, "use_added_loss", False)) else {},
+            **gershgorin_metrics,
+            **orth_metrics,
             **critic_diag,
         )
 
@@ -981,8 +998,15 @@ def make_learner_fn(
         extras = compute_extras(key=act_key, train_state=train_state, batch=batch)
         batch.extras.update(extras)
 
-        # compute log probs
+        # compute log probs and ESS
         current_log_prob = batch.extras["current_log_prob"]
+        behavior_log_prob = batch.extras["behavior_log_prob"]
+        log_importance_ratio = current_log_prob - behavior_log_prob
+        importance_ratio = jnp.exp(jnp.clip(log_importance_ratio, -20.0, 20.0))
+        mean_importance_ratio = importance_ratio.mean()
+        importance_ratio_ess = jnp.square(importance_ratio.sum()) / (
+            jnp.square(importance_ratio).sum() + 1e-8
+        )
         reward_mean = batch.reward.mean()
         policy_log_prob_mean = current_log_prob.mean()
 
@@ -1034,6 +1058,8 @@ def make_learner_fn(
         base_metrics = {
             "reward_mean": reward_mean,
             "actor_diag/policy_log_prob_mean": policy_log_prob_mean,
+            "offpolicy/mean_importance_ratio": mean_importance_ratio,
+            "offpolicy/ess": importance_ratio_ess,
             # retrace coefficient: measure of off-policyness (1.0 = on-policy, < 1.0 = off-policy)
             "critic_diag/retrace_coeff_mean": retrace_coeff_mean,
             "actor_diag/retrace_coeff_mean": retrace_coeff_mean,

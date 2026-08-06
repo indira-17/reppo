@@ -467,7 +467,7 @@ def make_loop_train_fn(
     num_epochs: int = 4,
     prefill_buffer: int = 1,
     num_collection_blocks: int = 1, # for gershgorin with batch size 1k and the same UTD and optimisation frequency
-    num_replay_updates: int = 32,
+    num_replay_updates: int = 64,
 ):
     from src.runners.gymnasium_runner import (
         make_eval_fn as make_gymnasium_eval_fn,
@@ -550,7 +550,9 @@ def make_loop_train_fn(
         prefill_stds = [] # [0.6, 0.8, 1.0, 1.2]
         geometry_history = {
             "feature_correlation": [],
-            "min_real_eigen_value": [],
+            "Aphi_min_real_eigenval": [],
+            "gram_min_eigenval": [],
+            "gram_max_eigenval": [],
             "invariance_loss": [],
             "eval_return": [],
         }
@@ -689,11 +691,15 @@ def make_loop_train_fn(
             grad_updates = float(train_metrics.get("sys/grad_updates", 1.0))
 
             feature_correlation = float(np.asarray(jax.device_get(train_metrics["feature_correlation"]), dtype=np.float64).mean())
-            min_real_eigen_value = float(np.asarray(jax.device_get(train_metrics["min_real_eigen_value"]), dtype=np.float64).mean())
+            Aphi_min_real_eigenval = float(np.asarray(jax.device_get(train_metrics["Aphi_min_real_eigenval"]), dtype=np.float64).mean())
+            gram_min_eigenval = float(np.asarray(jax.device_get(train_metrics["gram_min_eigenval"]), dtype=np.float64).mean())
+            gram_max_eigenval = float(np.asarray(jax.device_get(train_metrics["gram_max_eigenval"]), dtype=np.float64).mean())
             invariance_loss = float(np.asarray(jax.device_get(train_metrics["invariance_loss"]), dtype=np.float64).mean())
 
             geometry_history["feature_correlation"].append(feature_correlation)
-            geometry_history["min_real_eigen_value"].append(min_real_eigen_value)
+            geometry_history["Aphi_min_real_eigenval"].append(Aphi_min_real_eigenval)
+            geometry_history["gram_min_eigenval"].append(gram_min_eigenval)
+            geometry_history["gram_max_eigenval"].append(gram_max_eigenval)
             geometry_history["invariance_loss"].append(invariance_loss)
             geometry_history["eval_return"].append(eval_return)
 
@@ -710,11 +716,29 @@ def make_loop_train_fn(
                 eigenvalue_table = wandb.Table(
                     data=list(
                         zip(
-                            geometry_history["min_real_eigen_value"],
+                            geometry_history["Aphi_min_real_eigenval"],
                             geometry_history["eval_return"],
                         )
                     ),
                     columns=["Minimum real eigenvalue", "Evaluation return"],
+                )
+                gram_min_table = wandb.Table(
+                    data=list(
+                        zip(
+                            geometry_history["gram_min_eigenval"],
+                            geometry_history["eval_return"],
+                        )
+                    ),
+                    columns=["Minimum Gram eigenvalue", "Evaluation return"],
+                )
+                gram_max_table = wandb.Table(
+                    data=list(
+                        zip(
+                            geometry_history["gram_max_eigenval"],
+                            geometry_history["eval_return"],
+                        )
+                    ),
+                    columns=["Maximum Gram eigenvalue", "Evaluation return"],
                 )
                 invariance_table = wandb.Table(
                     data=list(
@@ -739,6 +763,18 @@ def make_loop_train_fn(
                         "Evaluation return",
                         title="Minimum real eigenvalue vs evaluation return",
                     ),
+                    "geometry/gram_min_eigenvalue_vs_eval_return": wandb.plot.scatter(
+                        gram_min_table,
+                        "Minimum Gram eigenvalue",
+                        "Evaluation return",
+                        title="Minimum Gram eigenvalue vs evaluation return",
+                    ),
+                    "geometry/gram_max_eigenvalue_vs_eval_return": wandb.plot.scatter(
+                        gram_max_table,
+                        "Maximum Gram eigenvalue",
+                        "Evaluation return",
+                        title="Maximum Gram eigenvalue vs evaluation return",
+                    ),
                     "geometry/invariance_loss_vs_eval_return": wandb.plot.scatter(
                         invariance_table,
                         "Invariance loss",
@@ -747,7 +783,13 @@ def make_loop_train_fn(
                     ),
                 }
 
-                for metric_name in ("feature_correlation", "min_real_eigen_value", "invariance_loss"):
+                for metric_name in (
+                    "feature_correlation",
+                    "Aphi_min_real_eigenval",
+                    "gram_min_eigenval",
+                    "gram_max_eigenval",
+                    "invariance_loss",
+                ):
                     pearson = _pearson_correlation(geometry_history[metric_name], geometry_history["eval_return"])
                     spearman = _spearman_correlation(geometry_history[metric_name], geometry_history["eval_return"])
                     if pearson is not None:

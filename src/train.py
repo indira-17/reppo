@@ -1,17 +1,9 @@
-import hydra
-import jax
 import logging
-import time
-import wandb
-import torch
+
+import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from src.algorithms import envs, utils
-from src.common import InitFn, LearnerFn, PolicyFn
-from src.cfg_utils import fix_cfg
-
 logging.basicConfig(level=logging.INFO)
-
 
 @hydra.main(
     version_base=None,
@@ -19,6 +11,21 @@ logging.basicConfig(level=logging.INFO)
     config_name="reppo_continuous.yaml",
 )
 def main(cfg: DictConfig):
+    import os
+    import time
+
+    import jax
+    import jax.numpy as jnp
+    import torch
+    import wandb
+    import random
+    import numpy as np
+    from gymnasium import spaces
+
+    from src.algorithms import envs, utils
+    from src.cfg_utils import fix_cfg
+    from src.common import InitFn, LearnerFn, PolicyFn
+
     cfg = fix_cfg(cfg)
     OmegaConf.resolve(cfg)
     logging.info("\n" + OmegaConf.to_yaml(cfg))
@@ -46,6 +53,11 @@ def main(cfg: DictConfig):
         f"bc-reppo-{cfg.env.name}-retrace"
         if cfg.algorithm.bc_indicator
         else f"reppo-{cfg.env.name}"
+    )
+
+    run_name = os.environ.get(
+    "WANDB_RUN_NAME",
+    f"{base_run_name}-seed{cfg.seed}",
     )
 
     # All five Slurm array tasks receive the same group.
@@ -131,7 +143,7 @@ def main(cfg: DictConfig):
         demo_path=demo_path,
         filter_success=filter_success,
         cut_at_first_success=cut_at_first_success,
-        wandb_run=run,
+        wandb_run=wandb.run,
         critic_offline_warmup_iters=cfg.algorithm.get("critic_offline_warmup_iters", 0),
         data_type=data_type,
         max_buffer_size=cfg.algorithm.get("max_buffer_size", 1_000_000),
