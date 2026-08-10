@@ -212,8 +212,8 @@ class LogWrapper(Wrapper):
             key, state.env_state, action
         )
 
-        lin_vel = env_state.metrics["reward/tracking_lin_vel"]
-        ang_vel = env_state.metrics["reward/tracking_ang_vel"]
+        lin_vel = env_state.metrics.get("reward/tracking_lin_vel", jnp.zeros_like(state.episode_tracking_lin_vel))
+        ang_vel = env_state.metrics.get("reward/tracking_ang_vel", jnp.zeros_like(state.episode_tracking_ang_vel))
 
         new_episode_return = state.episode_returns + reward
         new_episode_length = state.episode_lengths + 1

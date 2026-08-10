@@ -52,7 +52,11 @@ lmbda_min: 0.95 # irrelevant if no exploration noise is added
 num_steps: 4
 num_envs: 1024
 num_epochs: 8
-num_mini_batches: 1 # critic epochs per learner call: critic UTD = num_epochs * num_critic_epochs = 8, actor stays at num_epochs
+num_mini_batches: 1
+replay_batch_size: 131_072
+prefill_buffer: 0
+num_collection_blocks: 1
+num_replay_updates: 8
 
 # exploration settings (currently not touched)
 exploration_noise_max: 1.0
@@ -93,6 +97,7 @@ ent_target_mult: 0.5
 update_entropy_lagrangian: true
 ## auxiliary loss settings              # global scale on the summed auxiliary losses
 # per-loss multipliers (set to 0.0 to switch a term off)
+aux_loss_mult: 1.0
 td_loss_mult: 1.0                 # value/TD (critic) loss
 inv_loss_mult: 1.0               # BatchNorm/F invariance loss (off for this diagnostic run)
 gershgorin_loss_mult: 0.0       # Gershgorin spectral-stability loss (off for this diagnostic run)
@@ -101,7 +106,7 @@ orth_loss_mult: 0.0              # orthonormality ‖ΦᵀΞΦ−I‖² on live 
 ## SR-DICE / representation optimization (Adam)
 use_sr_dice_ratio: false          # off for this experiment; ρ still computed/logged
 sr_dice_solve_ridge: 1.0e-5       # ridge εI on the (I−γF) successor solve for conditioning
-sr_dice_lr: 1.0e-3                 # lr for ν (ratio) and S (successor features)
+sr_dice_lr: 1.0e-5                 # lr for ν (ratio) and S (successor features)
 train_batch_norm_phi: false       # φ BatchNorm affine params frozen by default; set true to re-enable training them
 batch_norm_phi_lr: 1.0e-3         # lr for the φ BatchNorm affine parameters (only used if train_batch_norm_phi)
 feature_dynamics_lr: 1.0e-3       # lr for the feature-dynamics matrix F

@@ -26,9 +26,17 @@ train_fn:
   num_eval: ${algorithm.num_eval}
   max_episode_steps: ${algorithm.max_episode_steps}
   stochastic_eval: ${env.stochastic_eval}
-  cut_at_first_success: ${env.cut_at_first_success}
-  critic_offline_warmup_iters: ${algorithm.critic_offline_warmup_iters}
+
   data_type: ${algorithm.data_type}
   max_buffer_size: ${algorithm.max_buffer_size}
+  replay_batch_size: ${algorithm.replay_batch_size}
   per_alpha: ${algorithm.per_alpha}
   per_beta: ${algorithm.per_beta}
+  num_epochs: ${algorithm.num_epochs}
+  prefill_buffer: ${algorithm.prefill_buffer}
+  num_collection_blocks: ${algorithm.num_collection_blocks}
+  num_replay_updates: ${algorithm.num_replay_updates}
+
+  filter_success: ${env.filter_success}
+  cut_at_first_success: ${env.cut_at_first_success}
+  critic_offline_warmup_iters: ${algorithm.critic_offline_warmup_iters}

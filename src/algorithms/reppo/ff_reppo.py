@@ -86,50 +86,7 @@ def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights:
     }
 
 
-def compute_successor_start_mean(dice_params: dict[str, jax.Array], start_phi: jax.Array):
-    """Compute E_{d₀,π}[ψ(s₀,a₀)] from cached live-policy features."""
-    successor = jax.lax.stop_gradient(dice_params["sr_dice_successor"])
-    successor_start = jax.lax.stop_gradient(start_phi) @ successor
-    return jax.lax.stop_gradient(successor_start.reshape((-1, successor_start.shape[-1])).mean(axis=0))
-
-def fit_sr_dice_ratio(dice_params: dict[str, jax.Array], train_state: REPPOTrainState, batch: Transition, hparams, action_space: Space, successor_start_mean: jax.Array):
-    """Evaluate SR-DICE from the cached shared feature φ_k(s,a)."""
-    del train_state, action_space
-    phi = jax.lax.stop_gradient(batch.extras["sr_dice_phi"])
-    flat_phi = phi.reshape((-1, phi.shape[-1]))
-    done = batch.done.reshape(-1)
-    truncated = batch.truncated.reshape(-1)
-    valid_weights = jnp.ones_like(done, dtype=flat_phi.dtype)
-    if hparams.mask_truncated:
-        valid_weights = valid_weights * (1.0 - truncated.astype(flat_phi.dtype))
-    valid_weights = valid_weights / jnp.maximum(valid_weights.sum(), 1.0)
-    nu = dice_params["sr_dice_nu"]
-    rho = flat_phi @ nu
-    successor_start_mean = jax.lax.stop_gradient(successor_start_mean)
-    ratio_loss = 0.5 * jnp.sum(valid_weights * jnp.square(rho)) - (1.0 - hparams.gamma) * jnp.dot(nu, successor_start_mean)
-    rho_flat = rho.reshape(-1)
-    # ESS is defined for non-negative importance weights. Use the same positive
-    # clipping as the actor ratio, and exclude transitions masked from the
-    # SR-DICE objective. This is the raw ESS in [1, number of valid samples].
-    valid_mask = valid_weights > 0.0
-    rho_ess_weights = jnp.where(
-        valid_mask,
-        jnp.clip(rho_flat, a_min=1e-5),
-        jnp.zeros_like(rho_flat),
-    )
-    rho_ess = (jnp.sum(rho_ess_weights) ** 2) / (
-        jnp.sum(jnp.square(rho_ess_weights)) + 1e-8
-    )
-    metrics = {
-        "sr_dice/ratio_loss": ratio_loss,
-        "sr_dice/rho_mean": rho_flat.mean(),
-        "sr_dice/rho_std": rho_flat.std(),
-        "sr_dice/rho_ess": rho_ess,
-    }
-    return rho.reshape(batch.done.shape), metrics
-
 def successor_feature_td_loss(curr_features: jax.Array, next_features: jax.Array, weights: jax.Array, continuation: jax.Array, successor: jax.Array, gamma: float):
-    """Semi-gradient TD loss for ψ_k(s,a)ᵀ = φ_k(s,a)ᵀS_k."""
     curr_features = jax.lax.stop_gradient(curr_features)
     next_features = jax.lax.stop_gradient(next_features)
     weights = jax.lax.stop_gradient(weights)
@@ -142,9 +99,27 @@ def successor_feature_td_loss(curr_features: jax.Array, next_features: jax.Array
     )
     residual = successor_features - target
     per_sample_loss = 0.5 * jnp.sum(jnp.square(residual), axis=-1)
-    loss = jnp.sum(weights * per_sample_loss) / curr_features.shape[-1]
+    return jnp.sum(weights * per_sample_loss) / curr_features.shape[-1]
 
-    return loss, {"sr_dice/successor_loss": loss}
+
+def fit_sr_dice_ratio(nu: jax.Array, features: jax.Array, weights: jax.Array, successor_start_mean: jax.Array, gamma: float):
+    features = jax.lax.stop_gradient(features)
+    weights = jax.lax.stop_gradient(weights)
+    successor_start_mean = jax.lax.stop_gradient(successor_start_mean)
+    rho = features @ nu
+    ratio_loss = 0.5 * jnp.sum(weights * jnp.square(rho)) - (1.0 - gamma) * jnp.dot(nu, successor_start_mean)
+    valid_mask = weights > 0.0
+    rho_ess_weights = jnp.where(valid_mask, jnp.clip(rho, a_min=1e-5), jnp.zeros_like(rho))
+    rho_ess = (jnp.sum(rho_ess_weights) ** 2) / (
+        jnp.sum(jnp.square(rho_ess_weights)) + 1e-8
+    )
+    return ratio_loss, {
+        "sr_dice/ratio_loss": ratio_loss,
+        "sr_dice/rho_mean": rho.mean(),
+        "sr_dice/rho_std": rho.std(),
+        "sr_dice/rho_ess": rho_ess,
+    }
+
 
 def load_bc_weights_to_actor(bc_checkpoint_path: str, jax_actor: nnx.Module) -> nnx.Module:
     """
@@ -267,23 +242,11 @@ def make_init_fn(
         rngs = nnx.Rngs(model_key)
 
         optim_fn = hydra.utils.instantiate(hparams.optimizer)
-        base_lr = hparams.optimizer.learning_rate
-        actor_lr = getattr(hparams, "actor_lr_start", base_lr)
 
         if hparams.max_grad_norm is not None:
             tx = optax.chain(optax.clip_by_global_norm(hparams.max_grad_norm), optim_fn)
         else:
             tx = optim_fn
-
-        actor_optim = optax.adam(learning_rate=actor_lr)
-        actor_tx = (
-            optax.chain(optax.clip_by_global_norm(hparams.max_grad_norm), actor_optim)
-            if hparams.max_grad_norm is not None
-            else actor_optim
-        )
-        logging.info(
-            f"Actor optimizer: fixed lr={actor_lr:.1e}, critic_lr={base_lr:.1e}"
-        )
 
         if hparams.normalize_env:
             normalizer = Normalizer()
@@ -302,6 +265,16 @@ def make_init_fn(
             observation_space=observation_space,
             rngs=rngs,
         )
+
+        dummy_obs = jax.tree.map(
+            lambda x: jnp.zeros((1,) + x.shape, dtype=jnp.float32),
+            observation_space.sample(key),
+        )
+        if isinstance(action_space, Discrete):
+            dummy_action = jnp.zeros((1,), dtype=jnp.int32)
+        else:
+            dummy_action = jnp.zeros((1,) + action_space.shape, dtype=jnp.float32)
+        feature_dim = critic(dummy_obs, dummy_action)["embed"].shape[-1]
 
         # Print JAX actor structure
         logging.info("JAX Actor structure successfully created")
@@ -326,10 +299,14 @@ def make_init_fn(
 
         return REPPOTrainState.create(
             graphdef=nnx.graphdef(actor),
-            params=nnx.state(actor),
+            params={
+                "sr_dice_nu": jnp.zeros((feature_dim,), dtype=jnp.float32),
+                "sr_dice_successor": jnp.eye(feature_dim, dtype=jnp.float32),
+                "sr_dice_start_phi": jnp.zeros((hparams.num_envs, feature_dim), dtype=jnp.float32),
+            },
             tx=optax.set_to_zero(),
             actor=nnx.TrainState.create(
-                graphdef=nnx.graphdef(actor), params=nnx.state(actor), tx=actor_tx
+                graphdef=nnx.graphdef(actor), params=nnx.state(actor), tx=tx
             ),
             critic=nnx.TrainState.create(
                 graphdef=nnx.graphdef(critic), params=nnx.state(critic), tx=tx
@@ -403,11 +380,13 @@ def make_learner_fn(
         )
         # Preserve the exact old concatenated-loss weighting while keeping invariance and reward prediction separate for ablations.
         feature_dim = pred_features.shape[-1]
-        inv_loss_mult = (float(getattr(hparams, "inv_loss_mult", 1.0)) * feature_dim / (feature_dim + 1))
+        inv_loss_mult = (float(getattr(hparams, "inv_loss_mult", 0.0)) * feature_dim / (feature_dim + 1))
         rew_aux_loss_mult = (float(getattr(hparams, "rew_aux_loss_mult", 0.0)) / (feature_dim + 1))
 
         invariance_loss = jnp.mean(done_mask * invariance_error, axis=-1)
         aux_rew_loss = jnp.mean(done_mask * reward_error, axis=-1)
+        logged_aux_loss = jnp.mean(done_mask * jnp.concatenate([invariance_error, reward_error], axis=-1), axis=-1)
+        logged_invariance_loss = jnp.mean(done_mask * invariance_error)
 
         # total_aux_loss = jnp.mean(
         #     (1 - minibatch.done.reshape(-1, 1))
@@ -447,7 +426,7 @@ def make_learner_fn(
         per_scale = is_w.reshape(-1) if (data_type == 'PER' and is_w is not None) else 1.0
 
         # Always compute the requested feature diagnostics. Only use their losses when use_added_loss=True.
-        next_features = minibatch.extras["next_emb"]
+        next_features = minibatch.extras["diagnostic_next_emb"]
         sample_weights = jnp.ones_like(
             minibatch.done.reshape(-1), dtype=curr_features.dtype
         )
@@ -488,8 +467,8 @@ def make_learner_fn(
 
         critic_objective = (
             critic_update_loss
-            + inv_loss_mult * invariance_loss
-            + rew_aux_loss_mult * aux_rew_loss
+            + hparams.aux_loss_mult
+            * inv_loss_mult * invariance_loss + rew_aux_loss_mult * aux_rew_loss
         )
 
         unmasked_critic_total_loss = jnp.mean(critic_objective)
@@ -506,27 +485,19 @@ def make_learner_fn(
             unmasked_critic_total_loss += weighted_orth_loss
             loss += weighted_orth_loss
 
-        critic_diag = {
-            "critic_diag/critic_loss": critic_loss,
-            "critic_diag/mc_bias": mc_bias,
-            "critic_diag/mc_error_var": mc_error_var,
-            "critic_diag/td_error_mean": td_error_mean,
-            "critic_diag/target_mean": target_mean,
-            "critic_diag/target_var": target_var,
-            "critic_diag/q": q_mean,
-        }
         return loss, dict(
+            value_loss=critic_loss,
             critic_update_loss=critic_update_loss,
-            masked_critic_total_loss=loss,
-            unmasked_critic_total_loss=unmasked_critic_total_loss,
-            invariance_loss=invariance_loss,
-            gershgorin_loss=computed_gershgorin_loss,
-            orth_loss=computed_orth_loss,
-            rew_aux_loss=aux_rew_loss,
-            abs_batch_action=jnp.abs(minibatch.action).mean(),
-            **gershgorin_metrics,
+            loss=loss,
+            aux_loss=logged_aux_loss,
+            invariance_loss=logged_invariance_loss,
+            rew_aux_loss=reward_error,
             **orth_metrics,
-            **critic_diag,
+            **gershgorin_metrics,
+            q=value.mean(),
+            abs_batch_action=jnp.abs(minibatch.action).mean(),
+            reward_mean=minibatch.reward.mean(),
+            target_values=target_values.mean(),
         )
 
     def actor_loss(
@@ -652,20 +623,21 @@ def make_learner_fn(
         real_action_log_prob = old_pi.log_prob(minibatch.action.clip(-0.999, 0.999)).mean()
 
         return loss, dict(
+            actor_loss=actor_loss,
+            loss=loss,
             temp=actor_model.temperature(),
+            abs_batch_action=jnp.abs(minibatch.action).mean(),
             abs_pred_action=jnp.abs(pred_action).mean()
             if not discrete_actions
             else 0.0,
+            reward_mean=minibatch.reward.mean(),
+            kl=kl.mean(),
             lagrangian=lagrangian,
             lagrangian_loss=lagrangian_loss,
+            entropy=entropy,
             entropy_loss=target_entropy_loss,
-            # --- actor diagnostics ---
-            **{
-                "actor_diag/kl": kl.mean(),
-                "actor_diag/entropy": jnp.mean(entropy),
-                "actor_diag/actor_loss": jnp.mean(actor_loss),
-                "actor_diag/real_action_log_prob": real_action_log_prob,
-            },
+            target_values=minibatch.extras["target_values"].mean(),
+            real_action_log_prob=real_action_log_prob,
         )
 
     def compute_policy_kl(
@@ -695,6 +667,93 @@ def make_learner_fn(
                 pi_act_log_prob = pi.log_prob(old_pi_action).mean(0)
                 kl = old_pi_act_log_prob - pi_act_log_prob
         return kl
+
+    def compute_epoch_diagnostics(key: Key, train_state: REPPOTrainState, batch: Transition):
+        next_action_key, _ = jax.random.split(key)
+        actor_target_model = nnx.merge(train_state.actor.graphdef, train_state.actor_target.params)
+        critic_model = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
+        actor_target_model.eval()
+        critic_model.eval()
+        next_action = actor_target_model(batch.next_obs).sample(seed=next_action_key)
+        if not discrete_actions:
+            next_action = next_action.clip(-0.999, 0.999)
+        next_features = jax.lax.stop_gradient(critic_model(batch.next_obs, next_action)["embed"])
+        return batch.replace(extras={**batch.extras, "diagnostic_next_emb": next_features})
+
+    def compute_dice_features(key: Key, train_state: REPPOTrainState, batch: Transition, initial_obs: jax.Array):
+        next_action_key, start_action_key = jax.random.split(key)
+        actor_target_model = nnx.merge(train_state.actor.graphdef, train_state.actor_target.params)
+        critic_model = nnx.merge(train_state.critic.graphdef, train_state.critic.params)
+        actor_target_model.eval()
+        critic_model.eval()
+        next_action = actor_target_model(batch.next_obs).sample(seed=next_action_key)
+        start_action = actor_target_model(initial_obs).sample(seed=start_action_key)
+        if not discrete_actions:
+            next_action = next_action.clip(-0.999, 0.999)
+            start_action = start_action.clip(-0.999, 0.999)
+        curr_features = jax.lax.stop_gradient(critic_model(batch.obs, batch.action)["embed"])
+        next_features = jax.lax.stop_gradient(critic_model(batch.next_obs, next_action)["embed"])
+        start_features = jax.lax.stop_gradient(critic_model(initial_obs, start_action)["embed"])
+        return batch.replace(extras={**batch.extras, "sr_dice_phi": curr_features, "sr_dice_next_phi": next_features}), start_features
+
+    def dice_update(train_state: REPPOTrainState, minibatch: Transition):
+        curr_features = jax.lax.stop_gradient(minibatch.extras["sr_dice_phi"])
+        next_features = jax.lax.stop_gradient(minibatch.extras["sr_dice_next_phi"])
+        start_features = jax.lax.stop_gradient(train_state.params["sr_dice_start_phi"])
+
+        weights = jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype)
+        if hparams.mask_truncated:
+            weights = weights * (
+                1.0 - minibatch.truncated.reshape(-1).astype(curr_features.dtype)
+            )
+        weights = weights / jnp.maximum(weights.sum(), 1.0)
+        continuation = jnp.where(
+            minibatch.truncated.reshape(-1).astype(bool),
+            jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype),
+            1.0 - minibatch.done.reshape(-1).astype(curr_features.dtype),
+        )
+        dice_lr = float(getattr(hparams, "sr_dice_lr", 1e-5))
+
+        def successor_loss_fn(successor):
+            return successor_feature_td_loss(
+                curr_features,
+                next_features,
+                weights,
+                continuation,
+                successor,
+                hparams.gamma,
+            )
+
+        successor_loss, successor_grad = jax.value_and_grad(successor_loss_fn)(train_state.params["sr_dice_successor"])
+        successor_grad = jnp.nan_to_num(successor_grad, nan=0.0, posinf=1.0, neginf=-1.0)
+        successor = train_state.params["sr_dice_successor"] - dice_lr * successor_grad
+        successor_start_mean = jax.lax.stop_gradient((start_features @ jax.lax.stop_gradient(successor)).mean(axis=0))
+
+        def ratio_loss_fn(nu):
+            return fit_sr_dice_ratio(
+                nu,
+                curr_features,
+                weights,
+                successor_start_mean,
+                hparams.gamma,
+            )
+
+        (_, _), nu_grad = jax.value_and_grad(ratio_loss_fn, has_aux=True)(train_state.params["sr_dice_nu"])
+        nu_grad = jnp.nan_to_num(nu_grad, nan=0.0, posinf=1.0, neginf=-1.0)
+        nu = train_state.params["sr_dice_nu"] - dice_lr * nu_grad
+        ratio_loss, ratio_metrics = fit_sr_dice_ratio(nu, curr_features, weights, successor_start_mean, hparams.gamma)
+        train_state = train_state.replace(
+            params={
+                **train_state.params,
+                "sr_dice_successor": successor,
+                "sr_dice_nu": nu,
+            }
+        )
+        return train_state, {
+            **ratio_metrics,
+            "sr_dice/successor_loss": successor_loss,
+            "sr_dice/ratio_loss": ratio_loss,
+        }
 
     def update(train_state: REPPOTrainState, batch: Transition):
         # Update critic always
@@ -789,11 +848,11 @@ def make_learner_fn(
         return train_state, {
             **critic_metrics,
             **actor_metrics,
-            "actor_diag/grad_norm": grad_norm
+            "grad_norm": grad_norm,
         }
 
     def run_epoch(
-        key: jax.Array, train_state: REPPOTrainState, batch: Transition
+        key: jax.Array, train_state: REPPOTrainState, batch: Transition, initial_obs: jax.Array
     ) -> tuple[REPPOTrainState, dict[str, jax.Array]]:
 
         if getattr(hparams, "use_one_step_td", True):
@@ -809,6 +868,10 @@ def make_learner_fn(
                 batch.extras["target_advs"],
                 _,
             ) = nstep_lambda(batch=batch)
+
+        diagnostic_key = jax.random.fold_in(key, 2718)
+        dice_key = jax.random.fold_in(key, 31415)
+        batch = compute_epoch_diagnostics(diagnostic_key, train_state, batch)
 
         # Shuffle data and split into mini-batches
         key, shuffle_key, act_key, kl_key = jax.random.split(key, 4)
@@ -836,14 +899,26 @@ def make_learner_fn(
 
         # Compute mean metrics across mini-batches
         metrics_mean = jax.tree.map(lambda x: x.mean(0), metrics)
-        # Gradient variance: Var(||g_θ||) across mini-batches
-        metrics_mean["actor_diag/grad_norm_var"] = jnp.var(metrics["actor_diag/grad_norm"])
+
+        dice_feature_key, dice_shuffle_key = jax.random.split(dice_key)
+        dice_batch, start_features = compute_dice_features(dice_feature_key, train_state, batch, initial_obs)
+        train_state = train_state.replace(params={**train_state.params, "sr_dice_start_phi": start_features})
+        dice_indices = jax.random.permutation(dice_shuffle_key, batch_size)
+        dice_minibatch_idxs = jax.tree.map(
+            lambda x: x.reshape(
+                (hparams.num_mini_batches, mini_batch_size, *x.shape[1:])
+            ),
+            dice_indices,
+        )
+        dice_minibatches = jax.tree.map(lambda x: jnp.take(x, dice_minibatch_idxs, axis=0), dice_batch)
+        train_state, dice_metrics = jax.lax.scan(dice_update, train_state, dice_minibatches)
+        dice_metrics_mean = jax.tree.map(lambda x: x.mean(0), dice_metrics)
         # Compute max metrics across mini-batches
         # metrics_max = jax.tree.map(lambda x: x.max(), metrics)
         # metrics_min = jax.tree.map(lambda x: x.min(), metrics)
         return (
             train_state,
-            metrics_mean,
+            {**metrics_mean, **dice_metrics_mean},
         )  # {**metrics_mean, **{k + "_max": v for k, v in metrics_max.items()}, **{k + "_min": v for k, v in metrics_min.items()}}
 
     def nstep_lambda(batch: Transition):
@@ -981,9 +1056,10 @@ def make_learner_fn(
     def learner_fn(
         key: Key, train_state: REPPOTrainState, batch: Transition
     ) -> tuple[REPPOTrainState, dict[str, jax.Array]]:
+        initial_obs = train_state.params["sr_dice_initial_obs"]
         if hparams.normalize_env:
-            new_norm_state = normalizer.update(
-                train_state.normalization_state, batch.obs
+            initial_obs = normalizer.normalize(
+                train_state.normalization_state, initial_obs
             )
             batch = batch.replace(
                 obs=normalizer.normalize(train_state.normalization_state, batch.obs),
@@ -991,7 +1067,6 @@ def make_learner_fn(
                     train_state.normalization_state, batch.next_obs
                 ),
             )
-            train_state = train_state.replace(normalization_state=new_norm_state)
 
         # compute n-step lambda estimates
         key, act_key = jax.random.split(key)
@@ -1031,7 +1106,7 @@ def make_learner_fn(
         # Update the model for a number of epochs
         key, train_key, pv_after_key = jax.random.split(key, 3)
         train_state, update_metrics = jax.lax.scan(
-            f=lambda train_state, key: run_epoch(key, train_state, batch),
+            f=lambda train_state, key: run_epoch(key, train_state, batch, initial_obs),
             init=train_state,
             xs=jax.random.split(train_key, hparams.num_epochs),
         )
@@ -1056,15 +1131,7 @@ def make_learner_fn(
         )
 
         base_metrics = {
-            "reward_mean": reward_mean,
-            "actor_diag/policy_log_prob_mean": policy_log_prob_mean,
-            "offpolicy/mean_importance_ratio": mean_importance_ratio,
-            "offpolicy/ess": importance_ratio_ess,
-            # retrace coefficient: measure of off-policyness (1.0 = on-policy, < 1.0 = off-policy)
-            "critic_diag/retrace_coeff_mean": retrace_coeff_mean,
-            "actor_diag/retrace_coeff_mean": retrace_coeff_mean,
-            "actor_diag/policy_improvement": policy_improvement,
-            "sys/grad_updates": (train_state.time_steps // (hparams.num_steps * hparams.num_envs)) * hparams.num_epochs * hparams.num_mini_batches,
+            "sys/grad_updates_per_learner_call": hparams.num_epochs * hparams.num_mini_batches,
         }
         update_metrics = {**update_metrics, **base_metrics}
         return train_state, update_metrics, per_env_td_error

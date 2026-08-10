@@ -51,6 +51,120 @@ def _spearman_correlation(x, y):
         return None
     return _pearson_correlation(_rankdata(x), _rankdata(y))
 
+def _update_geometry_history_and_log(geometry_history, wandb_run, state, train_metrics, eval_return):
+    feature_correlation = float(
+        np.asarray(
+            jax.device_get(train_metrics["feature_correlation"]),
+            dtype=np.float64,
+        ).mean()
+    )
+    Aphi_min_real_eigenval = float(
+        np.asarray(
+            jax.device_get(train_metrics["Aphi_min_real_eigenval"]),
+            dtype=np.float64,
+        ).mean()
+    )
+    gram_min_eigenval = float(
+        np.asarray(
+            jax.device_get(train_metrics["gram_min_eigenval"]),
+            dtype=np.float64,
+        ).mean()
+    )
+    gram_max_eigenval = float(
+        np.asarray(
+            jax.device_get(train_metrics["gram_max_eigenval"]),
+            dtype=np.float64,
+        ).mean()
+    )
+    invariance_loss = float(
+        np.asarray(
+            jax.device_get(train_metrics["invariance_loss"]),
+            dtype=np.float64,
+        ).mean()
+    )
+
+    geometry_history["feature_correlation"].append(feature_correlation)
+    geometry_history["Aphi_min_real_eigenval"].append(Aphi_min_real_eigenval)
+    geometry_history["gram_min_eigenval"].append(gram_min_eigenval)
+    geometry_history["gram_max_eigenval"].append(gram_max_eigenval)
+    geometry_history["invariance_loss"].append(invariance_loss)
+    geometry_history["eval_return"].append(eval_return)
+
+    if wandb_run is None:
+        return
+
+    feature_table = wandb.Table(
+        data=list(zip(geometry_history["feature_correlation"], geometry_history["eval_return"])),
+        columns=["Feature correlation", "Evaluation return"],
+    )
+    eigenvalue_table = wandb.Table(
+        data=list(zip(geometry_history["Aphi_min_real_eigenval"], geometry_history["eval_return"])),
+        columns=["Minimum real eigenvalue", "Evaluation return"],
+    )
+    gram_min_table = wandb.Table(
+        data=list(zip(geometry_history["gram_min_eigenval"], geometry_history["eval_return"])),
+        columns=["Minimum Gram eigenvalue", "Evaluation return"],
+    )
+    gram_max_table = wandb.Table(
+        data=list(zip(geometry_history["gram_max_eigenval"], geometry_history["eval_return"])),
+        columns=["Maximum Gram eigenvalue", "Evaluation return"],
+    )
+    invariance_table = wandb.Table(
+        data=list(zip(geometry_history["invariance_loss"], geometry_history["eval_return"])),
+        columns=["Invariance loss", "Evaluation return"],
+    )
+
+    geometry_logs = {
+        "geometry/feature_correlation_vs_eval_return": wandb.plot.scatter(
+            feature_table,
+            "Feature correlation",
+            "Evaluation return",
+            title="Feature correlation vs evaluation return",
+        ),
+        "geometry/min_real_eigenvalue_vs_eval_return": wandb.plot.scatter(
+            eigenvalue_table,
+            "Minimum real eigenvalue",
+            "Evaluation return",
+            title="Minimum real eigenvalue vs evaluation return",
+        ),
+        "geometry/gram_min_eigenvalue_vs_eval_return": wandb.plot.scatter(
+            gram_min_table,
+            "Minimum Gram eigenvalue",
+            "Evaluation return",
+            title="Minimum Gram eigenvalue vs evaluation return",
+        ),
+        "geometry/gram_max_eigenvalue_vs_eval_return": wandb.plot.scatter(
+            gram_max_table,
+            "Maximum Gram eigenvalue",
+            "Evaluation return",
+            title="Maximum Gram eigenvalue vs evaluation return",
+        ),
+        "geometry/invariance_loss_vs_eval_return": wandb.plot.scatter(
+            invariance_table,
+            "Invariance loss",
+            "Evaluation return",
+            title="Invariance loss vs evaluation return",
+        ),
+    }
+
+    for metric_name in (
+        "feature_correlation",
+        "Aphi_min_real_eigenval",
+        "gram_min_eigenval",
+        "gram_max_eigenval",
+        "invariance_loss",
+    ):
+        pearson = _pearson_correlation(geometry_history[metric_name], geometry_history["eval_return"])
+        spearman = _spearman_correlation(geometry_history[metric_name], geometry_history["eval_return"])
+        if pearson is not None:
+            geometry_logs[f"geometry_correlation/{metric_name}_pearson"] = pearson
+        if spearman is not None:
+            geometry_logs[f"geometry_correlation/{metric_name}_spearman"] = spearman
+
+    # Leave the step open so the existing log_callback commits the
+    # evaluation metrics at the same state.time_steps value.
+    wandb_run.log(geometry_logs, step=int(np.asarray(jax.device_get(state.time_steps)).reshape(-1)[0]), commit=False)
+
 def to_jax(x):
     if isinstance(x, np.ndarray):
         return jnp.array(x)
@@ -75,15 +189,12 @@ def to_torch(x):
 
 def _update_initial_obs_pool(initial_obs_pool: jax.Array, reset_obs: jax.Array, episode_ended: jax.Array) -> jax.Array:
     """Replace pool entries only with post-auto-reset observations."""
-    mask = episode_ended.astype(bool).reshape(
-        (episode_ended.shape[0],) + (1,) * (reset_obs.ndim - 1)
-    )
+    mask = episode_ended.astype(bool).reshape((episode_ended.shape[0],) + (1,) * (reset_obs.ndim - 1))
     return jnp.where(mask, reset_obs, initial_obs_pool)
 
 def _sample_initial_obs(key: Key, initial_obs_pool: jax.Array, sample_size: int) -> jax.Array:
     indices = jax.random.randint(key, shape=(sample_size,), minval=0, maxval=initial_obs_pool.shape[0])
     return jnp.take(initial_obs_pool, indices, axis=0)
-
 
 def _contains_humanoid_bench(*objects) -> bool:
     """Best-effort check for HumanoidBench runner/config context.
@@ -130,7 +241,7 @@ def _contains_humanoid_bench(*objects) -> bool:
     return False
 
 def make_scan_train_fn(
-    env: gymnasium.Env | tuple[gymnasium.Env, gymnasium.Env],
+    env: Environment | tuple[Environment, Environment],
     total_time_steps: int,
     num_seeds: int,
     num_steps: int,
@@ -141,30 +252,25 @@ def make_scan_train_fn(
     init_fn: InitFn,
     policy_fn: PolicyFn,
     learner_fn: LearnerFn,
+    data_type: str,
+    max_buffer_size: int,
+    replay_batch_size: int,
+    per_alpha: float,
+    per_beta: float,
+    num_epochs: int,
+    prefill_buffer: int,
+    num_collection_blocks: int,
+    num_replay_updates: int,
     rollout_fn: RolloutFn | None = None,
     eval_fn: EvalFn | None = None,
     log_callback: LogCallback | None = None,
-    demo_path: str | None = None,
-    bc_indicator: bool = False,
-    decay_rate: float = 1.0,
-    filter_success: bool = True,
-    wandb_run = None,
-    cut_at_first_success: bool = True,
-    critic_offline_warmup_iters: int = 0,
-    data_type: str = "expert",
-    max_buffer_size: int = 1_000_000,
-    per_alpha: float = 0.6,
-    per_beta: float = 0.4,
-    num_epochs: int = 4,
-    prefill_buffer: int = 2,
-    num_collection_blocks: int = 1,
 ) -> TrainFn:
     from src.runners.gymnax_runner import (
         make_eval_fn as make_gymnax_eval_fn,
         make_rollout_fn as make_gymnax_rollout_fn,
     )
 
-    # Initialize the environment and wrap it to admit vectorized behavior.
+    # Keep the online runner schedule and logging unchanged.
     if isinstance(env, tuple):
         env, eval_env = env
     else:
@@ -176,23 +282,38 @@ def make_scan_train_fn(
         eval_fn = make_gymnax_eval_fn(eval_env, max_episode_steps)
 
     if rollout_fn is None:
-        rollout_fn = make_gymnax_rollout_fn(env, num_steps=num_steps, num_envs=num_envs)
+        rollout_fn = make_gymnax_rollout_fn(
+            env, num_steps=num_steps, num_envs=num_envs
+        )
 
     if log_callback is None:
         log_callback = lambda state, metrics: None
 
+    if num_epochs < 1:
+        raise ValueError("num_epochs must be >= 1.")
+    if prefill_buffer < 0:
+        raise ValueError("prefill_buffer must be >= 0.")
+    if num_collection_blocks < 1:
+        raise ValueError("num_collection_blocks must be >= 1.")
+    if num_replay_updates < 1:
+        raise ValueError("num_replay_updates must be >= 1.")
     if data_type not in ("random", "PER"):
+        raise ValueError("data_type must be 'random' or 'PER'.")
+    if replay_batch_size > max_buffer_size:
+        raise ValueError("replay_batch_size must be <= max_buffer_size.")
+
+    # One Flashbax item is one transition. Sampling starts after one configured
+    # rollout has been inserted. Item-buffer sampling is with replacement.
+    min_buffer_length = num_steps * num_envs
+    if max_buffer_size < min_buffer_length:
         raise ValueError(
-            "Flashbax replay supports data_type='random' or data_type='PER'. "
-            "The expert replay path is separate from this SAC-style buffer path."
+            "max_buffer_size must hold at least one collected rollout."
         )
 
-    # Each buffer item is one transition; sample a full IID TD(0) training batch.
-    replay_batch_size = num_steps * num_envs
     if data_type == "random":
         buffer_fn = fbx.make_item_buffer(
             max_length=max_buffer_size,
-            min_length=replay_batch_size,
+            min_length=min_buffer_length,
             sample_batch_size=replay_batch_size,
             add_sequences=False,
             add_batches=True,
@@ -200,243 +321,278 @@ def make_scan_train_fn(
     else:
         buffer_fn = fbx.make_prioritised_item_buffer(
             max_length=max_buffer_size,
-            min_length=replay_batch_size,
+            min_length=min_buffer_length,
             sample_batch_size=replay_batch_size,
             add_sequences=False,
             add_batches=True,
             priority_exponent=per_alpha,
-            device="gpu",
         )
 
-    # One collection step -> one fixed Flashbax replay batch -> learner_fn once. learner_fn owns the num_epochs scan.
-    def train_step_replay(carry: tuple, key: Key) -> tuple:
-        state, buffer_state, initial_obs_pool = carry
-        key, rollout_key, learn_key, sample_key = jax.random.split(
-            key, 4
+    def _buffer_transition(transitions: Transition) -> Transition:
+        return Transition(
+            obs=transitions.obs,
+            next_obs=transitions.next_obs,
+            action=transitions.action,
+            reward=transitions.reward,
+            done=transitions.done,
+            truncated=transitions.truncated,
+            extras={
+                "behavior_log_prob": transitions.extras["behavior_log_prob"],
+            },
         )
 
+    def _add_to_buffer(buffer_state, transitions: Transition):
+        transitions = _buffer_transition(transitions)
+        flat_transitions = jax.tree.map(
+            lambda x: x.reshape((num_steps * num_envs, *x.shape[2:])),
+            transitions,
+        )
+        return buffer_fn.add(buffer_state, flat_transitions)
+
+    def _sample_from_buffer(buffer_state, sample_key: Key) -> tuple[Transition, object]:
+        sampled = buffer_fn.sample(buffer_state, sample_key)
+        transitions = jax.tree.map(
+            lambda x: x.reshape((1, replay_batch_size, *x.shape[1:])),
+            sampled.experience,
+        )
+
+        if data_type == "PER":
+            num_valid = jnp.where(
+                buffer_state.is_full,
+                max_buffer_size,
+                buffer_state.current_index,
+            )
+            is_weight = (
+                jnp.maximum(num_valid, 1)
+                * jnp.maximum(sampled.probabilities, 1e-8)
+            ) ** (-per_beta)
+            is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
+            transitions = transitions.replace(
+                extras={
+                    **transitions.extras,
+                    "is_weight": is_weight.reshape((1, replay_batch_size)),
+                }
+            )
+
+        return transitions, sampled
+
+    def _collect_and_add(state, buffer_state, rollout_key):
         policy = policy_fn(state, False)
-        rollout_transitions, state = rollout_fn(
+        transitions, state = rollout_fn(
             key=rollout_key, train_state=state, policy=policy
         )
 
-        # In the auto-reset Gymnasium/HumanoidBench runners, transition.next_obs is the terminal observation while state.last_obs is the post-reset s_0.
+        # Exactly the online SR-DICE d0-pool update.
         episode_ended = jnp.logical_or(
-            rollout_transitions.done[-1].astype(bool),
-            rollout_transitions.truncated[-1].astype(bool),
+            transitions.done[-1].astype(bool),
+            transitions.truncated[-1].astype(bool),
         )
-        initial_obs_pool = _update_initial_obs_pool(
-            initial_obs_pool, state.last_obs, episode_ended
+        initial_obs_pool = state.params["sr_dice_initial_obs"]
+        initial_obs_mask = episode_ended.reshape(
+            (episode_ended.shape[0],)
+            + (1,) * (state.last_obs.ndim - 1)
         )
-
-        replay_transitions = Transition(
-            obs=rollout_transitions.obs,
-            next_obs=rollout_transitions.next_obs,
-            action=rollout_transitions.action,
-            reward=rollout_transitions.reward,
-            done=rollout_transitions.done,
-            truncated=rollout_transitions.truncated,
-            extras={
-                "behavior_log_prob": rollout_transitions.extras[
-                    "behavior_log_prob"
-                ],
-            },
-        )
-        flat_replay_transitions = jax.tree.map(
-            lambda x: x.reshape((num_steps * num_envs, *x.shape[2:])),
-            replay_transitions,
-        )
-        buffer_state = buffer_fn.add(
-            buffer_state,
-            flat_replay_transitions,
-        )
-
-        # Sample IID transitions and reshape them to the learner's existing
-        # [num_steps, num_envs, ...] batch layout.
-        # Keep learner-facing Transition leaves time-aligned: do not attach
-        # non-temporal initial-state samples to Transition.extras.
-        if data_type == "PER":
-            def _sample_from_buffer(_):
-                sampled = buffer_fn.sample(buffer_state, sample_key)
-                num_valid = jnp.where(
-                    buffer_state.is_full,
-                    max_buffer_size,
-                    buffer_state.current_index,
-                )
-                is_weight = (
-                    jnp.maximum(num_valid, 1)
-                    * jnp.maximum(sampled.probabilities, 1e-8)
-                ) ** (-per_beta)
-                is_weight = is_weight / jnp.maximum(is_weight.max(), 1e-8)
-                transitions = jax.tree.map(
-                    lambda x: x.reshape((num_steps, num_envs, *x.shape[1:])),
-                    sampled.experience,
-                )
-                transitions = transitions.replace(
-                    extras={
-                        **transitions.extras,
-                        "is_weight": is_weight.reshape((num_steps, num_envs)),
-                    }
-                )
-                return transitions, sampled.indices, jnp.array(True)
-
-            def _use_fresh_rollout(_):
-                transitions = replay_transitions.replace(
-                    extras={
-                        **replay_transitions.extras,
-                        "is_weight": jnp.ones(
-                            (num_steps, num_envs), dtype=jnp.float32
-                        ),
-                    }
-                )
-                return (
-                    transitions,
-                    jnp.zeros((replay_batch_size,), dtype=jnp.int32),
-                    jnp.array(False),
-                )
-
-            transitions, sampled_indices, used_replay = jax.lax.cond(
-                buffer_fn.can_sample(buffer_state),
-                _sample_from_buffer,
-                _use_fresh_rollout,
-                operand=None,
-            )
-        else:
-            def _sample_from_buffer(_):
-                sampled = buffer_fn.sample(buffer_state, sample_key)
-                return jax.tree.map(
-                    lambda x: x.reshape((num_steps, num_envs, *x.shape[1:])),
-                    sampled.experience,
-                )
-
-            transitions = jax.lax.cond(
-                buffer_fn.can_sample(buffer_state),
-                _sample_from_buffer,
-                lambda _: replay_transitions.replace(
-                    extras={
-                        **replay_transitions.extras,
-                    }
+        state = state.replace(
+            params={
+                **state.params,
+                "sr_dice_initial_obs": jnp.where(
+                    initial_obs_mask,
+                    state.last_obs,
+                    initial_obs_pool,
                 ),
-                operand=None,
-            )
-
-        # actor_target snapshot + num_epochs now live inside learner_fn, matching the old working REPPO flow. Do not resample between epochs here.
-        state, update_metrics, per_env_td_error = learner_fn(
-            key=learn_key, train_state=state, batch=transitions
+            }
         )
 
-        if data_type == "PER":
-            buffer_state = jax.lax.cond(
-                used_replay,
-                lambda b: buffer_fn.set_priorities(
-                    b,
-                    sampled_indices,
+        buffer_state = _add_to_buffer(buffer_state, transitions)
+        return state, buffer_state
+
+    def train_step(
+        carry: tuple[TrainState, object], key: Key
+    ) -> tuple[tuple[TrainState, object], dict[str, jax.Array]]:
+        state, buffer_state = carry
+        key, collection_key, replay_key = jax.random.split(key, 3)
+
+        # The YAML controls how many fresh rollout blocks precede replay.
+        def collection_step(carry, rollout_key):
+            state, buffer_state = carry
+            state, buffer_state = _collect_and_add(
+                state, buffer_state, rollout_key
+            )
+            return (state, buffer_state), None
+
+        (state, buffer_state), _ = jax.lax.scan(
+            collection_step,
+            (state, buffer_state),
+            jax.random.split(collection_key, num_collection_blocks),
+        )
+
+        # Replace online reuse by fresh replay draws. actor_target refresh stays
+        # exactly where it was in the off-policy pipeline: before each learner call.
+        def replay_update(carry, update_key):
+            state, buffer_state = carry
+            sample_key, learn_key = jax.random.split(update_key)
+
+            replay_batch, sampled = _sample_from_buffer(
+                buffer_state, sample_key
+            )
+
+            state = state.replace(
+                actor_target=state.actor_target.replace(
+                    params=state.actor.params
+                )
+            )
+
+            state, update_metrics, per_env_td_error = learner_fn(
+                key=learn_key,
+                train_state=state,
+                batch=replay_batch,
+            )
+
+            if data_type == "PER":
+                buffer_state = buffer_fn.set_priorities(
+                    buffer_state,
+                    sampled.indices,
                     jnp.abs(per_env_td_error).reshape(-1) + 1e-6,
-                ),
-                lambda b: b,
-                buffer_state,
-            )
+                )
 
-        state = state.replace(iteration=state.iteration + 1)
+            return (state, buffer_state), update_metrics
 
-        namespaced = {k: v for k, v in update_metrics.items() if "/" in k}
-        plain = {k: v for k, v in update_metrics.items() if "/" not in k}
-        jax.debug.callback(
-            log_callback,
-            state,
-            {**utils.prefix_dict("train", plain), **namespaced},
+        (state, buffer_state), update_metrics = jax.lax.scan(
+            replay_update,
+            (state, buffer_state),
+            jax.random.split(replay_key, num_replay_updates),
         )
-        return (state, buffer_state, initial_obs_pool), update_metrics
 
-    # Eval step: runs eval_interval train steps then evaluates
-    def train_eval_step_replay(key, train_state, scan_buf):
-        buffer_state, initial_obs_pool = scan_buf
+        # Match online train_step: expose the last learner-call metrics and
+        # increment iteration once per environment collection/update step.
+        update_metrics = jax.tree.map(lambda x: x[-1], update_metrics)
+        state = state.replace(iteration=state.iteration + 1)
+        return (state, buffer_state), update_metrics
+
+    def train_eval_step(key, train_state, buffer_state):
         train_key, eval_key = jax.random.split(key)
-        (train_state, buffer_state, initial_obs_pool), stacked_metrics = jax.lax.scan(
-            f=train_step_replay,
-            init=(train_state, buffer_state, initial_obs_pool),
+        (train_state, buffer_state), train_metrics = jax.lax.scan(
+            f=train_step,
+            init=(train_state, buffer_state),
             xs=jax.random.split(train_key, eval_interval),
         )
-        scan_buf = (buffer_state, initial_obs_pool)
-        train_metrics = jax.tree.map(lambda x: x[-1], stacked_metrics)
+        train_metrics = jax.tree.map(lambda x: x[-1], train_metrics)
+
         policy = policy_fn(train_state, not stochastic_eval)
         eval_metrics = eval_fn(eval_key, policy)
-        eval_return = eval_metrics["episode_return"]
-        grad_updates = train_metrics.get("sys/grad_updates", jnp.array(1.0))
-        transitions_used = train_state.time_steps
-        log_metrics_eval = utils.prefix_dict("eval", eval_metrics)
-        log_metrics_eval.update({
-            "sys/perf_per_grad_update": eval_return / jnp.maximum(grad_updates, 1.0),
-            "sys/perf_per_transaction": eval_return / jnp.maximum(transitions_used, 1),
-        })
-        jax.debug.callback(log_callback, train_state, log_metrics_eval)
-        return train_state, scan_buf, {
+        metrics = {
             **utils.prefix_dict("train", train_metrics),
             **utils.prefix_dict("eval", eval_metrics),
         }
+        return train_state, buffer_state, metrics
 
-    # Outer scan body: vmaps eval step over seeds, threads (state, buf) carry
     def train_eval_loop_body(carry, key):
-        train_state, scan_buf = carry
+        train_state, buffer_state = carry
         key, subkey = jax.random.split(key)
-        keys = jax.random.split(subkey, num_seeds)
-        train_state, scan_buf, metrics = jax.vmap(train_eval_step_replay)(
-            keys, train_state, scan_buf
+        train_state, buffer_state, metrics = jax.vmap(train_eval_step)(
+            jax.random.split(subkey, num_seeds),
+            train_state,
+            buffer_state,
         )
         jax.debug.callback(log_callback, train_state, metrics)
-        return (train_state, scan_buf), metrics
+        return (train_state, buffer_state), metrics
 
     def init_train_state(key: Key) -> TrainState:
+        # Keep online initialization exactly, including SR-DICE initial states.
         key, env_key = jax.random.split(key)
         train_state = init_fn(key)
-        # obs, env_state = utils.init_env_state(key=env_key, env=env, num_envs=num_envs)
         env_key = jax.random.split(env_key, num_envs)
         obs, env_state = env.reset(env_key)
-        train_state = train_state.replace(last_obs=obs, last_env_state=env_state)
+        train_state = train_state.replace(
+            last_obs=obs,
+            last_env_state=env_state,
+            params={
+                **train_state.params,
+                "sr_dice_initial_obs": obs,
+            },
+        )
         return train_state
 
-    # Define the training loop
     def scan_train_fn(key: Key) -> tuple[TrainState, dict]:
+        # Keep the online evaluation/collection scheduling exactly.
         num_train_steps = total_time_steps // (num_steps * num_envs)
         num_iterations = num_train_steps // eval_interval + int(
             num_train_steps % eval_interval != 0
         )
-        key, init_key, warmup_key = jax.random.split(key, 3)
-        init_keys = jax.random.split(init_key, num_seeds)
-        train_state = jax.vmap(init_train_state)(init_keys)
 
-        # One rollout supplies the Flashbax template only. The first actual
-        # scan update falls back to fresh data until the buffer can sample.
+        key, init_key = jax.random.split(key)
+        train_state = jax.vmap(init_train_state)(
+            jax.random.split(init_key, num_seeds)
+        )
+
+        # Infer replay item shapes without executing an uncounted rollout.
         state0 = jax.tree.map(lambda x: x[0], train_state)
-        warmup_policy = policy_fn(state0, False)
-        rt_template, _ = rollout_fn(
-            key=warmup_key, train_state=state0, policy=warmup_policy
+        template_key = jax.random.fold_in(init_key, 1)
+
+        def rollout_for_shape(shape_key, shape_state):
+            return rollout_fn(
+                key=shape_key,
+                train_state=shape_state,
+                policy=policy_fn(shape_state, False),
+            )
+
+        rollout_shape, _ = jax.eval_shape(
+            rollout_for_shape,
+            template_key,
+            state0,
         )
-        rt_template = Transition(
-            obs=rt_template.obs,
-            next_obs=rt_template.next_obs,
-            action=rt_template.action,
-            reward=rt_template.reward,
-            done=rt_template.done,
-            truncated=rt_template.truncated,
-            extras={
-                "behavior_log_prob": rt_template.extras["behavior_log_prob"],
-            },
+        rollout_template = jax.tree.map(
+            lambda x: jnp.zeros(x.shape, x.dtype),
+            rollout_shape,
         )
-        seed_buf = buffer_fn.init(jax.tree.map(lambda x: x[0, 0], rt_template))
-        scan_buf_init = (
-            jax.tree.map(lambda x: jnp.broadcast_to(x, (num_seeds,) + x.shape), seed_buf),
-            train_state.last_obs,
+        replay_template = _buffer_transition(rollout_template)
+        item_template = jax.tree.map(
+            lambda x: x[0, 0],
+            replay_template,
         )
+        seed_buffer_state = buffer_fn.init(item_template)
+        buffer_state = jax.tree.map(
+            lambda x: jnp.broadcast_to(x, (num_seeds,) + x.shape),
+            seed_buffer_state,
+        )
+
+        # Optional prefill is controlled only by YAML. For the paper baseline
+        # prefill_buffer=0, so this executes zero environment interactions.
+        if prefill_buffer > 0:
+            prefill_seed_keys = jax.random.split(jax.random.fold_in(init_key, 2), num_seeds)
+
+            def prefill_seed(state, seed_buffer, seed_key):
+                def prefill_step(carry, _):
+                    state, seed_buffer, seed_key = carry
+                    seed_key, rollout_key = jax.random.split(seed_key)
+                    state, seed_buffer = _collect_and_add(
+                        state, seed_buffer, rollout_key
+                    )
+                    return (state, seed_buffer, seed_key), None
+
+                (state, seed_buffer, _), _ = jax.lax.scan(
+                    prefill_step,
+                    (state, seed_buffer, seed_key),
+                    xs=None,
+                    length=prefill_buffer,
+                )
+                return state, seed_buffer
+
+            train_state, buffer_state = jax.vmap(prefill_seed)(
+                train_state,
+                buffer_state,
+                prefill_seed_keys,
+            )
 
         keys = jax.random.split(key, num_iterations)
         (state, _), metrics = jax.lax.scan(
-            f=train_eval_loop_body, init=(train_state, scan_buf_init), xs=keys
+            f=train_eval_loop_body,
+            init=(train_state, buffer_state),
+            xs=keys,
         )
         return state, metrics
 
     return jax.jit(scan_train_fn)
-
 
 def make_loop_train_fn(
     env: gymnasium.Env | tuple[gymnasium.Env, gymnasium.Env],
@@ -449,6 +605,15 @@ def make_loop_train_fn(
     init_fn: InitFn,
     policy_fn: PolicyFn,
     learner_fn: LearnerFn,
+    data_type: str,
+    max_buffer_size: int,
+    replay_batch_size: int,
+    per_alpha: float,
+    per_beta: float,
+    num_epochs: int,
+    prefill_buffer: int,
+    num_collection_blocks: int,
+    num_replay_updates: int,
     rollout_fn: RolloutFn | None = None,
     eval_fn: EvalFn | None = None,
     log_callback: LogCallback | None = None,
@@ -459,15 +624,6 @@ def make_loop_train_fn(
     wandb_run = None,
     cut_at_first_success: bool = True,
     critic_offline_warmup_iters: int = 0,
-    data_type: str = "expert",
-    max_buffer_size: int = 1_000_000,
-    replay_batch_size: int = 16384,
-    per_alpha: float = 0.6,
-    per_beta: float = 0.4,
-    num_epochs: int = 4,
-    prefill_buffer: int = 1,
-    num_collection_blocks: int = 1, # for gershgorin with batch size 1k and the same UTD and optimisation frequency
-    num_replay_updates: int = 64,
 ):
     from src.runners.gymnasium_runner import (
         make_eval_fn as make_gymnasium_eval_fn,
@@ -690,120 +846,7 @@ def make_loop_train_fn(
             eval_return = float(eval_metrics["episode_return"])
             grad_updates = float(train_metrics.get("sys/grad_updates", 1.0))
 
-            feature_correlation = float(np.asarray(jax.device_get(train_metrics["feature_correlation"]), dtype=np.float64).mean())
-            Aphi_min_real_eigenval = float(np.asarray(jax.device_get(train_metrics["Aphi_min_real_eigenval"]), dtype=np.float64).mean())
-            gram_min_eigenval = float(np.asarray(jax.device_get(train_metrics["gram_min_eigenval"]), dtype=np.float64).mean())
-            gram_max_eigenval = float(np.asarray(jax.device_get(train_metrics["gram_max_eigenval"]), dtype=np.float64).mean())
-            invariance_loss = float(np.asarray(jax.device_get(train_metrics["invariance_loss"]), dtype=np.float64).mean())
-
-            geometry_history["feature_correlation"].append(feature_correlation)
-            geometry_history["Aphi_min_real_eigenval"].append(Aphi_min_real_eigenval)
-            geometry_history["gram_min_eigenval"].append(gram_min_eigenval)
-            geometry_history["gram_max_eigenval"].append(gram_max_eigenval)
-            geometry_history["invariance_loss"].append(invariance_loss)
-            geometry_history["eval_return"].append(eval_return)
-
-            if wandb_run is not None:
-                feature_table = wandb.Table(
-                    data=list(
-                        zip(
-                            geometry_history["feature_correlation"],
-                            geometry_history["eval_return"],
-                        )
-                    ),
-                    columns=["Feature correlation", "Evaluation return"],
-                )
-                eigenvalue_table = wandb.Table(
-                    data=list(
-                        zip(
-                            geometry_history["Aphi_min_real_eigenval"],
-                            geometry_history["eval_return"],
-                        )
-                    ),
-                    columns=["Minimum real eigenvalue", "Evaluation return"],
-                )
-                gram_min_table = wandb.Table(
-                    data=list(
-                        zip(
-                            geometry_history["gram_min_eigenval"],
-                            geometry_history["eval_return"],
-                        )
-                    ),
-                    columns=["Minimum Gram eigenvalue", "Evaluation return"],
-                )
-                gram_max_table = wandb.Table(
-                    data=list(
-                        zip(
-                            geometry_history["gram_max_eigenval"],
-                            geometry_history["eval_return"],
-                        )
-                    ),
-                    columns=["Maximum Gram eigenvalue", "Evaluation return"],
-                )
-                invariance_table = wandb.Table(
-                    data=list(
-                        zip(
-                            geometry_history["invariance_loss"],
-                            geometry_history["eval_return"],
-                        )
-                    ),
-                    columns=["Invariance loss", "Evaluation return"],
-                )
-
-                geometry_logs = {
-                    "geometry/feature_correlation_vs_eval_return": wandb.plot.scatter(
-                        feature_table,
-                        "Feature correlation",
-                        "Evaluation return",
-                        title="Feature correlation vs evaluation return",
-                    ),
-                    "geometry/min_real_eigenvalue_vs_eval_return": wandb.plot.scatter(
-                        eigenvalue_table,
-                        "Minimum real eigenvalue",
-                        "Evaluation return",
-                        title="Minimum real eigenvalue vs evaluation return",
-                    ),
-                    "geometry/gram_min_eigenvalue_vs_eval_return": wandb.plot.scatter(
-                        gram_min_table,
-                        "Minimum Gram eigenvalue",
-                        "Evaluation return",
-                        title="Minimum Gram eigenvalue vs evaluation return",
-                    ),
-                    "geometry/gram_max_eigenvalue_vs_eval_return": wandb.plot.scatter(
-                        gram_max_table,
-                        "Maximum Gram eigenvalue",
-                        "Evaluation return",
-                        title="Maximum Gram eigenvalue vs evaluation return",
-                    ),
-                    "geometry/invariance_loss_vs_eval_return": wandb.plot.scatter(
-                        invariance_table,
-                        "Invariance loss",
-                        "Evaluation return",
-                        title="Invariance loss vs evaluation return",
-                    ),
-                }
-
-                for metric_name in (
-                    "feature_correlation",
-                    "Aphi_min_real_eigenval",
-                    "gram_min_eigenval",
-                    "gram_max_eigenval",
-                    "invariance_loss",
-                ):
-                    pearson = _pearson_correlation(geometry_history[metric_name], geometry_history["eval_return"])
-                    spearman = _spearman_correlation(geometry_history[metric_name], geometry_history["eval_return"])
-                    if pearson is not None:
-                        geometry_logs[f"geometry_correlation/{metric_name}_pearson"] = pearson
-                    if spearman is not None:
-                        geometry_logs[f"geometry_correlation/{metric_name}_spearman"] = spearman
-
-                # Leave the step open so the existing log_callback commits the
-                # evaluation metrics at the same state.time_steps value.
-                wandb_run.log(
-                    geometry_logs,
-                    step=int(np.asarray(jax.device_get(state.time_steps)).reshape(-1)[0]),
-                    commit=False,
-                )
+            _update_geometry_history_and_log(geometry_history, wandb_run, state, train_metrics, eval_return)
 
             eval_metrics["num_samples"] = num_samples
 

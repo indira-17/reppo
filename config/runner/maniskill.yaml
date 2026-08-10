@@ -18,16 +18,28 @@ eval_fn:
   env_id: ${env.name}
   filter_success: ${env.demo.filter_success}
   cut_at_first_success: ${env.demo.cut_at_first_success}
-  
+
 train_fn:
   _target_: src.algorithms.training.make_loop_train_fn
   _partial_: true
-  num_steps: ${algorithm.num_steps}
   total_time_steps: ${algorithm.total_time_steps}
+  num_steps: ${algorithm.num_steps}
   num_envs: ${algorithm.num_envs}
   num_eval: ${algorithm.num_eval}
   max_episode_steps: ${algorithm.max_episode_steps}
-  stochastic_eval: True
+  stochastic_eval: ${env.stochastic_eval}
+
+  data_type: ${algorithm.data_type}
+  max_buffer_size: ${algorithm.max_buffer_size}
+  replay_batch_size: ${algorithm.replay_batch_size}
+  per_alpha: ${algorithm.per_alpha}
+  per_beta: ${algorithm.per_beta}
+  num_epochs: ${algorithm.num_epochs}
+  prefill_buffer: ${algorithm.prefill_buffer}
+  num_collection_blocks: ${algorithm.num_collection_blocks}
+  num_replay_updates: ${algorithm.num_replay_updates}
+
+  demo_path: ${env.demo.demo_path}
   filter_success: ${env.demo.filter_success}
   cut_at_first_success: ${env.demo.cut_at_first_success}
   critic_offline_warmup_iters: ${algorithm.critic_offline_warmup_iters}
