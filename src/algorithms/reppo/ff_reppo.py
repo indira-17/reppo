@@ -445,7 +445,10 @@ def make_learner_fn(
         per_scale = is_w.reshape(-1) if (data_type == 'PER' and is_w is not None) else 1.0
 
         # Always compute the requested feature diagnostics. Only use their losses when use_added_loss=True.
-        next_features = minibatch.extras["diagnostic_next_emb"]
+        # next_features = minibatch.extras["diagnostic_next_emb"]
+        next_features = jax.lax.stop_gradient(
+            critic_model(minibatch.next_obs, minibatch.extras["diagnostic_next_action"])["embed"]
+        )
         sample_weights = jnp.ones_like(
             minibatch.done.reshape(-1), dtype=curr_features.dtype
         )
@@ -698,7 +701,7 @@ def make_learner_fn(
         if not discrete_actions:
             next_action = next_action.clip(-0.999, 0.999)
         next_features = jax.lax.stop_gradient(critic_model(batch.next_obs, next_action)["embed"])
-        return batch.replace(extras={**batch.extras, "diagnostic_next_emb": next_features})
+        return batch.replace(extras={**batch.extras, "diagnostic_next_action": next_action})
 
     def compute_dice_features(key: Key, train_state: REPPOTrainState, batch: Transition, initial_obs: jax.Array):
         next_action_key, start_action_key = jax.random.split(key)
