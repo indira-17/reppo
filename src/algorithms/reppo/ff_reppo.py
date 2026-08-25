@@ -25,7 +25,12 @@ import distrax
 
 logging.basicConfig(level=logging.INFO)
 
-def batch_orthonormality_loss(features: jax.Array, weights: jax.Array):
+def batch_orthonormality_loss(
+    features: jax.Array,
+    weights: jax.Array,
+    reward: jax.Array,
+    successor: jax.Array,
+):
     weights = jax.lax.stop_gradient(weights)
     feature_dim = features.shape[-1]
     identity = jnp.eye(feature_dim, dtype=features.dtype)
@@ -34,6 +39,8 @@ def batch_orthonormality_loss(features: jax.Array, weights: jax.Array):
 
     # Logging only: mean absolute off-diagonal entry of the normalized Gram matrix.
     gram_metrics = jax.lax.stop_gradient(gram)
+    features_metrics = jax.lax.stop_gradient(features)
+    reward_metrics = jax.lax.stop_gradient(reward.reshape(-1).astype(features.dtype))
     feature_scale = jnp.sqrt(jnp.clip(jnp.diag(gram_metrics), a_min=1e-8))
     correlation = gram_metrics / (
         feature_scale[:, None] * feature_scale[None, :] + 1e-8
@@ -44,14 +51,60 @@ def batch_orthonormality_loss(features: jax.Array, weights: jax.Array):
     )
     feature_correlation = off_diagonal_sum / max(feature_dim * (feature_dim - 1), 1)
 
-    gram_eigenvalues = jnp.linalg.eigvalsh(gram_metrics)
+    gram_eigenvalues, gram_eigenvectors = jnp.linalg.eigh(gram_metrics)
     gram_min_eigenval = gram_eigenvalues[0]
     gram_max_eigenval = gram_eigenvalues[-1]
+
+    # Reward energy along each Gram eigendirection:
+    # E_i = ((Phi v_i)^T Xi r)^2 / lambda_i.
+    feature_reward = features_metrics.T @ (weights * reward_metrics)
+    reward_alignment = gram_eigenvectors.T @ feature_reward
+    reward_energy = jnp.where(
+        gram_eigenvalues > 1e-8,
+        jnp.square(reward_alignment) / jnp.clip(gram_eigenvalues, a_min=1e-8),
+        0.0,
+    )
+
+    # Logging only: conditioning of the immediate-reward-relevant subspace and its successor-propagated future-value subspace.
+    # U_r contains the Gram eigendirections with the largest reward energy.
+    # With row-wise successor features Psi = Phi S and r ~= Phi w,
+    # Q^pi ~= Psi w = Phi S w, so span(S U_r) is the corresponding successor-propagated value-relevant subspace.
+    subspace_dim = min(10, feature_dim)
+    _, reward_indices = jax.lax.top_k(reward_energy, subspace_dim)
+    reward_basis = gram_eigenvectors[:, reward_indices]
+
+    reward_subspace_gram = reward_basis.T @ gram_metrics @ reward_basis
+    reward_subspace_eigenvalues = jnp.linalg.eigvalsh(reward_subspace_gram)
+    reward_subspace_kappa = (
+        jnp.clip(reward_subspace_eigenvalues[-1], a_min=0.0)
+        / jnp.clip(reward_subspace_eigenvalues[0], a_min=1e-8)
+    )
+
+    successor_metrics = jax.lax.stop_gradient(successor)
+    value_basis_raw = successor_metrics @ reward_basis
+    value_basis, _ = jnp.linalg.qr(value_basis_raw, mode="reduced")
+
+    value_subspace_gram = value_basis.T @ gram_metrics @ value_basis
+    value_subspace_eigenvalues = jnp.linalg.eigvalsh(value_subspace_gram)
+    value_subspace_kappa = (
+        jnp.clip(value_subspace_eigenvalues[-1], a_min=0.0)
+        / jnp.clip(value_subspace_eigenvalues[0], a_min=1e-8)
+    )
+
+    k = min(10, feature_dim)
+    bottom10_reward_energy = reward_energy[:k]
+    top10_reward_energy = reward_energy[-k:]
 
     return loss, gram, {
         "gram_min_eigenval": gram_min_eigenval,
         "gram_max_eigenval": gram_max_eigenval,
         "feature_correlation": feature_correlation,
+        "reward_energy_top10_mean": top10_reward_energy.mean(),
+        "reward_energy_top10_var": top10_reward_energy.var(),
+        "reward_energy_bottom10_mean": bottom10_reward_energy.mean(),
+        "reward_energy_bottom10_var": bottom10_reward_energy.var(),
+        "reward_subspace_kappa": reward_subspace_kappa,
+        "value_subspace_kappa": value_subspace_kappa,
     }
 
 def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights: jax.Array, continuation: jax.Array, gamma: float, eps: float = 1e-5):
@@ -452,6 +505,8 @@ def make_learner_fn(
         computed_orth_loss, _, orth_metrics = batch_orthonormality_loss(
             curr_features,
             sample_weights,
+            minibatch.reward,
+            train_state.params["sr_dice_successor"],
         )
         use_added_loss = bool(getattr(hparams, "use_added_loss", False))
         gershgorin_loss_value = jnp.where(
