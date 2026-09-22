@@ -12,6 +12,10 @@ eval_fn:
 train_fn:
   _target_: src.algorithms.training.make_scan_train_fn
   _partial_: true
+  adaptive_cadence: true
+  cadence_probe_size: 256
+  cadence_num_action_samples: 4
+  # Keep all your existing train_fn settings here.
   total_time_steps: ${algorithm.total_time_steps}
   num_seeds: ${num_seeds}
   num_steps: ${algorithm.num_steps}

@@ -30,7 +30,6 @@ def _pearson_correlation(x, y):
         return None
     return float(np.corrcoef(x, y)[0, 1])
 
-
 def _rankdata(values):
     values = np.asarray(values, dtype=np.float64)
     order = np.argsort(values, kind="mergesort")
@@ -264,6 +263,9 @@ def make_scan_train_fn(
     rollout_fn: RolloutFn | None = None,
     eval_fn: EvalFn | None = None,
     log_callback: LogCallback | None = None,
+    adaptive_cadence: bool = False,
+    cadence_probe_size: int = 256,
+    cadence_num_action_samples: int = 4,
 ) -> TrainFn:
     from src.runners.gymnax_runner import (
         make_eval_fn as make_gymnax_eval_fn,
@@ -297,6 +299,15 @@ def make_scan_train_fn(
         raise ValueError("num_collection_blocks must be >= 1.")
     if num_replay_updates < 1:
         raise ValueError("num_replay_updates must be >= 1.")
+    if adaptive_cadence:
+        if num_replay_updates < 2:
+            raise ValueError("Adaptive cadence requires num_replay_updates >= 2.")
+        if not 1 <= cadence_probe_size <= replay_batch_size:
+            raise ValueError("cadence_probe_size must be between 1 and replay_batch_size.")
+        if cadence_num_action_samples < 1:
+            raise ValueError("cadence_num_action_samples must be >= 1.")
+        # Import only when enabled; other algorithms/runner paths are unchanged.
+        from src.algorithms.reppo.ff_reppo import measure_replay_update_efficiency
     if data_type not in ("random", "PER"):
         raise ValueError("data_type must be 'random' or 'PER'.")
     if replay_batch_size > max_buffer_size:
@@ -457,15 +468,93 @@ def make_scan_train_fn(
 
             return (state, buffer_state), update_metrics
 
-        (state, buffer_state), update_metrics = jax.lax.scan(
-            replay_update,
-            (state, buffer_state),
-            jax.random.split(replay_key, num_replay_updates),
-        )
+        if adaptive_cadence:
+            # Freeze Q and the replay-state probe BEFORE any learner updates.
+            reference_critic_params = state.critic.params
+            keys = jax.random.split(replay_key, num_replay_updates + 1)
+            probe_batch, _ = _sample_from_buffer(buffer_state, keys[0])
+            probe_obs = probe_batch.obs[0, :cadence_probe_size]
+            epsilon = 1e-8
 
-        # Match online train_step: expose the last learner-call metrics and
-        # increment iteration once per environment collection/update step.
-        update_metrics = jax.tree.map(lambda x: x[-1], update_metrics)
+            # The first block establishes the baseline efficiency. The first
+            # comparison is possible only after the second block.
+            previous_actor_params = state.actor.params
+            (state, buffer_state), update_metrics = replay_update(
+                (state, buffer_state), keys[1]
+            )
+            delta_q, delta_kl = measure_replay_update_efficiency(
+                jax.random.fold_in(keys[1], 2718),
+                state,
+                previous_actor_params,
+                reference_critic_params,
+                probe_obs,
+                cadence_num_action_samples,
+            )
+            total_q = delta_q
+            total_kl = delta_kl
+            last_eta = delta_q / (delta_kl + epsilon)
+            # Carry the most recent executed metrics through skipped iterations.
+            initial_carry = (
+                state, buffer_state, update_metrics, total_q, total_kl,
+                delta_q, delta_kl, last_eta,
+                jnp.array(1, dtype=jnp.int32),
+                jnp.array(True),
+            )
+
+            def adaptive_update(carry, update_key):
+                def execute(carry):
+                    (state, buffer_state, _, total_q, total_kl,
+                     _, _, _, count, _) = carry
+                    previous_average = total_q / (total_kl + epsilon)
+                    previous_actor_params = state.actor.params
+                    (state, buffer_state), metrics = replay_update(
+                        (state, buffer_state), update_key
+                    )
+                    delta_q, delta_kl = measure_replay_update_efficiency(
+                        jax.random.fold_in(update_key, 2718),
+                        state,
+                        previous_actor_params,
+                        reference_critic_params,
+                        probe_obs,
+                        cadence_num_action_samples,
+                    )
+                    eta = delta_q / (delta_kl + epsilon)
+                    # Exact selected criterion: compare the marginal efficiency
+                    # against the CUMULATIVE average BEFORE this update.
+                    keep_going = eta > previous_average
+                    return (
+                        state, buffer_state, metrics,
+                        total_q + delta_q, total_kl + delta_kl,
+                        delta_q, delta_kl, eta,
+                        count + 1, keep_going,
+                    )
+
+                # Do not sample, learn, or update priorities after stopping.
+                return jax.lax.cond(carry[-1], execute, lambda c: c, carry), None
+
+            (state, buffer_state, update_metrics, total_q, total_kl,
+             last_delta_q, last_delta_kl, last_eta, actual_updates, _), _ = (
+                jax.lax.scan(adaptive_update, initial_carry, keys[2:])
+            )
+            update_metrics = {
+                **update_metrics,
+                "cadence/actual_replay_updates": actual_updates,
+                "cadence/last_delta_q": last_delta_q,
+                "cadence/last_kl_per_dim": last_delta_kl,
+                "cadence/last_efficiency": last_eta,
+                "cadence/cumulative_efficiency": total_q / (total_kl + epsilon),
+            }
+        else:
+            # Original fixed-UTD path is unchanged when adaptive_cadence=False.
+            (state, buffer_state), update_metrics = jax.lax.scan(
+                replay_update,
+                (state, buffer_state),
+                jax.random.split(replay_key, num_replay_updates),
+            )
+            update_metrics = jax.tree.map(lambda x: x[-1], update_metrics)
+
+        # Match online train_step: expose the last EXECUTED learner-call metrics
+        # and increment iteration once per environment collection/update step.
         state = state.replace(iteration=state.iteration + 1)
         return (state, buffer_state), update_metrics
 
@@ -734,7 +823,6 @@ def make_loop_train_fn(
             )
             if buffer_state is None:
                 buffer_state = buffer_fn.init(jax.tree.map(lambda x: x[0, 0], replay_transitions))
-            
             flat_replay_transitions = jax.tree.map(
                 lambda x: x.reshape((num_steps * num_envs, *x.shape[2:])),
                 replay_transitions,

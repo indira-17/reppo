@@ -312,6 +312,64 @@ def make_init_fn(
     return init
 
 
+def measure_replay_update_efficiency(
+    key: Key,
+    train_state: REPPOTrainState,
+    previous_actor_params,
+    reference_critic_params,
+    probe_obs: jax.Array,
+    num_action_samples: int = 4,
+) -> tuple[jax.Array, jax.Array]:
+    """Measure one replay block's predicted Q gain and forward KL per action dim.
+
+    Both policies are evaluated on the SAME fixed probe states with the SAME
+    frozen reference critic. No gradients from this diagnostic enter training.
+    The KL follows REPPO's Monte Carlo, clipped-action estimate; because finite
+    sampling can produce a negative estimate, its mean is floored at zero.
+    """
+    if train_state.normalization_state is not None:
+        probe_obs = Normalizer().normalize(
+            train_state.normalization_state, probe_obs
+        )
+
+    previous_actor = nnx.merge(train_state.actor.graphdef, previous_actor_params)
+    current_actor = nnx.merge(train_state.actor.graphdef, train_state.actor.params)
+    reference_critic = nnx.merge(
+        train_state.critic.graphdef, reference_critic_params
+    )
+    previous_actor.eval()
+    current_actor.eval()
+    reference_critic.eval()
+
+    pi_before = previous_actor(probe_obs)
+    pi_after = current_actor(probe_obs)
+    q_key, kl_key = jax.random.split(key)
+
+    # Common random numbers reduce Monte Carlo noise in the Q difference.
+    before_actions = pi_before.sample(seed=q_key, sample_shape=(num_action_samples,))
+    after_actions = pi_after.sample(seed=q_key, sample_shape=(num_action_samples,))
+    if before_actions.ndim != 3:
+        raise ValueError("Adaptive cadence currently supports continuous Box actions only.")
+    action_dim = before_actions.shape[-1]
+    before_actions = jnp.clip(before_actions, -0.999, 0.999)
+    after_actions = jnp.clip(after_actions, -0.999, 0.999)
+
+    tiled_obs = jnp.broadcast_to(
+        probe_obs[None, ...],
+        (num_action_samples,) + probe_obs.shape,
+    )
+    before_q = reference_critic(tiled_obs, before_actions)["value"]
+    after_q = reference_critic(tiled_obs, after_actions)["value"]
+    delta_q = jnp.mean(after_q - before_q)
+
+    # The same forward-KL orientation as REPPO with reverse_kl=False.
+    kl_actions = pi_before.sample(seed=kl_key, sample_shape=(num_action_samples,))
+    kl_actions = jnp.clip(kl_actions, -0.999, 0.999)
+    sampled_kl = pi_before.log_prob(kl_actions) - pi_after.log_prob(kl_actions)
+    delta_kl_per_dim = jnp.maximum(jnp.mean(sampled_kl), 0.0) / action_dim
+    return delta_q, delta_kl_per_dim
+
+
 def make_learner_fn(
     cfg: DictConfig, observation_space: Space, action_space: Space
 ) -> LearnerFn:
