@@ -25,85 +25,47 @@ import distrax
 
 logging.basicConfig(level=logging.INFO)
 
-def batch_orthonormality_loss(features: jax.Array, weights: jax.Array, reward: jax.Array):
+def batch_orthonormality_loss(
+    features: jax.Array,
+    weights: jax.Array,
+):
     weights = jax.lax.stop_gradient(weights)
+
     feature_dim = features.shape[-1]
     identity = jnp.eye(feature_dim, dtype=features.dtype)
+
     gram = features.T @ (weights[:, None] * features)
-    loss = 0.5 * jnp.sum(jnp.square(gram - identity)) / gram.size
 
-    # Logging only: mean absolute off-diagonal entry of the normalized Gram matrix.
-    gram_metrics = jax.lax.stop_gradient(gram)
-    features_metrics = jax.lax.stop_gradient(features)
-    reward_metrics = jax.lax.stop_gradient(reward.reshape(-1).astype(features.dtype))
-    feature_scale = jnp.sqrt(jnp.clip(jnp.diag(gram_metrics), a_min=1e-8))
-    correlation = gram_metrics / (
-        feature_scale[:, None] * feature_scale[None, :] + 1e-8
+    loss = (
+        0.5
+        * jnp.sum(jnp.square(gram - identity)) / gram.size
     )
-    off_diagonal_sum = (
-        jnp.sum(jnp.abs(correlation))
-        - jnp.sum(jnp.abs(jnp.diag(correlation)))
-    )
-    feature_correlation = off_diagonal_sum / max(feature_dim * (feature_dim - 1), 1)
 
-    gram_eigenvalues, gram_eigenvectors = jnp.linalg.eigh(gram_metrics)
-    gram_min_eigenval = gram_eigenvalues[0]
-    gram_max_eigenval = gram_eigenvalues[-1]
+    return loss
 
-    # Reward energy along each Gram eigendirection:
-    # E_i = ((Phi v_i)^T Xi r)^2 / lambda_i.
-    feature_reward = features_metrics.T @ (weights * reward_metrics)
-    reward_alignment = gram_eigenvectors.T @ feature_reward
-    reward_energy = jnp.where(
-        gram_eigenvalues > 1e-8,
-        jnp.square(reward_alignment) / jnp.clip(gram_eigenvalues, a_min=1e-8),
-        0.0,
-    )
-    k = min(10, feature_dim)
-    bottom10_reward_energy = reward_energy[:k]
-    top10_reward_energy = reward_energy[-k:]
-
-    return loss, gram, {
-        "gram_min_eigenval": gram_min_eigenval,
-        "gram_max_eigenval": gram_max_eigenval,
-        "feature_correlation": feature_correlation,
-        "reward_energy_top10_mean": top10_reward_energy.mean(),
-        "reward_energy_top10_var": top10_reward_energy.var(),
-        "reward_energy_bottom10_mean": bottom10_reward_energy.mean(),
-        "reward_energy_bottom10_var": bottom10_reward_energy.var(),
-    }
-
-def gershgorin_loss(curr_features: jax.Array, next_features: jax.Array, weights: jax.Array, continuation: jax.Array, gamma: float, eps: float = 1e-5):
-    """Gershgorin loss on the empirical TD iteration matrix.
-
-    With row-wise features Φ_B ∈ R^{B×d}, the sampled matrix is
-
-        A_B = Φ_Bᵀ Ξ_B (Φ_B - γ P^πΦ_B)
-            ≈ φ(s,a)ᵀ Ξ_B [φ(s,a) - γφ(s',a')].
-
-    Gradients flow through the current features only; policy-next features are
-    treated as a fixed semi-gradient target.
-    """
+def gershgorin_loss(
+    curr_features: jax.Array,
+    next_features: jax.Array,
+    weights: jax.Array,
+    continuation: jax.Array,
+    gamma: float,
+    eps: float = 1e-5,
+):
     weights = jax.lax.stop_gradient(weights)
     continuation = jax.lax.stop_gradient(continuation).reshape(-1, 1)
+
     td_features = curr_features - gamma * continuation * next_features
     td_matrix = curr_features.T @ (weights[:, None] * td_features)
 
     diag = jnp.diag(td_matrix)
     off_diag_radius = jnp.sum(jnp.abs(td_matrix), axis=-1) - jnp.abs(diag)
+
     margin = diag - off_diag_radius
     violation = jax.nn.relu(eps - margin)
+
     loss = jnp.sum(violation) / td_matrix.size
 
-    # Compute the minimum real eigenvalue for logging
-    min_real_eigenval = jnp.min(jnp.real(jnp.linalg.eig(jax.lax.stop_gradient(td_matrix))[0]))
-
-    return loss, td_matrix, {
-        "gershgorin_margin_min": margin.min(),
-        "gershgorin_margin_mean": margin.mean(),
-        "Aphi_min_real_eigenval": min_real_eigenval,
-    }
-
+    return loss
 
 def successor_feature_td_loss(curr_features: jax.Array, next_features: jax.Array, weights: jax.Array, continuation: jax.Array, successor: jax.Array, gamma: float):
     curr_features = jax.lax.stop_gradient(curr_features)
@@ -444,49 +406,40 @@ def make_learner_fn(
         is_w = minibatch.extras.get("is_weight", None)
         per_scale = is_w.reshape(-1) if (data_type == 'PER' and is_w is not None) else 1.0
 
-        # Always compute the requested feature diagnostics. Only use their losses when use_added_loss=True.
-        # next_features = minibatch.extras["diagnostic_next_emb"]
-        next_features = jax.lax.stop_gradient(
-            critic_model(minibatch.next_obs, minibatch.extras["diagnostic_next_action"])["embed"]
-        )
-        sample_weights = jnp.ones_like(
-            minibatch.done.reshape(-1), dtype=curr_features.dtype
-        )
-        if hparams.mask_truncated:
-            sample_weights = sample_weights * (
-                1.0 - minibatch.truncated.reshape(-1).astype(curr_features.dtype)
-            )
-        sample_weights = sample_weights / jnp.maximum(sample_weights.sum(), 1.0)
-        continuation = jnp.where(
-            minibatch.truncated.reshape(-1).astype(bool),
-            jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype),
-            1.0 - minibatch.done.reshape(-1).astype(curr_features.dtype),
-        )
-
-        computed_gershgorin_loss, _, gershgorin_metrics = gershgorin_loss(
-            curr_features,
-            next_features,
-            sample_weights,
-            continuation,
-            gamma=hparams.gamma,
-            eps=float(getattr(hparams, "gershgorin_eps", 1e-5)),
-        )
-        computed_orth_loss, _, orth_metrics = batch_orthonormality_loss(
-            curr_features,
-            sample_weights,
-            minibatch.reward,
-        )
+        # Only compute matrix regularizers when they are actually active.
         use_added_loss = bool(getattr(hparams, "use_added_loss", False))
-        gershgorin_loss_value = jnp.where(
-            use_added_loss,
-            computed_gershgorin_loss,
-            jnp.array(0.0, dtype=value.dtype),
-        )
-        orth_loss_value = jnp.where(
-            use_added_loss,
-            computed_orth_loss,
-            jnp.array(0.0, dtype=value.dtype),
-        )
+        gersh_mult = float(getattr(hparams, "gershgorin_loss_mult", 0.0))
+        orth_mult = float(getattr(hparams, "orth_loss_mult", 0.0))
+
+        gershgorin_loss_value = jnp.array(0.0, dtype=value.dtype)
+        orth_loss_value = jnp.array(0.0, dtype=value.dtype)
+
+        if use_added_loss and (gersh_mult > 0.0 or orth_mult > 0.0):
+            sample_weights = jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype)
+
+            if hparams.mask_truncated:
+                sample_weights = sample_weights * (1.0 - minibatch.truncated.reshape(-1).astype(curr_features.dtype))
+
+            sample_weights = sample_weights / jnp.maximum(sample_weights.sum(), 1.0)
+
+            if gersh_mult > 0.0:
+                continuation = jnp.where(
+                    minibatch.truncated.reshape(-1).astype(bool),
+                    jnp.ones_like(minibatch.done.reshape(-1), dtype=curr_features.dtype),
+                    1.0 - minibatch.done.reshape(-1).astype(curr_features.dtype),
+                )
+
+                gershgorin_loss_value = gershgorin_loss(
+                    curr_features,
+                    minibatch.extras["diagnostic_next_emb"],
+                    sample_weights,
+                    continuation,
+                    gamma=hparams.gamma,
+                    eps=float(getattr(hparams, "gershgorin_eps", 1e-5)),
+                )
+
+            if orth_mult > 0.0:
+                orth_loss_value = batch_orthonormality_loss(curr_features, sample_weights)
 
         critic_objective = (
             critic_update_loss
@@ -498,13 +451,13 @@ def make_learner_fn(
         loss = jnp.mean(per_scale * mask * critic_objective)
 
         # Gershgorin and orthonormality are batch-level matrix losses, so add them after reducing the per-sample critic objective.
-        if float(getattr(hparams, "gershgorin_loss_mult", 0.0)) > 0.0:
-            weighted_gershgorin_loss = float(getattr(hparams, "gershgorin_loss_mult", 0.0)) * gershgorin_loss_value
+        if use_added_loss and gersh_mult > 0.0:
+            weighted_gershgorin_loss = gersh_mult * gershgorin_loss_value
             unmasked_critic_total_loss += weighted_gershgorin_loss
             loss += weighted_gershgorin_loss
 
-        if float(getattr(hparams, "orth_loss_mult", 0.0)) > 0.0:
-            weighted_orth_loss = float(getattr(hparams, "orth_loss_mult", 0.0)) * orth_loss_value
+        if use_added_loss and orth_mult > 0.0:
+            weighted_orth_loss = orth_mult * orth_loss_value
             unmasked_critic_total_loss += weighted_orth_loss
             loss += weighted_orth_loss
 
@@ -515,8 +468,6 @@ def make_learner_fn(
             aux_loss=logged_aux_loss,
             invariance_loss=logged_invariance_loss,
             rew_aux_loss=reward_error,
-            **orth_metrics,
-            **gershgorin_metrics,
             q=value.mean(),
             abs_batch_action=jnp.abs(minibatch.action).mean(),
             reward_mean=minibatch.reward.mean(),
@@ -701,7 +652,7 @@ def make_learner_fn(
         if not discrete_actions:
             next_action = next_action.clip(-0.999, 0.999)
         next_features = jax.lax.stop_gradient(critic_model(batch.next_obs, next_action)["embed"])
-        return batch.replace(extras={**batch.extras, "diagnostic_next_action": next_action})
+        return batch.replace(extras={**batch.extras, "diagnostic_next_emb": next_features})
 
     def compute_dice_features(key: Key, train_state: REPPOTrainState, batch: Transition, initial_obs: jax.Array):
         next_action_key, start_action_key = jax.random.split(key)
@@ -892,9 +843,11 @@ def make_learner_fn(
                 _,
             ) = nstep_lambda(batch=batch)
 
-        diagnostic_key = jax.random.fold_in(key, 2718)
-        dice_key = jax.random.fold_in(key, 31415)
-        batch = compute_epoch_diagnostics(diagnostic_key, train_state, batch)
+        use_gershgorin = bool(getattr(hparams, "use_added_loss", False)) and float(getattr(hparams, "gershgorin_loss_mult", 0.0)) > 0.0
+
+        if use_gershgorin:
+            diagnostic_key = jax.random.fold_in(key, 2718)
+            batch = compute_epoch_diagnostics(diagnostic_key, train_state, batch)
 
         # Shuffle data and split into mini-batches
         key, shuffle_key, act_key, kl_key = jax.random.split(key, 4)
@@ -923,26 +876,21 @@ def make_learner_fn(
         # Compute mean metrics across mini-batches
         metrics_mean = jax.tree.map(lambda x: x.mean(0), metrics)
 
-        dice_feature_key, dice_shuffle_key = jax.random.split(dice_key)
-        dice_batch, start_features = compute_dice_features(dice_feature_key, train_state, batch, initial_obs)
-        train_state = train_state.replace(params={**train_state.params, "sr_dice_start_phi": start_features})
-        dice_indices = jax.random.permutation(dice_shuffle_key, batch_size)
-        dice_minibatch_idxs = jax.tree.map(
-            lambda x: x.reshape(
-                (hparams.num_mini_batches, mini_batch_size, *x.shape[1:])
-            ),
-            dice_indices,
-        )
-        dice_minibatches = jax.tree.map(lambda x: jnp.take(x, dice_minibatch_idxs, axis=0), dice_batch)
-        train_state, dice_metrics = jax.lax.scan(dice_update, train_state, dice_minibatches)
-        dice_metrics_mean = jax.tree.map(lambda x: x.mean(0), dice_metrics)
-        # Compute max metrics across mini-batches
-        # metrics_max = jax.tree.map(lambda x: x.max(), metrics)
-        # metrics_min = jax.tree.map(lambda x: x.min(), metrics)
-        return (
-            train_state,
-            {**metrics_mean, **dice_metrics_mean},
-        )  # {**metrics_mean, **{k + "_max": v for k, v in metrics_max.items()}, **{k + "_min": v for k, v in metrics_min.items()}}
+        # dice_feature_key, dice_shuffle_key = jax.random.split(dice_key)
+        # dice_batch, start_features = compute_dice_features(dice_feature_key, train_state, batch, initial_obs)
+        # train_state = train_state.replace(params={**train_state.params, "sr_dice_start_phi": start_features})
+        # dice_indices = jax.random.permutation(dice_shuffle_key, batch_size)
+        # dice_minibatch_idxs = jax.tree.map(
+        #     lambda x: x.reshape(
+        #         (hparams.num_mini_batches, mini_batch_size, *x.shape[1:])
+        #     ),
+        #     dice_indices,
+        # )
+        # dice_minibatches = jax.tree.map(lambda x: jnp.take(x, dice_minibatch_idxs, axis=0), dice_batch)
+        # train_state, dice_metrics = jax.lax.scan(dice_update, train_state, dice_minibatches)
+        # dice_metrics_mean = jax.tree.map(lambda x: x.mean(0), dice_metrics)
+
+        return train_state, metrics_mean  # {**metrics_mean, **{k + "_max": v for k, v in metrics_max.items()}, **{k + "_min": v for k, v in metrics_min.items()}}
 
     def nstep_lambda(batch: Transition):
         if not getattr(hparams, "use_one_step_td", True):

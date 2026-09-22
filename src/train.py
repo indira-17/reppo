@@ -37,6 +37,7 @@ def main(cfg: DictConfig):
         project=wandb_project,
         entity=wandb_entity,
         tags=tags,
+        config=OmegaConf.to_container(cfg),
         group=run_group,
         job_type=job_type,
         name=run_name,
